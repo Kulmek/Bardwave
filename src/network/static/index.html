@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoundShared | Red Noir Listener</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
+</head>
+<body>
+    <div class="noise-overlay"></div>
+    <div class="container">
+        <!-- Legacy JS-compatible elements (hidden, kept for app.js) -->
+        <span id="statusIndicator" class="status-indicator disconnected" hidden></span>
+        <span id="statusText" class="status-text disconnected" hidden>Disconnected</span>
+        <div id="bufferIndicator" class="buffer-panel" hidden></div>
+        <header>
+            <span class="brand-kicker">SoundShared Protocol</span>
+            <h1>Listener<span class="accent">.</span>v2</h1>
+            <p class="subtitle">High-fidelity, ultra-low latency spatial audio stream monitoring and synchronization node.</p>
+        </header>
+
+        <main>
+            <!-- Connection Status -->
+            <section class="connection-panel" id="connection-panel">
+                <div class="flex-between">
+                    <div class="status-group">
+                        <h2 class="panel-title">Main Output Control</h2>
+                        <p class="panel-sub">Connect to the broadcast server to begin audio decoding.</p>
+                    </div>
+                    <button class="btn btn-primary" id="connectBtn">
+                        <span class="btn-text">Establish Link</span>
+                        <span class="btn-loader" hidden></span>
+                    </button>
+                </div>
+
+                <!-- Audio Level Meter -->
+                <div class="audio-panel" id="audioIndicator" hidden>
+                    <div class="meter-group">
+                        <label class="meter-label">Live Audio Levels (LR)</label>
+                        <span class="meter-value stat-mono" id="meterValue">-INF dB</span>
+                    </div>
+                    <div class="audio-level-bars" id="audioLevelBars">
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                        <div class="level-bar"></div>
+                    </div>
+                </div>
+
+                <!-- Buffer Health -->
+                <div class="buffer-panel">
+                    <div class="buffer-group">
+                        <label class="buffer-label">Buffer Health Monitor</label>
+                        <span class="buffer-value stat-mono" id="bufferText">0ms / 200ms</span>
+                    </div>
+                    <div class="buffer-bar">
+                        <div class="buffer-fill" id="bufferFill"></div>
+                    </div>
+                    <div class="buffer-grid" id="bufferGrid">
+                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Messages -->
+            <section class="message-panel" id="messagePanel" hidden>
+                <div class="message-content">
+                    <iconify-icon icon="lucide:info" class="message-icon"></iconify-icon>
+                    <p class="message-text" id="messageText"></p>
+                </div>
+                <button class="btn btn-secondary" id="dismissBtn" hidden>Dismiss</button>
+            </section>
+
+            <!-- Stats -->
+            <section class="stats-panel" id="stats-panel">
+                <div class="stat-item">
+                    <span class="stat-label">Packets Received</span>
+                    <span class="stat-value stat-mono" id="statsReceived">000,000</span>
+                </div>
+                <div class="stat-item stat-item--accent">
+                    <span class="stat-label">Frames Played</span>
+                    <span class="stat-value stat-mono" id="statsPlayed">000,000</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Underruns</span>
+                    <span class="stat-value stat-mono text-red" id="statsUnderruns">0</span>
+                </div>
+            </section>
+        </main>
+
+        <!-- Info Panel -->
+        <section class="info-panel" id="info-panel">
+            <details open>
+                <summary>Connection Details</summary>
+                <div class="info-grid">
+                    <div class="info-item">
+                        <span class="info-label">Server Endpoint</span>
+                        <span class="info-value stat-mono" id="wsUrl">WSS://AUDIO.LOCAL</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Protocol</span>
+                        <span class="info-value stat-mono">OPUS / 48KHZ</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Latency Mode</span>
+                        <span class="info-value stat-mono text-red">ULTRA-LOW</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Bitrate</span>
+                        <span class="info-value stat-mono">256 KBPS</span>
+                    </div>
+                </div>
+            </details>
+        </section>
+
+        <!-- Toast Panel -->
+        <section class="toast-panel" id="toastPanel">
+            <div class="toast toast-info">
+                <iconify-icon icon="lucide:info"></iconify-icon>
+                <span>Waiting for server handshake...</span>
+            </div>
+            <div class="toast toast-success opacity-50">
+                <iconify-icon icon="lucide:check-circle"></iconify-icon>
+                <span>System ready. Initializing components.</span>
+            </div>
+        </section>
+
+        <footer>
+            <div class="footer-links">
+                <a href="#" id="footer-docs-link">Documentation</a>
+                <a href="#" id="footer-github-link">GitHub</a>
+            </div>
+            <span class="footer-copy">© 2024 SoundShared Red Noir Edition</span>
+            <div class="footer-social">
+                <iconify-icon icon="mdi:twitter"></iconify-icon>
+                <iconify-icon icon="mdi:discord"></iconify-icon>
+            </div>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
