@@ -36,8 +36,6 @@ pub mod glyph {
     pub const REFRESH: Glyph = "\u{27F3}";
     /// ⟲ — repeat / loop playback.
     pub const LOOP: Glyph = "\u{27F2}";
-    /// ⇄ — move / assign.
-    pub const MOVE: Glyph = "\u{21C4}";
     /// ≈ — waveform-ish mark used in the brand lockup.
     pub const WAVE: Glyph = "\u{224B}";
 }
@@ -554,19 +552,6 @@ pub fn level_slider(ui: &mut Ui, value: &mut f32, width: f32, id_salt: &str) -> 
     resp
 }
 
-/// A static (non-interactive) level bar with a filled and an empty portion.
-pub fn level_bar(ui: &mut Ui, value: f32, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 2.0), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::ZERO, Palette::BORDER_STRONG);
-    let clamped = value.clamp(0.0, 1.0);
-    if clamped > 0.0 {
-        let filled =
-            Rect::from_min_size(rect.min, Vec2::new(rect.width() * clamped, rect.height()));
-        painter.rect_filled(filled, Rounding::ZERO, Palette::ROSE_500);
-    }
-}
-
 /// A segmented meter (e.g. the 20-cell master output strip).
 pub fn segmented_meter(ui: &mut Ui, value: f32, cells: usize, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
@@ -620,43 +605,6 @@ pub fn signal_dot(ui: &mut Ui, color: Color32, diameter: f32, pulse: bool) -> Re
     ui.painter()
         .circle_filled(rect.center(), diameter / 2.0, color);
     resp
-}
-
-/// Mono percentage readout, right-aligned in a fixed slot so rows never wobble.
-pub fn percent_label(ui: &mut Ui, value: f32, width: f32) {
-    ui.allocate_ui(Vec2::new(width, 14.0), |ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0))
-                    .font(mono_font(10.0))
-                    .color(Palette::ZINC_400),
-            );
-        });
-    });
-}
-
-/// Inset field frame used for read-only telemetry (URL well, masked inputs).
-pub fn inset_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(Palette::WELL)
-        .stroke(Stroke::new(1.0_f32, Palette::BORDER))
-        .rounding(Rounding::same(Metrics::R_SM))
-        .inner_margin(egui::Margin::symmetric(12.0, 0.0))
-}
-
-/// A read-only monospaced value field with a hairline well.
-pub fn inset_value(ui: &mut Ui, value: &str, color: Color32, height: f32, font_size: f32) {
-    inset_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.set_height(height);
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(value)
-                    .font(mono_font(font_size))
-                    .color(color),
-            );
-        });
-    });
 }
 
 /// Shorten a string to fit roughly `max_chars` characters, adding an ellipsis.

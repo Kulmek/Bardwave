@@ -22,12 +22,8 @@ pub enum AudioCommand {
     SetMasterVolume { volume: f32, response: Sender<anyhow::Result<()>> },
     /// Remove a sound from the library
     RemoveSound { id: SoundId, response: Sender<anyhow::Result<()>> },
-    /// Get list of loaded sounds
-    ListSounds { response: Sender<Vec<SoundInfo>> },
     /// Stop all playback
     StopAll { response: Sender<anyhow::Result<()>> },
-    /// Check if a sound is currently playing in the mixer
-    IsPlaying { id: SoundId, response: Sender<bool> },
 }
 
 /// Sound information for GUI display

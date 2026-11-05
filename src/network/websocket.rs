@@ -1,12 +1,12 @@
 //! WebSocket session handling for audio streaming
 
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use axum::extract::ws::{Message, WebSocket};
 use tracing::{info, warn, error, debug};
 use uuid::Uuid;
 
-use crate::network::broadcast::BroadcasterHandle;
+use crate::network::broadcast::{format_message, BroadcasterHandle};
 
 /// Configuration for WebSocket sessions
 #[derive(Debug, Clone)]
@@ -50,6 +50,9 @@ pub struct WebSocketSession {
     ws: WebSocket,
     broadcaster: BroadcasterHandle,
     config: WebSocketConfig,
+    /// Fires when the server stops. The session closes its socket instead of
+    /// holding the server shutdown open indefinitely.
+    shutdown_rx: broadcast::Receiver<()>,
     /// Channel to send messages to this client
     msg_tx: mpsc::Sender<Message>,
     /// Receiver for messages to send
@@ -62,20 +65,20 @@ impl WebSocketSession {
         ws: WebSocket,
         broadcaster: BroadcasterHandle,
         config: WebSocketConfig,
-    ) -> (Self, mpsc::Sender<Message>) {
+        shutdown_rx: broadcast::Receiver<()>,
+    ) -> Self {
         let (msg_tx, msg_rx) = mpsc::channel(config.send_buffer_size);
         let id = Uuid::new_v4();
 
-        let session = Self {
+        Self {
             id,
             ws,
             broadcaster,
             config,
-            msg_tx: msg_tx.clone(),
+            shutdown_rx,
+            msg_tx,
             msg_rx,
-        };
-
-        (session, msg_tx)
+        }
     }
 
     /// Get session ID
@@ -83,20 +86,36 @@ impl WebSocketSession {
         self.id
     }
 
-    /// Get the message sender for external use (e.g., broadcaster)
-    pub fn message_sender(&self) -> mpsc::Sender<Message> {
-        self.msg_tx.clone()
-    }
-
-    /// Run the session - handles incoming/outgoing messages
+    /// Run the session - handles incoming/outgoing messages.
+    ///
+    /// The listener is always removed from the broadcaster before returning,
+    /// including when the socket fails: a leaked entry would otherwise keep the
+    /// listener count (and the console readout) wrong for the rest of the run.
     pub async fn run(mut self) -> Result<(), WebSocketError> {
         info!("🔌 WebSocket session started: {}", self.id);
 
         // Register with broadcaster
         let msg_tx = self.msg_tx.clone();
-        let client_id = self.broadcaster.register_client(msg_tx).await.map_err(|e| WebSocketError::Protocol(e.to_string()))?;
+        let client_id = self
+            .broadcaster
+            .register_client(msg_tx)
+            .await
+            .map_err(|e| WebSocketError::Protocol(e.to_string()))?;
         info!("🔌 Client registered with ID: {}", client_id);
 
+        let outcome = self.session_loop(client_id).await;
+
+        if let Err(e) = self.broadcaster.unregister_client(client_id).await {
+            // The broadcaster is gone (shutdown); the count is moot by then.
+            debug!("🔌 Could not unregister client {}: {}", client_id, e);
+        }
+        info!("🔌 WebSocket session ended: {}", self.id);
+
+        outcome
+    }
+
+    /// The session's message pump.
+    async fn session_loop(&mut self, client_id: Uuid) -> Result<(), WebSocketError> {
         // Send welcome message
         let welcome = serde_json::json!({
             "type": "welcome",
@@ -105,10 +124,16 @@ impl WebSocketSession {
                 "message": "Connected to SoundShared audio stream"
             }
         });
-        let _ = self.msg_tx.try_send(Message::Text(welcome.to_string().into()));
+        let _ = self.msg_tx.try_send(Message::Text(welcome.to_string()));
         info!("🔌 Welcome message sent to client");
 
-        // Split into incoming and outgoing tasks
+        // A listener that connects while audio is already flowing never sees the
+        // first frame that established the format, so the format is replayed here
+        // (the browser uses it to label the stream in its info panel).
+        if let Some(info) = self.broadcaster.format_info().await {
+            let _ = self.msg_tx.try_send(Message::Text(format_message(&info)));
+        }
+
         // Note: axum's WebSocket doesn't have split() so we handle both in one loop
         let mut interval = tokio::time::interval(self.config.ping_interval);
 
@@ -156,14 +181,18 @@ impl WebSocketSession {
                 // Periodic ping
                 _ = interval.tick() => {
                     debug!("🔌 Sending ping to {}", self.id);
-                    let _ = self.msg_tx.try_send(Message::Ping(vec![].into()));
+                    let _ = self.msg_tx.try_send(Message::Ping(Vec::new()));
+                }
+                // The server is stopping: close the socket so the browser shows
+                // "off air" and the graceful shutdown of the accept loop can
+                // actually finish.
+                _ = self.shutdown_rx.recv() => {
+                    info!("🔌 Server shutting down, closing session {}", self.id);
+                    let _ = self.ws.send(Message::Close(None)).await;
+                    break;
                 }
             }
         }
-
-        // Unregister on disconnect
-        self.broadcaster.unregister_client(client_id).await.map_err(|e| WebSocketError::Protocol(e.to_string()))?;
-        info!("🔌 WebSocket session ended: {}", self.id);
 
         Ok(())
     }
@@ -178,11 +207,24 @@ impl WebSocketSession {
                 match msg_type {
                     "ping" => {
                         let pong = serde_json::json!({"type": "pong"});
-                        let _ = self.msg_tx.try_send(Message::Text(pong.to_string().into()));
+                        let _ = self.msg_tx.try_send(Message::Text(pong.to_string()));
                     }
                     "get_format" => {
-                        // Client requests current audio format
-                        // The broadcaster will send format info when available
+                        // Client asks for the current audio format. Answering it
+                        // used to be a no-op, so a listener that joined late had
+                        // no format at all: the browser was left showing whatever
+                        // its info panel guessed at startup.
+                        match self.broadcaster.format_info().await {
+                            Some(info) => {
+                                let _ =
+                                    self.msg_tx.try_send(Message::Text(format_message(&info)));
+                            }
+                            None => {
+                                // No audio has been mixed yet; the format is
+                                // announced with the first frame instead.
+                                debug!("🔌 No audio format yet for {}", self.id);
+                            }
+                        }
                     }
                     _ => {
                         debug!("Unknown message type from {}: {}", self.id, msg_type);
@@ -200,9 +242,10 @@ pub async fn handle_websocket_upgrade(
     ws: WebSocket,
     broadcaster: BroadcasterHandle,
     config: WebSocketConfig,
+    shutdown_rx: broadcast::Receiver<()>,
 ) {
     info!("🔌 New WebSocket connection from client");
-    let (session, _msg_tx) = WebSocketSession::new(ws, broadcaster, config);
+    let session = WebSocketSession::new(ws, broadcaster, config, shutdown_rx);
 
     if let Err(e) = session.run().await {
         warn!("🔌 WebSocket session error: {}", e);
@@ -214,7 +257,6 @@ pub async fn handle_websocket_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_websocket_config_default() {

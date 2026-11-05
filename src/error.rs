@@ -1,6 +1,5 @@
 //! Error types for SoundShared.
 
-use std::fmt;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

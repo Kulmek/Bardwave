@@ -6,6 +6,7 @@ use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use std::collections::VecDeque;
 use egui::Context;
 use rfd::FileDialog;
 use std::collections::HashMap;
@@ -130,12 +131,13 @@ pub struct SoundSharedApp {
     copied_feedback: Arc<Mutex<bool>>,
     copied_feedback_timer: Arc<Mutex<Option<Instant>>>,
 
-    // Pending file load
-    pending_load: Arc<Mutex<Option<PathBuf>>>,
-
-    // Channel for receiving sound list updates
-    sound_list_rx: Receiver<Vec<SoundInfo>>,
-    sound_list_tx: Sender<Vec<SoundInfo>>,
+    /// Library files still waiting for room in the audio command channel.
+    ///
+    /// That channel is short and only the GUI thread drains it, so a board with
+    /// more files than the channel holds has to be fed frame by frame. Dropping
+    /// the excess (the old behaviour) silently lost part of the saved library on
+    /// every start.
+    pending_loads: VecDeque<PathBuf>,
 
     // Channel for receiving server status updates
     server_status_rx: Receiver<AppServerStatus>,
@@ -191,7 +193,6 @@ impl SoundSharedApp {
         _cc: &eframe::CreationContext<'_>,
     ) -> Self {
         // Create channels for receiving updates from background threads
-        let (sound_list_tx, sound_list_rx) = bounded(1);
         let (server_status_tx, server_status_rx) = bounded(1);
         let (bind_result_tx, bind_result_rx) = bounded(4);
 
@@ -209,7 +210,7 @@ impl SoundSharedApp {
             )
         };
 
-        let app = Self {
+        let mut app = Self {
             app_state,
             audio_engine,
             audio_cmd_rx,
@@ -223,9 +224,7 @@ impl SoundSharedApp {
             })),
             copied_feedback: Arc::new(Mutex::new(false)),
             copied_feedback_timer: Arc::new(Mutex::new(None)),
-            pending_load: Arc::new(Mutex::new(None)),
-            sound_list_rx,
-            sound_list_tx,
+            pending_loads: VecDeque::new(),
             server_status_rx,
             server_status_tx,
             library,
@@ -244,9 +243,6 @@ impl SoundSharedApp {
             bind_result_tx,
         };
 
-        // Request initial sound list
-        app.request_sound_list();
-
         // Request initial server status
         app.request_server_status();
 
@@ -258,10 +254,13 @@ impl SoundSharedApp {
 
     // ===== Public API =====
 
-    /// Request loading a sound file via native file dialog
-    pub fn request_load_sound(&self, path: PathBuf) {
-        *self.pending_load.lock().unwrap() = Some(path.clone());
-
+    /// Queue a sound file to be handed to the audio engine.
+    ///
+    /// The command is dropped in immediately when the channel has room; a full
+    /// channel (the startup restore of a large library) parks the path in
+    /// [`Self::pending_loads`] and [`Self::pump_pending_loads`] feeds it as soon
+    /// as the main thread has drained a slot.
+    pub fn request_load_sound(&mut self, path: PathBuf) {
         let (response_tx, response_rx) = bounded(1);
         let cmd = AudioCommand::LoadSound {
             path: path.to_string_lossy().to_string(),
@@ -269,33 +268,44 @@ impl SoundSharedApp {
         };
 
         if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send load sound command (channel full): {}", e);
-            *self.pending_load.lock().unwrap() = None;
+            debug!("Load channel full, queueing {}: {}", path.display(), e);
+            self.pending_loads.push_back(path);
             return;
         }
 
-        // Handle response in background
-        let pending_load = self.pending_load.clone();
+        self.await_load_response(response_rx);
+    }
 
-        std::thread::spawn(move || {
-            match response_rx.recv() {
-                Ok(Ok(_sound_info)) => {
-                    // Note: SoundEntry was already inserted into `sounds` and `sound_order`
-                    // by process_audio_commands() on the main thread. Do NOT insert again here
-                    // to avoid duplicate entries in the GUI list.
-                    *pending_load.lock().unwrap() = None;
-                    info!("Loaded sound: {} ({})", _sound_info.name, _sound_info.id);
-                }
-                Ok(Err(e)) => {
-                    error!("Failed to load sound: {}", e);
-                    *pending_load.lock().unwrap() = None;
-                }
-                Err(_) => {
-                    error!("Audio command channel closed");
-                    *pending_load.lock().unwrap() = None;
-                }
+    /// Report the outcome of one `LoadSound` command without blocking the GUI.
+    ///
+    /// The sound entry itself is inserted by [`Self::process_audio_commands`] on
+    /// the main thread; this thread only logs the result.
+    fn await_load_response(&self, response_rx: Receiver<anyhow::Result<SoundInfo>>) {
+        std::thread::spawn(move || match response_rx.recv() {
+            Ok(Ok(sound_info)) => {
+                info!("Loaded sound: {} ({})", sound_info.name, sound_info.id);
             }
+            Ok(Err(e)) => error!("Failed to load sound: {}", e),
+            Err(_) => error!("Audio command channel closed"),
         });
+    }
+
+    /// Feed queued library files to the engine while the channel has room.
+    fn pump_pending_loads(&mut self) {
+        while let Some(path) = self.pending_loads.pop_front() {
+            let (response_tx, response_rx) = bounded(1);
+            let cmd = AudioCommand::LoadSound {
+                path: path.to_string_lossy().to_string(),
+                response: response_tx,
+            };
+            if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
+                // Still full: put it back and try again on a later frame.
+                debug!("Load channel still full, {} stays queued: {}", path.display(), e);
+                self.pending_loads.push_front(path);
+                break;
+            }
+            self.await_load_response(response_rx);
+        }
     }
 
     /// Re-open every sound saved in the library that is still on disk.
@@ -304,7 +314,7 @@ impl SoundSharedApp {
     /// come back with a blank board while the group rail still reported the
     /// saved counts. Missing files are skipped rather than reported as errors,
     /// because a library entry may legitimately point at an unmounted volume.
-    fn restore_library_sounds(&self) {
+    fn restore_library_sounds(&mut self) {
         let paths: Vec<PathBuf> = self
             .library
             .sounds()
@@ -453,6 +463,11 @@ impl SoundSharedApp {
                 sound_order.lock().unwrap().retain(|&x| x != id);
             }
         });
+    }
+
+    /// Every loaded sound, regardless of the active group filter.
+    pub fn sounds(&self) -> Vec<SoundEntry> {
+        self.get_sounds()
     }
 
     /// Get all sounds for display
@@ -804,7 +819,7 @@ impl SoundSharedApp {
     }
 
     /// Open native file dialog to add sound
-    pub fn open_file_dialog(&self) {
+    pub fn open_file_dialog(&mut self) {
         if let Some(path) = FileDialog::new()
             .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac", "opus"])
             .set_title("Select Audio File")
@@ -1141,18 +1156,9 @@ impl SoundSharedApp {
             }
         }
 
-        // Poll for sound list updates
-        match self.sound_list_rx.try_recv() {
-            Ok(list) => {
-                if !list.is_empty() {
-                    self.sync_sound_list(list);
-                }
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                debug!("Sound list channel disconnected");
-            }
-        }
+        // Feed the engine the library files that did not fit the channel on
+        // the previous pass.
+        self.pump_pending_loads();
 
         // Poll server status
         self.poll_server_status();
@@ -1345,27 +1351,6 @@ impl SoundSharedApp {
                         }
                         let _ = response.send(result.map_err(|e| e.into()));
                     }
-                    AudioCommand::ListSounds { response } => {
-                        let sounds = engine
-                            .list_sounds()
-                            .into_iter()
-                            .filter_map(|sound_id| {
-                                if let Ok((duration, _, _)) = engine.sound_info(sound_id) {
-                                    Some(SoundInfo {
-                                        id: sound_id,
-                                        name: format!("Sound {}", sound_id.0),
-                                        path: "".to_string(),
-                                        duration,
-                                        is_playing: false,
-                                        volume: 1.0,
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let _ = response.send(sounds);
-                    }
                     AudioCommand::StopAll { response } => {
                         let result = engine.stop_all();
                         if result.is_ok() {
@@ -1374,10 +1359,6 @@ impl SoundSharedApp {
                             }
                         }
                         let _ = response.send(result.map_err(|e| e.into()));
-                    }
-                    AudioCommand::IsPlaying { id, response } => {
-                        let result = engine.is_sound_playing(id);
-                        let _ = response.send(result.unwrap_or(false));
                     }
                 }
             } else {
@@ -1404,85 +1385,12 @@ impl SoundSharedApp {
                     AudioCommand::RemoveSound { response, .. } => {
                         let _ = response.send(Err(anyhow::anyhow!("Engine not running")));
                     }
-                    AudioCommand::ListSounds { response } => {
-                        let _ = response.send(Vec::new());
-                    }
                     AudioCommand::StopAll { response } => {
                         let _ = response.send(Ok(()));
-                    }
-                    AudioCommand::IsPlaying { response, .. } => {
-                        let _ = response.send(false);
                     }
                 };
             }
         }
     }
 
-    /// Sync local sound list with audio engine
-    fn sync_sound_list(&self, sound_infos: Vec<SoundInfo>) {
-        let mut sounds = self.sounds.lock().unwrap();
-        let mut order = self.sound_order.lock().unwrap();
-
-        // Build new order from sound infos
-        let new_ids: Vec<SoundId> = sound_infos.iter().map(|s| s.id).collect();
-
-        // Update or add sounds
-        for info in sound_infos {
-            let path = PathBuf::from(&info.path);
-            let group = self.library.sound(&path).and_then(|sound| sound.group);
-            let looped = self
-                .library
-                .sound(&path)
-                .map(|sound| sound.looped)
-                .unwrap_or(false);
-            let entry = sounds.entry(info.id).or_insert_with(|| SoundEntry {
-                id: info.id,
-                name: info.name.clone(),
-                path: path.clone(),
-                playing: false,
-                volume: info.volume,
-                looped,
-                group,
-                duration: info.duration,
-                sample_rate: crate::audio::TARGET_SAMPLE_RATE,
-            });
-            entry.name = info.name;
-            entry.path = path;
-            entry.playing = info.is_playing;
-            entry.volume = info.volume;
-            entry.duration = info.duration;
-            entry.group = group;
-        }
-
-        // Remove sounds that are no longer in the engine
-        sounds.retain(|id, _| new_ids.contains(id));
-        order.retain(|id| new_ids.contains(id));
-
-        // Add new sounds to order
-        for id in new_ids {
-            if !order.contains(&id) {
-                order.push(id);
-            }
-        }
-    }
-
-    /// Request full sound list from audio engine
-    pub fn request_sound_list(&self) {
-        let (response_tx, response_rx) = bounded(1);
-        let cmd = AudioCommand::ListSounds {
-            response: response_tx,
-        };
-
-        if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
-            error!("Failed to send list sounds command (channel full): {}", e);
-            return;
-        }
-
-        let sound_list_tx = self.sound_list_tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(list) = response_rx.recv_timeout(Duration::from_secs(5)) {
-                let _ = sound_list_tx.try_send(list);
-            }
-        });
-    }
 }

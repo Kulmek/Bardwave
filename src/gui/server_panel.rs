@@ -22,10 +22,10 @@
 
 use crate::gui::app::{ServerStatus as GuiServerStatus, SoundSharedApp};
 use crate::gui::theme::{
-    alpha, console_panel, hairline, micro_label, micro_label_accent, panel_title, telemetry,
-    Metrics, Palette,
+    console_panel, hairline, micro_label, micro_label_accent, panel_title, telemetry, Metrics,
+    Palette,
 };
-use crate::gui::widgets::{glyph, occupancy_cells, signal_dot, BtnKind, ConsoleButton};
+use crate::gui::widgets::{glyph, occupancy_cells, signal_dot, ConsoleButton};
 use egui::{Align, Layout, RichText, Sense, Ui, Vec2};
 
 /// Renders the network server panel at the given size.
@@ -386,26 +386,3 @@ fn config_input(
         .inner
 }
 
-/// One-line server status for the command bar or a compact layout.
-pub fn compact_server_status(ui: &mut Ui, state: &SoundSharedApp) {
-    let server = state.get_server_state();
-    let (color, text) = match &server.status {
-        GuiServerStatus::Stopped => (Palette::ZINC_500, "Server: Stopped"),
-        GuiServerStatus::Starting => (Palette::AMBER_400, "Server: Starting"),
-        GuiServerStatus::Running => (Palette::ROSE_500, "Server: Running"),
-        GuiServerStatus::Error(_) => (Palette::ROSE_400, "Server: Error"),
-    };
-
-    ui.horizontal(|ui| {
-        signal_dot(
-            ui,
-            color,
-            8.0,
-            matches!(server.status, GuiServerStatus::Running),
-        );
-        ui.add_space(Metrics::XS);
-        ui.label(micro_label(text));
-        let _ = BtnKind::Ghost;
-        let _ = alpha;
-    });
-}

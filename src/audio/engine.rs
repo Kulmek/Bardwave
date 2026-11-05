@@ -12,7 +12,7 @@ use cpal::{
     BufferSize, FromSample, SampleFormat, SampleRate, StreamConfig, SupportedStreamConfig,
     SupportedStreamConfigRange,
 };
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -345,8 +345,11 @@ pub mod device_adapter {
     }
 }
 
-/// Internal engine state shared across handles
-struct AudioEngineInner {
+/// Internal engine state shared across handles.
+///
+/// Crate-visible because TrackHandle keeps an Arc of it and the handle is part
+/// of the public API; the fields themselves stay private.
+pub(crate) struct AudioEngineInner {
     mixer: Arc<AudioMixer>,
     /// Loaded sounds: SoundId -> Arc<DecodedAudio>
     sounds: RwLock<HashMap<SoundId, Arc<DecodedAudio>>>,
@@ -364,8 +367,6 @@ struct AudioEngineInner {
     local_output: Arc<parking_lot::RwLock<LocalOutputStatus>>,
     /// Master volume (synced with mixer)
     master_volume: Arc<parking_lot::Mutex<f32>>,
-    /// Output sender for network broadcast
-    broadcast_tx: Option<Sender<MixedOutput>>,
     /// Next track ID
     next_track_id: AtomicU64,
 }
@@ -382,7 +383,6 @@ impl std::fmt::Debug for AudioEngineInner {
             .field("running", &self.running)
             .field("local_output", &self.local_output)
             .field("master_volume", &self.master_volume)
-            .field("broadcast_tx", &self.broadcast_tx)
             .field("next_track_id", &self.next_track_id)
             .finish()
     }
@@ -446,7 +446,6 @@ impl AudioEngine {
             running: Arc::new(AtomicBool::new(false)),
             local_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
-            broadcast_tx: None,
             next_track_id: AtomicU64::new(0),
         });
 
@@ -466,17 +465,10 @@ impl AudioEngine {
             running: Arc::new(AtomicBool::new(false)),
             local_output: Arc::new(parking_lot::RwLock::new(LocalOutputStatus::stopped())),
             master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
-            broadcast_tx: None,
             next_track_id: AtomicU64::new(0),
         });
 
         Ok(Self { inner })
-    }
-
-    /// Set the broadcast sender for network streaming
-    pub fn set_broadcast_sender(&self, _tx: Sender<MixedOutput>) {
-        // Note: This requires interior mutability, for now we document the pattern
-        // In practice, you'd use a RwLock<Option<Sender>> or similar
     }
 
     /// Initialize and start the CPAL output stream.

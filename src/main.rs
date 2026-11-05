@@ -11,62 +11,23 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-// For Ctrl+C handling in server-only mode
-use ctrlc;
-
 use soundshared::{
-    audio::{AudioEngine, MixedOutput, SoundId},
+    audio::{AudioEngine, MixedOutput, TARGET_CHANNELS, TARGET_SAMPLE_RATE},
     config::{parse_bind_host, Config},
     error::{Result, SoundSharedError},
     gui::{
-        types::{AppState, AudioCommand, ServerCommand, SoundInfo, ServerStatus},
+        types::{AppState, AudioCommand, ServerCommand, ServerStatus},
         run_gui,
     },
     network::{
         broadcast::{AudioBroadcaster, AudioFrame, BroadcasterConfig, BroadcasterHandle, BroadcastError},
-        server::{NetworkServer, ServerConfig, ServerHandle, ServerError, ServerState, api_status, websocket_handler, Router, get, TraceLayer},
+        server::{build_router, detect_local_ip, listen_url, Router, ServerConfig, ServerHandle, ServerState},
         websocket::WebSocketConfig,
     },
 };
 
 // Audio buffer type for inter-component communication (from mixer)
 type MixedOutputBuffer = MixedOutput;
-
-/// The URL listeners should open, derived from where the socket actually bound.
-///
-/// * a loopback bind is only reachable from this machine, so it advertises
-///   loopback;
-/// * a wildcard bind (`0.0.0.0` / `::`) advertises the OS-detected LAN address of
-///   the matching family, falling back to loopback when there is none;
-/// * an explicit address advertises itself.
-///
-/// `actual` supplies the real port, so a bind to port 0 reports the port the OS
-/// picked rather than the one that was asked for.
-fn listen_url(
-    bind_addr: std::net::IpAddr,
-    actual: std::net::SocketAddr,
-    detected: Option<std::net::IpAddr>,
-) -> String {
-    let advertise = if bind_addr.is_loopback() {
-        bind_addr
-    } else if bind_addr.is_unspecified() {
-        match detected {
-            // Never advertise an address of the other family: the socket only
-            // listens on the family it was bound to.
-            Some(ip) if ip.is_ipv4() == bind_addr.is_ipv4() => ip,
-            _ if bind_addr.is_ipv4() => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            _ => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        }
-    } else {
-        bind_addr
-    };
-
-    match advertise {
-        std::net::IpAddr::V4(ip) => format!("http://{}:{}", ip, actual.port()),
-        // IPv6 literals need brackets, otherwise the port reads as part of the address.
-        std::net::IpAddr::V6(ip) => format!("http://[{}]:{}", ip, actual.port()),
-    }
-}
 
 /// Audio processor that receives mixed audio from engine and forwards to broadcaster
 struct AudioProcessor {
@@ -94,11 +55,13 @@ impl AudioProcessor {
                 recv(self.audio_rx) -> msg => {
                     match msg {
                         Ok(mixed) => {
-                            // Convert MixedOutput to AudioFrame for broadcaster
+                            // Convert MixedOutput to AudioFrame for broadcaster.
+                            // The mix pipeline's own constants, so a change of
+                            // rate or channel count cannot drift apart here.
                             let frame = AudioFrame::new(
                                 mixed.buffer,
-                                48000, // sample rate
-                                2,     // channels
+                                TARGET_SAMPLE_RATE,
+                                TARGET_CHANNELS as u16,
                                 mixed.seq_no,
                             );
                             if let Err(e) = self.broadcaster.send_audio(frame) {
@@ -124,12 +87,69 @@ impl AudioProcessor {
     }
 }
 
+/// Bind the listener and spawn the task that serves it.
+///
+/// Split out of the command loop so a bind failure (or a failure to read the
+/// bound address) is a value the loop can report, instead of an early return
+/// that silently kills the whole server thread.
+async fn start_listener(
+    app: &Router,
+    bind_addr: std::net::IpAddr,
+    bind_port: u16,
+    detected_ip: Option<std::net::IpAddr>,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
+    let addr = std::net::SocketAddr::new(bind_addr, bind_port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let actual_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    info!("Network server listening on {}", actual_addr);
+
+    // Advertise somewhere the listener is actually reachable, recomputed on
+    // every Start so an edited bind address is reflected in the URL the GUI
+    // displays and copies.
+    let url = listen_url(bind_addr, actual_addr, detected_ip);
+
+    let app_clone = app.clone();
+    let mut shutdown_rx_for_server = shutdown_tx.subscribe();
+    let task = tokio::spawn(async move {
+        info!("🌐 Server task started, beginning to serve on {}", actual_addr);
+        let _ = axum::serve(listener, app_clone)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx_for_server.recv().await;
+                info!("🌐 Shutdown signal received, stopping server...");
+            })
+            .await;
+        info!("🌐 Server task ended");
+    });
+
+    Ok((url, task))
+}
+
+/// Signal the running listener and wait for it to finish.
+///
+/// The wait is bounded on purpose. axum finishes a graceful shutdown only once
+/// every open connection is gone, and a browser tab can hold a WebSocket open
+/// indefinitely; waiting on that without a deadline is what used to freeze the
+/// command loop (and the console, still reporting Live) forever.
+async fn stop_listener(shutdown_tx: &broadcast::Sender<()>, task: tokio::task::JoinHandle<()>) {
+    let _ = shutdown_tx.send(());
+    let mut task = task;
+    if tokio::time::timeout(Duration::from_secs(2), &mut task)
+        .await
+        .is_err()
+    {
+        warn!("Listener did not finish shutting down in time; detaching it");
+        task.abort();
+    }
+}
+
 /// Server manager that runs the network server in a Tokio runtime
 /// Server does NOT auto-start - only starts when GUI sends Start command
 fn run_server_and_get_handle(
     config: ServerConfig,
     server_cmd_rx: Receiver<ServerCommand>,
-    shutdown_rx: Receiver<()>,
     listener_count_tx: Sender<usize>,
     server_handle_tx: Sender<ServerHandle>,
 ) -> Result<()> {
@@ -139,7 +159,9 @@ fn run_server_and_get_handle(
         .expect("Failed to create Tokio runtime");
 
     let result = rt.block_on(async {
-        let (shutdown_tx, mut shutdown_rx_tokio) = broadcast::channel(1);
+        // Kept for the whole run: every listener session subscribes to this
+        // signal, so a Stop reaches the browsers as well as the accept loop.
+        let (shutdown_tx, _) = broadcast::channel(1);
         
         // Create broadcaster
         let (broadcaster_handle, broadcaster) = AudioBroadcaster::new(config.broadcaster_config.clone());
@@ -155,21 +177,15 @@ fn run_server_and_get_handle(
         // URL of the running server; `None` while the socket is down.
         let mut server_url: Option<String> = None;
 
-        // Build the router - all routes share ServerState
+        // One router definition, shared with NetworkServer: the app used to
+        // hand-build a second copy of this exact route table.
         let state = ServerState {
             broadcaster: broadcaster_handle.clone(),
             websocket_config: config.websocket_config.clone(),
+            shutdown_tx: shutdown_tx.clone(),
         };
 
-        let app = Router::new()
-            .route("/", get(soundshared::network::server::serve_index_html))
-            .route("/index.html", get(soundshared::network::server::serve_index_html))
-            .route("/app.js", get(soundshared::network::server::serve_app_js))
-            .route("/style.css", get(soundshared::network::server::serve_style_css))
-            .route("/api/status", get(api_status))
-            .route("/ws/audio", get(websocket_handler))
-            .with_state(state)
-            .layer(TraceLayer::new_for_http());
+        let app = build_router(state);
 
         // Create server handle (URL is None until Start command)
         let shutdown_tx_for_handle = shutdown_tx.clone();
@@ -184,7 +200,7 @@ fn run_server_and_get_handle(
         let _ = server_handle_tx.send(handle.clone());
 
         // Spawn broadcaster task once — it runs continuously regardless of server state
-        let mut broadcaster_task = tokio::spawn(broadcaster.run());
+        let broadcaster_task = tokio::spawn(broadcaster.run());
 
         // Subscribe to listener count
         let mut count_rx = broadcaster_handle.subscribe_count();
@@ -220,65 +236,56 @@ fn run_server_and_get_handle(
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(ServerCommand::Start { response }) => {
-                            if !server_running {
-                                // Bind listener and start serving ONLY on Start command
-                                let addr = std::net::SocketAddr::new(bind_addr, bind_port);
-                                match tokio::net::TcpListener::bind(addr).await {
-                                    Ok(listener) => {
-                                        let actual_addr = listener.local_addr()
-                                            .map_err(|e| SoundSharedError::Other(e.to_string()))?;
-                                        info!("Network server listening on {}", actual_addr);
+                            if server_running {
+                                let _ = response.send(Err(anyhow::anyhow!("Server already running")));
+                            } else {
+                                // Bind listener and start serving ONLY on Start command.
+                                // Reported through the response channel, not by
+                                // bubbling up: a bind failure must not kill the
+                                // server thread.
+                                let started = start_listener(
+                                    &app,
+                                    bind_addr,
+                                    bind_port,
+                                    detected_ip,
+                                    &shutdown_tx,
+                                )
+                                .await;
 
-                                        // Advertise somewhere the listener is actually
-                                        // reachable, recomputed on every Start so an
-                                        // edited bind address is reflected in the URL
-                                        // the GUI displays and copies.
-                                        let url = listen_url(bind_addr, actual_addr, detected_ip);
-
-                                        // Spawn server task
-                                        let app_clone = app.clone();
-                                        let mut shutdown_rx_for_server = shutdown_tx.subscribe();
-                                        let st = tokio::spawn(async move {
-                                            info!("🌐 Server task started, beginning to serve on {}", actual_addr);
-                                            axum::serve(listener, app_clone)
-                                                .with_graceful_shutdown(async move {
-                                                    let _ = shutdown_rx_for_server.recv().await;
-                                                    info!("🌐 Shutdown signal received, stopping server...");
-                                                })
-                                                .await;
-                                            info!("🌐 Server task ended");
-                                        });
-
+                                match started {
+                                    Ok((url, task)) => {
                                         server_running = true;
                                         listener_count = 0;
-                                        server_task = Some(st);
+                                        server_task = Some(task);
                                         server_url = Some(url.clone());
 
                                         *handle.url.lock().await = Some(url.clone());
                                         let _ = response.send(Ok(url.clone()));
                                         info!("Server started at {}", url);
                                     }
-                                    Err(e) => {
-                                        error!("Failed to bind listener: {}", e);
-                                        let _ = response.send(Err(SoundSharedError::Other(e.to_string()).into()));
+                                    Err(message) => {
+                                        error!("Failed to start listener: {}", message);
+                                        let _ = response.send(Err(SoundSharedError::Other(message).into()));
                                     }
                                 }
-                            } else {
-                                let _ = response.send(Err(anyhow::anyhow!("Server already running").into()));
                             }
                         }
                         Some(ServerCommand::Stop { response }) => {
                             if server_running {
-                                shutdown_tx.send(()).ok();
                                 server_running = false;
-                                listener_count = 0;
 
-                                // Wait for server task to finish
-                                if let Some(st) = server_task.take() {
-                                    let _ = st.await;
+                                // Tell the listener (and every session it holds
+                                // open) to stop, then wait for it with a deadline.
+                                // Every listener session closes its socket on this
+                                // signal, so the wait is short; the deadline is the
+                                // backstop that keeps one stubborn client from
+                                // freezing the command loop.
+                                if let Some(task) = server_task.take() {
+                                    stop_listener(&shutdown_tx, task).await;
                                 }
 
                                 server_url = None;
+                                listener_count = 0;
                                 *handle.url.lock().await = None;
                                 let _ = listener_count_tx.send(0);
                                 let _ = response.send(Ok(()));
@@ -339,45 +346,18 @@ fn run_server_and_get_handle(
             }
         }
 
-        // Cleanup on shutdown
-        if let Some(st) = server_task.take() {
-            let _ = st.await;
+        // Cleanup on shutdown. The broadcaster is detached instead of awaited:
+        // it lives as long as the audio engine holds its handle, so waiting for
+        // it here would block this thread for the rest of the run.
+        if let Some(task) = server_task.take() {
+            stop_listener(&shutdown_tx, task).await;
         }
-        let _ = broadcaster_task.await;
+        broadcaster_task.abort();
 
         Ok::<(), SoundSharedError>(())
     });
 
     result
-}
-
-// Helper function for local IP detection
-async fn detect_local_ip() -> Option<std::net::IpAddr> {
-    use std::net::UdpSocket;
-    
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    if let Ok(socket) = UdpSocket::bind("[::]:0") {
-        if socket.connect("[2001:4860:4860::8888]:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    None
 }
 
 fn main() -> Result<()> {
@@ -436,14 +416,14 @@ fn main() -> Result<()> {
     // Wrap audio engine in Arc<Mutex> for sharing with GUI (main thread)
     let audio_engine_shared = Arc::new(Mutex::new(Some(audio_engine)));
 
-    // Create network server config
+    // Create network server config. The listener page is embedded in the binary
+    // (build_router), so there is no static directory to point at any more.
     let server_config = ServerConfig {
         port: config.server.port,
         bind_addr: parse_bind_host(&config.server.host)
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
-        static_dir: Some("src/network/static".to_string()),
     };
 
     // Create shared app state (for GUI)
@@ -454,8 +434,10 @@ fn main() -> Result<()> {
         Arc::new(Mutex::new(config.clone())),
     );
 
-    // Spawn server thread (does NOT auto-start - waits for Start command from GUI)
-    let server_shutdown_rx = shutdown_rx.clone();
+    // Spawn server thread (does NOT auto-start - waits for Start command from GUI).
+    // The thread learns about process shutdown from its own Stop command / the
+    // process exit; the crossbeam shutdown channel only carries the audio
+    // processor's signal, which is why this call never took it.
     let listener_count_tx_clone = listener_count_tx.clone();
     let server_cmd_rx_clone = server_cmd_rx.clone();
     let server_config_clone = server_config.clone();
@@ -464,7 +446,6 @@ fn main() -> Result<()> {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
             server_cmd_rx_clone,
-            server_shutdown_rx,
             listener_count_tx_clone,
             server_handle_tx_clone,
         ) {
@@ -547,7 +528,7 @@ fn main() -> Result<()> {
         let _ = shutdown_tx.send(());
         thread::sleep(Duration::from_millis(300));
 
-        if let Some(mut engine) = audio_engine_shared.lock().unwrap().take() {
+        if let Some(engine) = audio_engine_shared.lock().unwrap().take() {
             if let Err(e) = engine.stop_output() {
                 warn!("Error stopping audio engine: {}", e);
             }
@@ -569,7 +550,7 @@ fn main() -> Result<()> {
         thread::sleep(Duration::from_millis(500));
 
         // Stop audio engine (on main thread)
-        if let Some(mut engine) = audio_engine_shared.lock().unwrap().take() {
+        if let Some(engine) = audio_engine_shared.lock().unwrap().take() {
             if let Err(e) = engine.stop_output() {
                 warn!("Error stopping audio engine: {}", e);
             }
@@ -597,94 +578,4 @@ fn init_logging(config: &Config) -> Result<()> {
         .map_err(|e| SoundSharedError::Other(format!("Failed to set global logger: {}", e)))?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    #[test]
-    fn listen_url_advertises_loopback_for_loopback_binds() {
-        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 8080));
-        assert_eq!(
-            listen_url(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                v4,
-                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
-            ),
-            "http://127.0.0.1:8080"
-        );
-
-        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9000));
-        assert_eq!(
-            listen_url(IpAddr::V6(Ipv6Addr::LOCALHOST), v6, None),
-            "http://[::1]:9000"
-        );
-    }
-
-    #[test]
-    fn listen_url_prefers_the_detected_lan_address_for_wildcard_binds() {
-        let actual = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080));
-        assert_eq!(
-            listen_url(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                actual,
-                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
-            ),
-            "http://192.168.1.245:8080"
-        );
-
-        // Without detection a wildcard bind is only guaranteed reachable locally.
-        assert_eq!(
-            listen_url(IpAddr::V4(Ipv4Addr::UNSPECIFIED), actual, None),
-            "http://127.0.0.1:8080"
-        );
-    }
-
-    #[test]
-    fn listen_url_never_advertises_the_other_address_family() {
-        // IPv4 wildcard socket + IPv6 detection: advertising `::1` would point
-        // at a socket this server never opened.
-        let actual4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080));
-        assert_eq!(
-            listen_url(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                actual4,
-                Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
-            ),
-            "http://127.0.0.1:8080"
-        );
-
-        // …and the mirror image for an IPv6 wildcard socket.
-        let actual6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 8080));
-        assert_eq!(
-            listen_url(
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                actual6,
-                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
-            ),
-            "http://[::1]:8080"
-        );
-    }
-
-    #[test]
-    fn listen_url_reports_the_port_the_os_actually_bound() {
-        // The OS may pick the port (bind to 0), and the advertised URL has to
-        // match the socket rather than the requested port.
-        let actual = SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000));
-        assert_eq!(
-            listen_url(IpAddr::V4(Ipv4Addr::LOCALHOST), actual, None),
-            "http://127.0.0.1:41000"
-        );
-    }
-
-    #[test]
-    fn listen_url_advertises_an_explicit_address_verbatim() {
-        let actual = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 7), 8080));
-        assert_eq!(
-            listen_url(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), actual, None),
-            "http://10.0.0.7:8080"
-        );
-    }
 }

@@ -71,14 +71,12 @@ mod tests {
     #[test]
     fn unrecognised_env_values_fall_back_to_the_config() {
         for typo in ["", "  ", "maybe", "2", "reduced"] {
-            assert_eq!(
+            assert!(
                 resolve_reduced_motion(true, Some(typo)),
-                true,
                 "{typo:?} must not switch motion off"
             );
-            assert_eq!(
-                resolve_reduced_motion(false, Some(typo)),
-                false,
+            assert!(
+                !resolve_reduced_motion(false, Some(typo)),
                 "{typo:?} must not switch motion on"
             );
         }

@@ -94,7 +94,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
             }
         }
 
-        Dialog::RenameGroup { id, name, error } => {
+        Dialog::RenameGroup { name, error, .. } => {
             let mut field = name;
             let mut submit = false;
             let mut cancel = false;
@@ -145,7 +145,6 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 });
             });
 
-            let _ = id;
             if let Dialog::RenameGroup { name, .. } = state.dialog_mut() {
                 *name = field;
             }
@@ -219,17 +218,15 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                 .iter()
                 .map(|group| (group.id, group.name.clone()))
                 .collect();
+            // Look the sound up among all loaded sounds, not the visible rows:
+            // filtering the board to another group used to make this dialog
+            // highlight "Ungrouped" for a sound that is in a group.
             let current = state
-                .library()
-                .sound(
-                    &state
-                        .visible_sounds()
-                        .iter()
-                        .find(|entry| entry.id == sound_id)
-                        .map(|entry| entry.path.clone())
-                        .unwrap_or_default(),
-                )
-                .and_then(|sound| sound.group);
+                .sounds()
+                .iter()
+                .find(|entry| entry.id == sound_id)
+                .map(|entry| entry.group)
+                .unwrap_or(None);
 
             let mut chosen: Option<Option<GroupId>> = None;
             let mut cancel = false;

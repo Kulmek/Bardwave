@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, broadcast, oneshot};
 use axum::extract::ws::Message;
 use tracing::{debug, info, warn};
@@ -17,25 +16,36 @@ pub struct AudioFormatInfo {
     pub frame_size: usize, // samples per channel per frame
 }
 
-/// Configuration for the broadcaster
+/// Configuration for the broadcaster.
+///
+/// Only the engine channel capacity lives here. The per-client send buffer and
+/// the keepalive interval belong to the WebSocket session; the copies that used
+/// to sit in this struct were never read by anything.
 #[derive(Debug, Clone)]
 pub struct BroadcasterConfig {
-    /// Maximum number of audio frames to buffer per client
-    pub client_buffer_size: usize,
     /// Channel capacity for incoming audio from engine
     pub engine_channel_capacity: usize,
-    /// Interval for sending keepalive/ping frames
-    pub ping_interval: Duration,
 }
 
 impl Default for BroadcasterConfig {
     fn default() -> Self {
         Self {
-            client_buffer_size: 200,
             engine_channel_capacity: 500,
-            ping_interval: Duration::from_secs(30),
         }
     }
+}
+
+/// Text frame that tells a listener which stream format it is receiving.
+///
+/// Shared by the broadcaster (announced with the first frame) and by the
+/// WebSocket session (a listener that joined later, or asked with get_format),
+/// so every producer spells the message the same way.
+pub fn format_message(info: &AudioFormatInfo) -> String {
+    serde_json::json!({
+        "type": "format",
+        "data": info
+    })
+    .to_string()
 }
 
 /// Internal messages for broadcaster control
@@ -55,6 +65,8 @@ pub struct BroadcasterHandle {
     count_tx: broadcast::Sender<usize>,
     /// Channel to send commands to broadcaster
     command_tx: mpsc::Sender<BroadcasterCommand>,
+    /// Stream format established by the first mixed frame
+    format_info: Arc<Mutex<Option<AudioFormatInfo>>>,
 }
 
 impl BroadcasterHandle {
@@ -69,6 +81,14 @@ impl BroadcasterHandle {
     /// Get current listener count
     pub async fn listener_count(&self) -> usize {
         *self.listener_count.lock().await
+    }
+
+    /// Stream format, once the first frame has established it.
+    ///
+    /// Lets a session tell a late-joining listener what it is about to receive,
+    /// instead of waiting for a format change that never comes.
+    pub async fn format_info(&self) -> Option<AudioFormatInfo> {
+        self.format_info.lock().await.clone()
     }
 
     /// Subscribe to listener count changes
@@ -183,12 +203,10 @@ pub enum BroadcastError {
 struct ClientSession {
     id: Uuid,
     ws_tx: mpsc::Sender<Message>,
-    connected_at: std::time::Instant,
 }
 
 /// The audio broadcaster - receives from engine, sends to all WebSocket clients
 pub struct AudioBroadcaster {
-    config: BroadcasterConfig,
     /// Receiver for audio frames from engine
     audio_rx: mpsc::Receiver<AudioFrame>,
     /// Receiver for control commands
@@ -220,10 +238,10 @@ impl AudioBroadcaster {
             listener_count: listener_count.clone(),
             count_tx: count_tx.clone(),
             command_tx,
+            format_info: format_info.clone(),
         };
 
         let broadcaster = Self {
-            config,
             audio_rx,
             command_rx,
             clients,
@@ -239,11 +257,7 @@ impl AudioBroadcaster {
     /// Register a new WebSocket client
     async fn register_client(&self, ws_tx: mpsc::Sender<Message>) -> Uuid {
         let id = Uuid::new_v4();
-        let session = ClientSession {
-            id,
-            ws_tx,
-            connected_at: std::time::Instant::now(),
-        };
+        let session = ClientSession { id, ws_tx };
 
         let mut clients = self.clients.lock().await;
         clients.push(session);
@@ -271,34 +285,28 @@ impl AudioBroadcaster {
         info!("Client disconnected: {} (total listeners: {})", id, count);
     }
 
-    /// Send audio format info to a newly connected client
-    async fn send_format_info(&self, ws_tx: &mpsc::Sender<Message>) {
-        let format_info = self.format_info.lock().await;
-        if let Some(info) = format_info.as_ref() {
-            let msg = serde_json::json!({
-                "type": "format",
-                "data": info
-            });
-            if let Ok(text) = serde_json::to_string(&msg) {
-                let _ = ws_tx.try_send(Message::Text(text.into()));
-            }
-        }
-    }
-
     /// Broadcast audio frame to all connected clients
     async fn broadcast_frame(&self, frame: AudioFrame) {
-        // Update format info on first frame
-        {
+        // The first frame is what establishes the stream format, and every
+        // listener that is already connected has never been told about it: the
+        // format announcement used to be prepared but never actually sent.
+        let announcement = {
             let mut format_info = self.format_info.lock().await;
-            if format_info.is_none() {
-                *format_info = Some(AudioFormatInfo {
-                    sample_rate: frame.sample_rate,
-                    channels: frame.channels,
-                    format: "f32".to_string(),
-                    frame_size: frame.frame_count(),
-                });
+            match format_info.as_ref() {
+                Some(_) => None,
+                None => {
+                    let info = AudioFormatInfo {
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
+                        format: "f32".to_string(),
+                        frame_size: frame.frame_count(),
+                    };
+                    let message = format_message(&info);
+                    *format_info = Some(info);
+                    Some(message)
+                }
             }
-        }
+        };
 
         let seq = self.seq_no.fetch_add(1, Ordering::Relaxed);
         let frame_with_seq = AudioFrame {
@@ -310,12 +318,15 @@ impl AudioBroadcaster {
         };
 
         let binary_data = frame_with_seq.to_binary();
-        let message = Message::Binary(binary_data.into());
+        let message = Message::Binary(binary_data);
 
         let mut clients = self.clients.lock().await;
         let mut disconnected = Vec::new();
 
         for client in clients.iter_mut() {
+            if let Some(text) = &announcement {
+                let _ = client.ws_tx.try_send(Message::Text(text.clone()));
+            }
             // Try to send; if the per-client buffer is full, skip this frame
             // for that client but keep the connection open. Only a closed
             // channel means the WebSocket task is really gone. Treating a
@@ -445,7 +456,6 @@ mod tests {
     async fn test_backpressure() {
         let config = BroadcasterConfig {
             engine_channel_capacity: 2,
-            ..Default::default()
         };
         let (handle, broadcaster) = AudioBroadcaster::new(config);
         let _task = tokio::spawn(broadcaster.run());

@@ -4,9 +4,9 @@
 //! brand left · master volume centre-left · live signal right.
 
 use crate::gui::app::{ServerStatus, SoundSharedApp};
-use crate::gui::theme::{alpha, hairline, micro_label, wordmark, Metrics, Palette};
-use crate::gui::widgets::{glyph, level_bar, level_slider, signal_dot, IconButton};
-use egui::{Align, Layout, Rect, Rounding, Sense, Stroke, Ui, Vec2};
+use crate::gui::theme::{micro_label, wordmark, Metrics, Palette};
+use crate::gui::widgets::{glyph, level_slider, signal_dot, IconButton};
+use egui::{Align, Layout, Rect, Rounding, Sense, Ui, Vec2};
 
 /// Height reserved for the master volume slider inside the bar.
 const MASTER_SLIDER_W: f32 = 150.0;
@@ -196,8 +196,10 @@ pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);
                 let tracks = state.get_sounds().len();
+                // The wire format is 32-bit float (see the browser client and
+                // the broadcaster header), so the strip must not claim 16-bit.
                 let label = format!(
-                    "{} kHz / 16-bit / stereo  ·  {} tracks  ·  {} groups",
+                    "{} kHz / f32 / stereo  ·  {} tracks  ·  {} groups",
                     crate::audio::decoder::TARGET_SAMPLE_RATE / 1000,
                     tracks,
                     state.group_count()
@@ -275,31 +277,3 @@ fn local_audio_readout(ui: &mut Ui, state: &SoundSharedApp) {
     );
 }
 
-pub fn master_meter(ui: &mut Ui, value: f32) {
-    ui.horizontal(|ui| {
-        ui.label(micro_label("Out"));
-        level_bar(ui, value, 60.0);
-        ui.label(
-            egui::RichText::new(format!("{:.0}%", value * 100.0))
-                .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
-                .color(Palette::ZINC_400),
-        );
-    });
-}
-
-/// Hairline divider helper mirrored from the theme for convenience.
-pub fn divider(ui: &mut Ui) {
-    hairline(ui);
-}
-
-/// Frame used by the bar (exported so the shell can keep identical styling).
-pub fn bar_frame() -> egui::Frame {
-    card_panel_frame()
-}
-
-fn card_panel_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(Palette::APP)
-        .stroke(Stroke::new(1.0_f32, alpha(Palette::BORDER, 255)))
-        .rounding(Rounding::ZERO)
-}
