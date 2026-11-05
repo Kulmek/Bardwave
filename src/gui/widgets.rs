@@ -185,6 +185,22 @@ impl<'a> ConsoleButton<'a> {
         let hovered = self.enabled && resp.hovered();
         let pressed = self.enabled && resp.is_pointer_button_down_on();
 
+        // Keyboard accessibility, both halves of it:
+        //
+        // * egui reports `Space`/`Enter` on a focused widget as
+        //   `fake_primary_click`, so it is folded into `clicked` here and every
+        //   caller keeps using `.clicked()`;
+        // * clicking a focusable widget does not move focus by itself, so a
+        //   click focuses it — which is what makes the ring appear and the
+        //   follow-up keystroke work.
+        if resp.clicked() {
+            resp.request_focus();
+        }
+        if resp.fake_primary_click {
+            resp.clicked = true;
+        }
+        let focused = self.enabled && resp.has_focus();
+
         let (fill, border, text_color, glyph_color) = match self.kind {
             BtnKind::Primary => {
                 // Pressed and hovered both darken to rose-700.
@@ -265,6 +281,16 @@ impl<'a> ConsoleButton<'a> {
                 },
             ),
         );
+
+        // 1px rose-400 focus ring, drawn just outside the border so it never
+        // hides the button's own edge.
+        if focused {
+            painter.rect_stroke(
+                rect.expand(1.0),
+                Rounding::same(Metrics::R_BTN + 1.0),
+                Stroke::new(1.0_f32, Palette::ROSE_400),
+            );
+        }
 
         let font = mono_font(self.font_size);
         let label = self.text.to_uppercase();
@@ -356,9 +382,19 @@ impl<'a> IconButton<'a> {
     fn show_inner(self, ui: &mut Ui) -> Response {
         let size = Vec2::splat(self.size);
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+        let mut resp = resp.on_hover_cursor(CursorIcon::PointingHand);
         let hovered = resp.hovered();
         let pressed = resp.is_pointer_button_down_on();
+
+        // Same keyboard contract as `ConsoleButton`: a click focuses the button,
+        // and `Space`/`Enter` on the focused button counts as a click.
+        if resp.clicked() {
+            resp.request_focus();
+        }
+        if resp.fake_primary_click {
+            resp.clicked = true;
+        }
+        let focused = resp.has_focus();
 
         let (fill, border, fg) = match self.kind {
             BtnKind::Primary => {
@@ -421,6 +457,13 @@ impl<'a> IconButton<'a> {
                 rect,
                 Rounding::same(Metrics::R_SM),
                 Stroke::new(1.0_f32, border),
+            );
+        }
+        if focused {
+            painter.rect_stroke(
+                rect.expand(1.0),
+                Rounding::same(Metrics::R_SM + 1.0),
+                Stroke::new(1.0_f32, Palette::ROSE_400),
             );
         }
         painter.text(

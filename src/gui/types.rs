@@ -48,6 +48,21 @@ pub enum ServerCommand {
     Start { response: Sender<anyhow::Result<String>> },
     /// Stop the network server
     Stop { response: Sender<anyhow::Result<()>> },
+    /// Point the server at a new bind address / port for the next start.
+    ///
+    /// Editing the CONFIGURATION fields must take effect without restarting the
+    /// app, so the server thread keeps these values instead of the bind address
+    /// captured when the process started. The server refuses the change while it
+    /// is running (the GUI greys the fields out in that state anyway) and
+    /// re-validates both values before accepting them.
+    SetBind {
+        /// Bind address as typed, e.g. `0.0.0.0`, `127.0.0.1`, `::1`
+        host: String,
+        /// Port as typed, validated to `1..=65535`
+        port: u16,
+        /// `Ok` once the new values are in force, `Err` with a displayable reason
+        response: Sender<Result<(), String>>,
+    },
     /// Get current server status
     GetStatus { response: Sender<ServerStatus> },
 }

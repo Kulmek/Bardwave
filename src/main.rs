@@ -16,7 +16,7 @@ use ctrlc;
 
 use soundshared::{
     audio::{AudioEngine, MixedOutput, SoundId},
-    config::Config,
+    config::{parse_bind_host, Config},
     error::{Result, SoundSharedError},
     gui::{
         types::{AppState, AudioCommand, ServerCommand, SoundInfo, ServerStatus},
@@ -31,6 +31,42 @@ use soundshared::{
 
 // Audio buffer type for inter-component communication (from mixer)
 type MixedOutputBuffer = MixedOutput;
+
+/// The URL listeners should open, derived from where the socket actually bound.
+///
+/// * a loopback bind is only reachable from this machine, so it advertises
+///   loopback;
+/// * a wildcard bind (`0.0.0.0` / `::`) advertises the OS-detected LAN address of
+///   the matching family, falling back to loopback when there is none;
+/// * an explicit address advertises itself.
+///
+/// `actual` supplies the real port, so a bind to port 0 reports the port the OS
+/// picked rather than the one that was asked for.
+fn listen_url(
+    bind_addr: std::net::IpAddr,
+    actual: std::net::SocketAddr,
+    detected: Option<std::net::IpAddr>,
+) -> String {
+    let advertise = if bind_addr.is_loopback() {
+        bind_addr
+    } else if bind_addr.is_unspecified() {
+        match detected {
+            // Never advertise an address of the other family: the socket only
+            // listens on the family it was bound to.
+            Some(ip) if ip.is_ipv4() == bind_addr.is_ipv4() => ip,
+            _ if bind_addr.is_ipv4() => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            _ => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        }
+    } else {
+        bind_addr
+    };
+
+    match advertise {
+        std::net::IpAddr::V4(ip) => format!("http://{}:{}", ip, actual.port()),
+        // IPv6 literals need brackets, otherwise the port reads as part of the address.
+        std::net::IpAddr::V6(ip) => format!("http://[{}]:{}", ip, actual.port()),
+    }
+}
 
 /// Audio processor that receives mixed audio from engine and forwards to broadcaster
 struct AudioProcessor {
@@ -110,8 +146,14 @@ fn run_server_and_get_handle(
 
         // Detect local IP
         let detected_ip = detect_local_ip().await;
-        let advertise_ip = detected_ip.unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
-        let server_url = format!("http://{}:{}", advertise_ip, config.port);
+
+        // The bind target is live state, not a snapshot: the GUI can change the
+        // CONFIGURATION port / bind address while the server is down, and the
+        // next Start has to use the new values.
+        let mut bind_addr = config.bind_addr;
+        let mut bind_port = config.port;
+        // URL of the running server; `None` while the socket is down.
+        let mut server_url: Option<String> = None;
 
         // Build the router - all routes share ServerState
         let state = ServerState {
@@ -167,7 +209,10 @@ fn run_server_and_get_handle(
         let mut server_task: Option<tokio::task::JoinHandle<()>> = None;
 
         info!("🌐 Server initialized, waiting for Start command");
-        info!("Server URL: {} (waiting for Start command)", server_url);
+        info!(
+            "Server will bind {}:{} on the next Start command",
+            bind_addr, bind_port
+        );
 
         loop {
             tokio::select! {
@@ -177,12 +222,18 @@ fn run_server_and_get_handle(
                         Some(ServerCommand::Start { response }) => {
                             if !server_running {
                                 // Bind listener and start serving ONLY on Start command
-                                let addr = std::net::SocketAddr::new(config.bind_addr, config.port);
+                                let addr = std::net::SocketAddr::new(bind_addr, bind_port);
                                 match tokio::net::TcpListener::bind(addr).await {
                                     Ok(listener) => {
                                         let actual_addr = listener.local_addr()
                                             .map_err(|e| SoundSharedError::Other(e.to_string()))?;
                                         info!("Network server listening on {}", actual_addr);
+
+                                        // Advertise somewhere the listener is actually
+                                        // reachable, recomputed on every Start so an
+                                        // edited bind address is reflected in the URL
+                                        // the GUI displays and copies.
+                                        let url = listen_url(bind_addr, actual_addr, detected_ip);
 
                                         // Spawn server task
                                         let app_clone = app.clone();
@@ -201,10 +252,11 @@ fn run_server_and_get_handle(
                                         server_running = true;
                                         listener_count = 0;
                                         server_task = Some(st);
+                                        server_url = Some(url.clone());
 
-                                        *handle.url.lock().await = Some(server_url.clone());
-                                        let _ = response.send(Ok(server_url.clone()));
-                                        info!("Server started");
+                                        *handle.url.lock().await = Some(url.clone());
+                                        let _ = response.send(Ok(url.clone()));
+                                        info!("Server started at {}", url);
                                     }
                                     Err(e) => {
                                         error!("Failed to bind listener: {}", e);
@@ -226,6 +278,7 @@ fn run_server_and_get_handle(
                                     let _ = st.await;
                                 }
 
+                                server_url = None;
                                 *handle.url.lock().await = None;
                                 let _ = listener_count_tx.send(0);
                                 let _ = response.send(Ok(()));
@@ -234,10 +287,40 @@ fn run_server_and_get_handle(
                                 let _ = response.send(Ok(()));
                             }
                         }
+                        Some(ServerCommand::SetBind { host, port, response }) => {
+                            if server_running {
+                                // The socket is already bound; the new values
+                                // only apply to the next Start.
+                                let _ = response.send(Err("Stop the server first".to_string()));
+                            } else {
+                                match parse_bind_host(&host) {
+                                    None => {
+                                        let _ = response.send(Err(format!(
+                                            "Not an IP address: {}",
+                                            host
+                                        )));
+                                    }
+                                    Some(_) if port == 0 => {
+                                        let _ = response.send(Err(
+                                            "Port must be 1-65535".to_string(),
+                                        ));
+                                    }
+                                    Some(ip) => {
+                                        bind_addr = ip;
+                                        bind_port = port;
+                                        info!(
+                                            "Server bind address set to {}:{}",
+                                            bind_addr, bind_port
+                                        );
+                                        let _ = response.send(Ok(()));
+                                    }
+                                }
+                            }
+                        }
                         Some(ServerCommand::GetStatus { response }) => {
                             let status = ServerStatus {
                                 running: server_running,
-                                address: if server_running { Some(server_url.clone()) } else { None },
+                                address: server_url.clone(),
                                 listener_count,
                             };
                             let _ = response.send(status);
@@ -356,7 +439,7 @@ fn main() -> Result<()> {
     // Create network server config
     let server_config = ServerConfig {
         port: config.server.port,
-        bind_addr: config.server.host.parse()
+        bind_addr: parse_bind_host(&config.server.host)
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
@@ -425,7 +508,11 @@ fn main() -> Result<()> {
                     "Failed to start local audio output: {}. Falling back to headless streaming.",
                     e
                 );
-                if let Err(headless_err) = engine.start_headless_output() {
+                // Carry the reason the device could not be opened, so the status
+                // strip can say *why* the desktop is silent instead of just
+                // reporting "headless".
+                let reason = format!("local output unavailable: {e}");
+                if let Err(headless_err) = engine.start_headless_output_with_reason(reason) {
                     error!("Failed to start headless audio engine: {}", headless_err);
                 }
             }
@@ -510,4 +597,94 @@ fn init_logging(config: &Config) -> Result<()> {
         .map_err(|e| SoundSharedError::Other(format!("Failed to set global logger: {}", e)))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn listen_url_advertises_loopback_for_loopback_binds() {
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 8080));
+        assert_eq!(
+            listen_url(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                v4,
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
+            ),
+            "http://127.0.0.1:8080"
+        );
+
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9000));
+        assert_eq!(
+            listen_url(IpAddr::V6(Ipv6Addr::LOCALHOST), v6, None),
+            "http://[::1]:9000"
+        );
+    }
+
+    #[test]
+    fn listen_url_prefers_the_detected_lan_address_for_wildcard_binds() {
+        let actual = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080));
+        assert_eq!(
+            listen_url(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                actual,
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
+            ),
+            "http://192.168.1.245:8080"
+        );
+
+        // Without detection a wildcard bind is only guaranteed reachable locally.
+        assert_eq!(
+            listen_url(IpAddr::V4(Ipv4Addr::UNSPECIFIED), actual, None),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn listen_url_never_advertises_the_other_address_family() {
+        // IPv4 wildcard socket + IPv6 detection: advertising `::1` would point
+        // at a socket this server never opened.
+        let actual4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080));
+        assert_eq!(
+            listen_url(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                actual4,
+                Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            ),
+            "http://127.0.0.1:8080"
+        );
+
+        // …and the mirror image for an IPv6 wildcard socket.
+        let actual6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 8080));
+        assert_eq!(
+            listen_url(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                actual6,
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 245)))
+            ),
+            "http://[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn listen_url_reports_the_port_the_os_actually_bound() {
+        // The OS may pick the port (bind to 0), and the advertised URL has to
+        // match the socket rather than the requested port.
+        let actual = SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000));
+        assert_eq!(
+            listen_url(IpAddr::V4(Ipv4Addr::LOCALHOST), actual, None),
+            "http://127.0.0.1:41000"
+        );
+    }
+
+    #[test]
+    fn listen_url_advertises_an_explicit_address_verbatim() {
+        let actual = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 7), 8080));
+        assert_eq!(
+            listen_url(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), actual, None),
+            "http://10.0.0.7:8080"
+        );
+    }
 }

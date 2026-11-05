@@ -13,9 +13,12 @@
 //! ─────────────────────────────
 //! [ ■ STOP SERVER ] [ ⧉ COPY LINK ]
 //! ─────────────────────────────
-//! CONFIGURATION  PORT 8080   BIND 0.0.0.0
+//! CONFIGURATION  PORT [8080]   BIND [0.0.0.0]
 //! WS / 48 kHz / STEREO
 //! ```
+//!
+//! The two CONFIGURATION wells are real text inputs: a valid edit updates the
+//! config, `config.toml` and the server thread without restarting the app.
 
 use crate::gui::app::{ServerStatus as GuiServerStatus, SoundSharedApp};
 use crate::gui::theme::{
@@ -69,7 +72,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         };
 
         ui.horizontal(|ui| {
-            signal_dot(ui, status_color, 8.0, pulse);
+            signal_dot(ui, status_color, 8.0, pulse && !state.reduced_motion());
             ui.add_space(Metrics::SM);
             ui.label(
                 RichText::new(headline.to_uppercase())
@@ -237,36 +240,83 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         ui.label(micro_label("Configuration"));
         ui.add_space(Metrics::SM);
 
+        // The bind address and port can only be changed while the socket is
+        // down: the running server captured its address at `Start`, and
+        // `ServerCommand::SetBind` refuses edits in that state.
         let config_enabled = !matches!(
             server.status,
             GuiServerStatus::Running | GuiServerStatus::Starting
         );
+
+        let mut port_edited = false;
+        let mut bind_edited = false;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(micro_label("Port"));
                 ui.add_space(2.0);
-                config_field(
+                let response = config_input(
                     ui,
-                    &state.get_server_port().to_string(),
+                    state.port_input_mut(),
                     config_enabled,
-                    80.0,
+                    PORT_WELL_W,
+                    crate::gui::app::PORT_INPUT_MAX_CHARS,
+                    "server_port_input",
                 );
+                port_edited = response.changed();
             });
             ui.add_space(Metrics::SM);
             ui.vertical(|ui| {
                 ui.label(micro_label("Bind Address"));
                 ui.add_space(2.0);
-                config_field(ui, &state.get_server_bind_addr(), config_enabled, 120.0);
+                let response = config_input(
+                    ui,
+                    state.bind_input_mut(),
+                    config_enabled,
+                    BIND_WELL_W,
+                    crate::gui::app::BIND_INPUT_MAX_CHARS,
+                    "server_bind_input",
+                );
+                bind_edited = response.changed();
             });
         });
 
-        if config_enabled {
-            ui.add_space(Metrics::XS);
-            ui.label(micro_label("Editable while stopped"));
-        } else {
-            ui.add_space(Metrics::XS);
-            ui.label(micro_label("Stop the server to edit"));
+        // Keystroke → validation → commit. Invalid text leaves the last valid
+        // host/port in force and only raises the inline error below.
+        if port_edited {
+            state.on_port_edited();
         }
+        if bind_edited {
+            state.on_bind_edited();
+        }
+
+        if let Some(error) = state.config_error() {
+            ui.add_space(Metrics::XS);
+            ui.label(
+                RichText::new(error.to_uppercase())
+                    .font(crate::gui::widgets::glyph_font(9.0))
+                    .color(Palette::ROSE_400)
+                    .extra_letter_spacing(0.8),
+            );
+        }
+
+        ui.add_space(Metrics::XS);
+        ui.horizontal(|ui| {
+            ui.label(micro_label(if config_enabled {
+                "Editable while stopped"
+            } else {
+                "Stop the server to edit"
+            }));
+            if state.config_saved() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("Saved")
+                            .font(crate::gui::widgets::glyph_font(Metrics::MICRO_TINY))
+                            .color(Palette::ROSE_400)
+                            .extra_letter_spacing(1.0),
+                    );
+                });
+            }
+        });
 
         ui.add_space(Metrics::LG);
         hairline(ui);
@@ -275,32 +325,65 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
     });
 }
 
-/// Read-only telemetry field. The values are edited in the settings dialog;
-/// here they are shown as the console's inset wells.
-fn config_field(ui: &mut Ui, value: &str, enabled: bool, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::hover());
-    let painter = ui.painter();
-    painter.rect(
-        rect,
-        egui::Rounding::same(Metrics::R_SM),
-        Palette::WELL,
-        egui::Stroke::new(1.0_f32, Palette::BORDER),
-    );
-    let color = if enabled {
+/// Width of the `PORT` well, and of the `BIND ADDRESS` well next to it.
+///
+/// Together with the 8px gaps they fill the 292px panel body exactly the way the
+/// read-only pair did.
+const PORT_WELL_W: f32 = 80.0;
+const BIND_WELL_W: f32 = 120.0;
+
+/// Height of the two CONFIGURATION wells.
+const CONFIG_WELL_H: f32 = 36.0;
+
+/// Space the well leaves between its border and the text, per side.
+const CONFIG_WELL_PAD_X: f32 = 12.0;
+
+/// Editable CONFIGURATION field: the console's inset well around a real
+/// `TextEdit`, so PORT and BIND ADDRESS can actually be typed into.
+///
+/// Painted with the same tokens as the read-only wells it replaces (`Palette::WELL`,
+/// `Palette::BORDER`, `Metrics::R_SM`, 12px mono text). A disabled field is
+/// greyed out and stops accepting clicks and keystrokes; the caller keeps
+/// showing the hint line that explains why.
+fn config_input(
+    ui: &mut Ui,
+    value: &mut String,
+    enabled: bool,
+    width: f32,
+    max_chars: usize,
+    id_salt: &str,
+) -> egui::Response {
+    let font = crate::gui::widgets::glyph_font(12.0);
+    // The field is fixed-height, so the text is centred by padding it instead of
+    // by an extra layout: a `TextEdit` sizes itself to its row height.
+    let row_h = ui.fonts(|fonts| fonts.row_height(&font));
+    let pad_y = ((CONFIG_WELL_H - row_h) / 2.0).max(0.0);
+    let inner_w = (width - 2.0 * CONFIG_WELL_PAD_X).max(24.0);
+    let text_color = if enabled {
         Palette::WHITE
     } else {
         Palette::ZINC_600
     };
-    let galley = painter.layout_no_wrap(
-        value.to_string(),
-        crate::gui::widgets::glyph_font(12.0),
-        color,
-    );
-    painter.galley(
-        egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
+
+    egui::Frame::none()
+        .fill(Palette::WELL)
+        .stroke(egui::Stroke::new(1.0_f32, Palette::BORDER))
+        .rounding(egui::Rounding::same(Metrics::R_SM))
+        .inner_margin(egui::Margin::symmetric(CONFIG_WELL_PAD_X, 0.0))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .id_salt(id_salt)
+                    .frame(false)
+                    .interactive(enabled)
+                    .font(font)
+                    .text_color(text_color)
+                    .desired_width(inner_w)
+                    .char_limit(max_chars)
+                    .margin(egui::Margin::symmetric(0.0, pad_y)),
+            )
+        })
+        .inner
 }
 
 /// One-line server status for the command bar or a compact layout.

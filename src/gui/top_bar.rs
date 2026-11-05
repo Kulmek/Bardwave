@@ -151,7 +151,7 @@ fn live_status(ui: &mut Ui, state: &mut SoundSharedApp) {
                         .extra_letter_spacing(1.0)
                         .strong(),
                 );
-                signal_dot(ui, color, 7.0, pulse);
+                signal_dot(ui, color, 7.0, pulse && !state.reduced_motion());
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(micro_label(subline).size(9.0).extra_letter_spacing(0.8));
@@ -167,7 +167,7 @@ fn vertical_divider(ui: &mut Ui) {
         .rect_filled(rect, Rounding::ZERO, Palette::BORDER);
 }
 
-/// Bottom status strip (28px): version left, format right.
+/// Bottom status strip (28px): version left, local output centre, format right.
 pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
     let rect = ui.max_rect();
     ui.painter().rect_filled(rect, Rounding::ZERO, Palette::APP);
@@ -190,6 +190,9 @@ pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
                     .extra_letter_spacing(1.0),
             );
 
+            ui.add_space(Metrics::LG);
+            local_audio_readout(ui, state);
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Metrics::PANEL_PAD);
                 let tracks = state.get_sounds().len();
@@ -210,7 +213,68 @@ pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
     );
 }
 
-/// Compact master readout reused elsewhere (kept for API stability).
+/// Compact "where the sound is going" readout for the status strip.
+///
+/// The web listeners are fed from the mixer in every state, so a silent desktop
+/// is otherwise indistinguishable from a working one: this strip is what says
+/// `LOCAL OFF` (headless), `LOCAL FAILED` (with the device error) or the device
+/// the mix is being played on.
+fn local_audio_readout(ui: &mut Ui, state: &SoundSharedApp) {
+    use crate::audio::LocalOutputState as State;
+
+    let status = state.local_output();
+    let (dot, color, text) = match &status.state {
+        State::Running => {
+            let text = match status.device.as_deref() {
+                Some(device) => format!("Local · {device}"),
+                None => "Local".to_string(),
+            };
+            (Palette::ROSE_500, Palette::ZINC_400, text)
+        }
+        State::Headless => (
+            Palette::AMBER_400,
+            Palette::AMBER_400,
+            "Local off — headless (network only)".to_string(),
+        ),
+        State::Failed(message) => (
+            Palette::ROSE_700,
+            Palette::ROSE_400,
+            format!("Local failed — {message}"),
+        ),
+        State::Stopped => (
+            Palette::ZINC_500,
+            Palette::ZINC_600,
+            "Local stopped".to_string(),
+        ),
+    };
+
+    // The readout competes with the format text on the right, so it is clipped
+    // rather than allowed to push the strip wider than the window.
+    ui.allocate_ui_with_layout(
+        Vec2::new(320.0, ui.available_height()),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_max_width(320.0);
+            crate::gui::widgets::signal_dot(
+                ui,
+                dot,
+                6.0,
+                matches!(status.state, State::Running) && !state.reduced_motion(),
+            );
+            ui.add_space(Metrics::SM);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text.to_uppercase())
+                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                        .color(color)
+                        .extra_letter_spacing(1.0),
+                )
+                .truncate(),
+            );
+        },
+    );
+}
+
 pub fn master_meter(ui: &mut Ui, value: f32) {
     ui.horizontal(|ui| {
         ui.label(micro_label("Out"));

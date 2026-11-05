@@ -1,0 +1,414 @@
+<!DOCTYPE html><html lang="en"><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoundShared Broadcast Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+    <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;700;900&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        noir: {
+                            black: '#0A0A0A',
+                            panel: '#111111',
+                            zinc: {
+                                950: '#09090B',
+                                900: '#18181B',
+                                800: '#27272A',
+                                700: '#3F3F46',
+                                600: '#52525B',
+                                500: '#71717A',
+                                400: '#A1A1AA',
+                                300: '#D4D4D8',
+                            }
+                        },
+                        rose: {
+                            400: '#FB7185',
+                            500: '#F43F5E',
+                            600: '#E11D48',
+                            700: '#BE123C',
+                            950: '#4C0519',
+                        },
+                        amber: {
+                            400: '#FBBF24',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Archivo', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    letterSpacing: {
+                        'micro': '0.12em',
+                        'title': '0.04em',
+                        'brand': '-0.01em',
+                        'btn': '0.08em',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #0A0A0A;
+            color: #FFFFFF;
+            font-family: 'Archivo', sans-serif;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .micro-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #71717A;
+        }
+        .micro-label-accent {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #F43F5E;
+        }
+        .panel-title {
+            font-size: 18px;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #FFFFFF;
+        }
+        .brand-title {
+            font-size: 20px;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: -0.01em;
+            color: #FFFFFF;
+        }
+        .btn-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #27272A;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #3F3F46;
+        }
+        /* Pulse animation */
+        @keyframes scanline {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100vh); }
+        }
+        .scanline {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: rgba(225, 29, 72, 0.03);
+            animation: scanline 8s linear infinite;
+            pointer-events: none;
+            z-index: 50;
+        }
+        /* Custom Range Slider */
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 4px;
+            border-radius: 0;
+            background: #E11D48;
+            cursor: pointer;
+            margin-top: -5px;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 2px;
+            cursor: pointer;
+            background: #3F3F46;
+        }
+        .range-red::-webkit-slider-runnable-track {
+             background: linear-gradient(to right, #E11D48 80%, #3F3F46 80%);
+        }
+    </style>
+</head>
+<body>
+    <div class="min-h-screen flex flex-col relative" data-sd-id="1">
+        <!-- Optional Scanline -->
+        <div class="scanline" data-sd-id="2"></div>
+
+        <!-- Top Command Bar -->
+        <header class="h-16 flex-none flex items-center justify-between border-b border-noir-zinc-800 px-6 bg-noir-panel z-10" data-sd-id="3">
+            <div class="flex items-center gap-3" data-sd-id="4">
+                <div class="w-5 h-5 bg-rose-600 rounded-sm flex items-center justify-center" data-sd-id="5">
+                    <div class="w-3 h-0.5 bg-white opacity-80" data-sd-id="6"></div>
+                    <div class="h-3 w-0.5 bg-white opacity-80 absolute" data-sd-id="7"></div>
+                    <div class="w-3 h-0.5 bg-white opacity-80 rotate-45 absolute" data-sd-id="8"></div>
+                    <div class="w-3 h-0.5 bg-white opacity-80 -rotate-45 absolute" data-sd-id="9"></div>
+                </div>
+                <div class="flex flex-col" data-sd-id="10">
+                    <span class="brand-title leading-none" data-sd-id="11">SoundShared</span>
+                    <span class="micro-label leading-none mt-1" data-sd-id="12">Broadcast Console</span>
+                </div>
+            </div>
+
+            <div class="flex items-center h-full" data-sd-id="13">
+                <div class="h-full w-px bg-noir-zinc-800 mx-6" data-sd-id="14"></div>
+                <div class="flex items-center gap-4" data-sd-id="15">
+                    <span class="micro-label" data-sd-id="16">Master</span>
+                    <div class="w-[150px] flex items-center" data-sd-id="17">
+                        <input type="range" min="0" max="100" value="80" class="range-red w-full" data-sd-id="18">
+                    </div>
+                    <span class="mono text-[11px] text-white w-8" data-sd-id="19">80%</span>
+                </div>
+                <div class="h-full w-px bg-noir-zinc-800 mx-6" data-sd-id="20"></div>
+                <button class="flex items-center gap-2 px-2 hover:bg-noir-zinc-900 rounded transition-colors h-8" data-sd-id="21">
+                     <div class="w-2 h-2 bg-noir-zinc-500" data-sd-id="22"></div>
+                     <span class="mono text-[11px] text-noir-zinc-500" data-sd-id="23">PANIC</span>
+                </button>
+                <div class="h-full w-px bg-noir-zinc-800 mx-6" data-sd-id="24"></div>
+                <div class="flex items-center gap-2" data-sd-id="25">
+                    <div class="w-2 h-2 rounded-full bg-noir-zinc-500" data-sd-id="26"></div>
+                    <div class="flex flex-col items-end" data-sd-id="27">
+                        <span class="mono text-[11px] text-noir-zinc-500 leading-none" data-sd-id="28">OFF AIR</span>
+                        <span class="mono text-[10px] text-noir-zinc-600 leading-none mt-1 uppercase" data-sd-id="29">Server Stopped</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="flex-1 flex gap-6 p-6 overflow-hidden" data-sd-id="30">
+            
+            <!-- Left Panel: 01 / LIBRARY -->
+            <section class="flex-1 bg-noir-panel border border-noir-zinc-800 rounded flex flex-col min-w-[600px]" data-sd-id="31">
+                <!-- Header -->
+                <div class="p-6 pb-4 border-b border-noir-zinc-800" data-sd-id="32">
+                    <div class="flex justify-between items-start" data-sd-id="33">
+                        <div data-sd-id="34">
+                            <div class="micro-label-accent mb-1" data-sd-id="35">01 / Library</div>
+                            <div class="flex items-end gap-3" data-sd-id="36">
+                                <h1 class="panel-title" data-sd-id="37">Sound Library</h1>
+                                <span class="mono text-[10px] text-noir-zinc-600 uppercase mb-0.5" data-sd-id="38">1 Track</span>
+                            </div>
+                        </div>
+                        <button class="bg-rose-600 hover:bg-rose-700 text-white rounded-sm h-9 px-4 flex items-center gap-2 transition-colors" data-sd-id="39">
+                            <span class="mono text-[12px]" data-sd-id="40">+</span>
+                            <span class="btn-label" data-sd-id="41">Add Sound</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Library Content -->
+                <div class="flex-1 flex overflow-hidden" data-sd-id="42">
+                    <!-- Rail -->
+                    <div class="w-[148px] border-r border-noir-zinc-800 flex flex-col py-4 gap-1" data-sd-id="43">
+                       <div class="px-4 flex justify-between items-center mb-2" data-sd-id="44">
+                            <span class="micro-label" data-sd-id="45">Groups</span>
+                            <span class="mono text-[10px] text-noir-zinc-500 cursor-pointer" data-sd-id="46">+</span>
+                       </div>
+                       
+                       <button class="w-full flex items-center justify-between px-4 py-1.5 bg-noir-zinc-900 border-l-2 border-rose-600 text-left" data-sd-id="47">
+                           <span class="text-[13px] text-white" data-sd-id="48">All Sounds</span>
+                           <span class="mono text-[11px] text-rose-500" data-sd-id="49">01</span>
+                       </button>
+                       <button class="w-full flex items-center justify-between px-4 py-1.5 text-left hover:bg-noir-zinc-900 transition-colors border-l-2 border-transparent" data-sd-id="50">
+                           <span class="text-[13px] text-noir-zinc-400" data-sd-id="51">Ungrouped</span>
+                           <span class="mono text-[11px] text-noir-zinc-600" data-sd-id="52">01</span>
+                       </button>
+                    </div>
+
+                    <!-- Sound List -->
+                    <div class="flex-1 p-6 overflow-y-auto flex flex-col gap-[10px]" data-sd-id="53">
+                        <!-- Single Sound Row -->
+                        <div class="h-16 bg-noir-zinc-900 border border-noir-zinc-800 rounded flex items-center px-4 gap-4 hover:border-noir-zinc-700 transition-colors group" data-sd-id="54">
+                            <button class="w-8 h-8 rounded-sm bg-rose-600 hover:bg-rose-700 flex items-center justify-center flex-none transition-colors" data-sd-id="55">
+                                <iconify-icon icon="material-symbols:play-arrow" class="text-white text-lg"></iconify-icon>
+                            </button>
+                            <button class="w-6 h-6 flex items-center justify-center opacity-50 hover:opacity-100 transition-opacity" data-sd-id="56">
+                                <iconify-icon icon="material-symbols:replay" class="text-noir-zinc-300 text-lg"></iconify-icon>
+                            </button>
+                            <div class="flex-1 min-w-0" data-sd-id="57">
+                                <div class="text-[13px] font-medium text-white truncate" data-sd-id="58">GORILLA GLUE, LIL NAKUR, Maladoy Prin...</div>
+                                <div class="mono text-[10px] text-noir-zinc-500 uppercase tracking-wide mt-0.5" data-sd-id="59">48 KHZ / 02:28 / MP3</div>
+                            </div>
+                            <div class="flex items-center gap-4 flex-none" data-sd-id="60">
+                                <div class="px-2 py-0.5 border border-noir-zinc-800 rounded-sm bg-noir-zinc-950" data-sd-id="61">
+                                    <span class="mono text-[9px] text-noir-zinc-500 uppercase" data-sd-id="62">No Group</span>
+                                </div>
+                                <div class="w-[80px] flex items-center" data-sd-id="63">
+                                    <input type="range" min="0" max="100" value="100" class="w-full" data-sd-id="64">
+                                </div>
+                                <span class="mono text-[11px] text-noir-zinc-400 w-8 text-right" data-sd-id="65">100%</span>
+                                <button class="w-6 h-6 flex items-center justify-center text-noir-zinc-600 hover:text-noir-zinc-300 transition-colors ml-2" data-sd-id="66">
+                                    <span class="mono text-xs" data-sd-id="67">□</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Master Output Footer -->
+                <div class="p-6 border-t border-noir-zinc-800 flex items-center justify-between" data-sd-id="68">
+                     <span class="micro-label" data-sd-id="69">Master Output</span>
+                     <div class="flex items-center gap-6" data-sd-id="70">
+                         <div class="flex items-center gap-4" data-sd-id="71">
+                            <div class="w-24 h-0.5 bg-noir-zinc-700 relative" data-sd-id="72">
+                                <div class="absolute left-0 top-0 h-full bg-rose-600 w-4/5" data-sd-id="73"></div>
+                                <div class="absolute left-[80%] top-[-2px] w-1 h-1.5 bg-rose-600" data-sd-id="74"></div>
+                            </div>
+                            <div class="flex gap-[2px]" data-sd-id="75">
+                                <!-- Meter Cells (20 cells) -->
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="76"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="77"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="78"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="79"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="80"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="81"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="82"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="83"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="84"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="85"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="86"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="87"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="88"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="89"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="90"></div>
+                                <div class="w-1.5 h-2.5 bg-rose-600" data-sd-id="91"></div>
+                                <div class="w-1.5 h-2.5 bg-noir-zinc-800" data-sd-id="92"></div>
+                                <div class="w-1.5 h-2.5 bg-noir-zinc-800" data-sd-id="93"></div>
+                                <div class="w-1.5 h-2.5 bg-noir-zinc-800" data-sd-id="94"></div>
+                                <div class="w-1.5 h-2.5 bg-noir-zinc-800" data-sd-id="95"></div>
+                            </div>
+                         </div>
+                         <span class="mono text-[11px] text-white w-8" data-sd-id="96">80%</span>
+                         <button class="px-3 py-1.5 border border-noir-zinc-800 rounded-sm hover:border-noir-zinc-700 hover:bg-noir-zinc-900 transition-colors" data-sd-id="97">
+                             <span class="btn-label text-noir-zinc-300" data-sd-id="98">Mute</span>
+                         </button>
+                     </div>
+                </div>
+            </section>
+
+            <!-- Right Panel: 02 / NETWORK -->
+            <section class="w-[340px] flex-none bg-noir-panel border border-noir-zinc-800 rounded flex flex-col p-6" data-sd-id="99">
+                <!-- Header -->
+                <div class="mb-6" data-sd-id="100">
+                    <div class="micro-label-accent mb-1" data-sd-id="101">02 / Network</div>
+                    <h2 class="panel-title" data-sd-id="102">Network Server</h2>
+                </div>
+
+                <!-- Status -->
+                <div class="mb-8 flex flex-col items-start" data-sd-id="103">
+                    <div class="flex items-center gap-3 mb-1" data-sd-id="104">
+                        <div class="w-3 h-3 rounded-full bg-noir-zinc-500" data-sd-id="105"></div>
+                        <div class="mono text-[24px] text-noir-zinc-500 leading-none" data-sd-id="106">OFF AIR</div>
+                    </div>
+                    <div class="mono text-[11px] text-noir-zinc-500 uppercase" data-sd-id="107">Server Stopped</div>
+                </div>
+
+                <!-- Listen URL -->
+                <div class="mb-6" data-sd-id="108">
+                    <label class="micro-label block mb-2" data-sd-id="109">Listen URL</label>
+                    <div class="flex gap-2" data-sd-id="110">
+                        <div class="flex-1 bg-noir-zinc-950 border border-noir-zinc-800 rounded-sm px-3 py-2 flex items-center" data-sd-id="111">
+                             <span class="mono text-[11px] text-noir-zinc-600" data-sd-id="112">--</span>
+                        </div>
+                        <button class="w-9 flex-none bg-noir-zinc-950 border border-noir-zinc-800 rounded-sm flex items-center justify-center hover:bg-noir-zinc-900 transition-colors" data-sd-id="113">
+                             <span class="mono text-[12px] text-noir-zinc-400" data-sd-id="114">□</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Listeners -->
+                <div class="mb-8 pb-6 border-b border-noir-zinc-800" data-sd-id="115">
+                    <label class="micro-label block mb-2" data-sd-id="116">Listeners</label>
+                    <div class="flex items-end justify-between" data-sd-id="117">
+                        <div class="flex items-center gap-3" data-sd-id="118">
+                            <span class="mono text-[28px] text-white leading-none" data-sd-id="119">00</span>
+                            <div class="flex gap-1 mb-1" data-sd-id="120">
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="121"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="122"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="123"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="124"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="125"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="126"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="127"></div>
+                                <div class="w-2 h-2 bg-noir-zinc-800 rounded-sm" data-sd-id="128"></div>
+                            </div>
+                        </div>
+                        <span class="mono text-[9px] text-noir-zinc-500 uppercase mb-1" data-sd-id="129">Peak 0</span>
+                    </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="flex gap-2 mb-8" data-sd-id="130">
+                    <button class="flex-1 bg-rose-600 hover:bg-rose-700 text-white rounded-sm h-9 flex items-center justify-center gap-2 transition-colors" data-sd-id="131">
+                        <span class="mono text-[12px]" data-sd-id="132">▶</span>
+                        <span class="btn-label" data-sd-id="133">Start Server</span>
+                    </button>
+                    <button class="px-4 border border-noir-zinc-800 rounded-sm hover:bg-noir-zinc-900 transition-colors flex items-center justify-center gap-2" data-sd-id="134">
+                         <span class="mono text-[12px] text-noir-zinc-400" data-sd-id="135">□</span>
+                         <span class="btn-label text-noir-zinc-400" data-sd-id="136">Copy Link</span>
+                    </button>
+                </div>
+
+                <!-- Configuration -->
+                <div class="mt-auto" data-sd-id="137">
+                    <div class="micro-label mb-3" data-sd-id="138">Configuration</div>
+                    <div class="flex gap-3 mb-2" data-sd-id="139">
+                        <div class="w-24" data-sd-id="140">
+                            <label class="micro-label block mb-1 text-[9px]" data-sd-id="141">Port</label>
+                            <div class="relative" data-sd-id="142">
+                                <input type="text" value="8080" class="w-20 h-9 bg-noir-zinc-950 border border-rose-600 ring-1 ring-rose-600 rounded-[2px] px-3 mono text-[12px] text-white focus:outline-none" id="port-input">
+                            </div>
+                        </div>
+                        <div class="flex-1" data-sd-id="143">
+                            <label class="micro-label block mb-1 text-[9px]" data-sd-id="144">Bind Address</label>
+                            <input type="text" value="0.0.0.0" class="w-[120px] h-9 bg-noir-zinc-950 border border-noir-zinc-800 rounded-[2px] px-3 mono text-[12px] text-white focus:outline-none focus:border-noir-zinc-700" id="bind-input">
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between mb-4" data-sd-id="146">
+                        <span class="mono text-[9px] text-rose-400 uppercase tracking-[0.08em]">Bind must be an IP address</span>
+                        <div class="flex items-center gap-2">
+                            <span class="mono text-[9px] text-noir-zinc-600 uppercase tracking-[0.08em]">Editable while stopped</span>
+                            <span class="mono text-[9px] text-rose-400 uppercase tracking-[0.08em]">Saved</span>
+                        </div>
+                    </div>
+                    <div class="mono text-[9px] text-noir-zinc-500 uppercase tracking-widest" data-sd-id="147">WS / 48 KHZ / STEREO</div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Bottom Status Strip -->
+        <footer class="h-7 flex-none px-6 grid grid-cols-3 items-center border-t border-noir-zinc-800 bg-noir-black" data-sd-id="148">
+            <span class="mono text-[9px] text-noir-zinc-600 tracking-wider justify-self-start" data-sd-id="149">SoundShared v0.1.0</span>
+            <div class="flex items-center justify-center gap-2 overflow-hidden px-4" data-sd-id="local-output-readout">
+                <div class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></div>
+                <span class="mono text-[9px] text-noir-zinc-400 tracking-[0.12em] uppercase truncate">Local · Wireless Headset (USB Audio)</span>
+            </div>
+            <span class="mono text-[9px] text-noir-zinc-600 tracking-wider justify-self-end" data-sd-id="150">48 kHz / 16-bit / stereo · 1 tracks · 0 groups</span>
+        </footer>
+    </div>
+
+</body></html>

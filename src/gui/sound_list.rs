@@ -551,9 +551,14 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
 
     if playing {
         // Pulsing dot in front of the name (the mockup's playing indicator).
-        let t = ui.input(|i| i.time) as f32;
-        let phase = ((t * std::f32::consts::PI).sin() + 1.0) * 0.5;
-        let a = (120.0 + 135.0 * phase) as u8;
+        // Reduced motion keeps the dot, drops the breath.
+        let a = if state.reduced_motion() {
+            200
+        } else {
+            let t = ui.input(|i| i.time) as f32;
+            let phase = ((t * std::f32::consts::PI).sin() + 1.0) * 0.5;
+            (120.0 + 135.0 * phase) as u8
+        };
         painter.circle_filled(
             egui::pos2(text_x + 3.0, rect.center().y - 8.0),
             3.0,

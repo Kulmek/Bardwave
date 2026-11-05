@@ -3,7 +3,7 @@
   "targets": {
     "/": {
       "targetKind": "existing-ui",
-      "projectId": "fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62",
+      "projectId": "875b7ceb-a940-403e-a436-289d1df6a916",
       "activeDraftId": "ba2a6a33-bdfc-4c62-b956-50977b891f84",
       "contextFiles": [
         "src/network/static/index.html",
@@ -22,46 +22,43 @@
           "currentVersion": 1
         }
       },
+      "stale": true,
+      "staleReason": "draft id belongs to the previous Superdesign account/team (project fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62); the current CLI credential cannot access it. Re-create this target under project 875b7ceb-a940-403e-a436-289d1df6a916 before iterating.",
       "updatedAt": "2026-11-05T18:12:49.201Z"
     },
     "desktop-gui": {
       "targetKind": "existing-ui",
-      "projectId": "fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62",
-      "activeDraftId": "89f1c08c-4668-40ba-831f-fa8dfcbc50fe",
+      "projectId": "875b7ceb-a940-403e-a436-289d1df6a916",
+      "activeDraftId": "dc98adbc-ddba-4731-be9c-2e5c3ff352e1",
       "designSystemPath": ".superdesign/design-system.md",
       "referenceIds": [
-        "1c4f8e99-b7ce-4ebb-bf3f-04a1150b8472"
+        "f470fe4f-3ec4-45a9-93cf-eb2058dfc739"
       ],
       "contextFiles": [
         ".superdesign/design-system.md",
-        "src/gui/mod.rs",
         "src/gui/theme.rs",
-        "src/gui/top_bar.rs",
-        "src/gui/sound_list.rs",
         "src/gui/server_panel.rs",
-        "src/gui/types.rs",
-        "src/network/static/style.css",
-        "src/network/static/index.html"
+        "src/gui/top_bar.rs",
+        "src/gui/sound_list.rs"
       ],
       "fingerprints": {
-        ".superdesign/design-system.md": "16ec876fae8e710164c24067d4b76edf9635b7a6c521fddf6a5cd3dacd01847a",
-        "src/gui/mod.rs": "097fd0029fd847f4a91798f7210fc0d3fa3d99d03d8f2f2a87652f0b48af6032",
-        "src/gui/theme.rs": "6dc6696c6b7ab624e41d9fc42f685156289b3c32483725c1111a8635fe3abd7a",
-        "src/gui/top_bar.rs": "00a1b73e805d1198f86dd9313add2eb5fce5855dc67f353840497bdf72417f18",
-        "src/gui/sound_list.rs": "a3b406811246bc81b0ae22dee2e29b2eb1857c696895c5a24f5c0cbb141b00fa",
-        "src/gui/server_panel.rs": "ea0745afdc8e0ae99b4e524dccd49ecdc056961ab30414baeeb55ae708d87943",
-        "src/gui/types.rs": "5ad0ca673df1bd4e87792b28abe4b2c634d6f18d50595bc9f46ec77b1d30b072",
-        "src/network/static/style.css": "7d798dae1f542ef25e25034cbd82243afbb7689b2a2e206ed235a3f5abf1ebd7",
-        "src/network/static/index.html": "4a1345f24cf19a770992bd616e4e6bf258572c8c8a5b1b21d81fda56bf90d41e"
+        ".superdesign/design-system.md": "425c4f02ed02298d1a20635cd14d50e9a8f9549658c49b67cd3609f0f87e121a",
+        "src/gui/theme.rs": "faf7431a5fa3833f8f6aff2568f20a9c2ddf1782a408ba81dc30bffc62c9d4c6",
+        "src/gui/server_panel.rs": "84e62515a10f4c0cbf4fbd519c70d1cef741f56af1056b83fb087800b0a77f82",
+        "src/gui/top_bar.rs": "7155661dafd533eecf616b4d9a1835d44585c8d555a07841c23337e6e17548aa",
+        "src/gui/sound_list.rs": "c63e3f6df80098687584127328d23069c16869bcd4d563cbdec1f0035fb5ff7f"
       },
       "drafts": {
-        "89f1c08c-4668-40ba-831f-fa8dfcbc50fe": {
-          "title": "SoundShared Desktop - Red Noir Broadcast Console",
-          "visualDirection": "red noir / industrial broadcast console",
+        "dc98adbc-ddba-4731-be9c-2e5c3ff352e1": {
+          "title": "SoundShared Broadcast Console — Design Sync & States",
+          "visualDirection": "red noir / industrial broadcast console at 1280x800 (min 960x620); three frames — populated console, empty library (NO SIGNAL), zero listeners (LIVE with 00 / hollow cells). design-system.md realigned with the code: window size, 340px right column, local-output readout, editable PORT / BIND wells, both empty states",
           "currentVersion": 4
         }
       },
-      "updatedAt": "2026-11-06T00:00:00.000Z"
+      "previousProjectId": "fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62",
+      "previousActiveDraftId": "89f1c08c-4668-40ba-831f-fa8dfcbc50fe",
+      "note": "v2 added the local output readout and the editable config wells. v3 corrected the window to 1280x800 / min 960x620 and added the two empty-state frames after design-system.md was realigned with the code (context bundle extended with src/gui/sound_list.rs, the source of the NO SIGNAL empty state). v4 was a targeted repair: the NETWORK SERVER body was missing from the EMPTY LIBRARY frame; frames 01 and 03 came back byte-identical in visible text.",
+      "updatedAt": "2026-11-05T22:15:00.000Z"
     }
   }
 }

@@ -118,7 +118,10 @@ impl AudioDecoder {
 
         let mut all_samples = Vec::new();
         let sample_rate = codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
-        let channels = codec_params.channels.map(|c| c.count() as usize).unwrap_or(TARGET_CHANNELS as usize);
+        let channels = codec_params
+            .channels
+            .map(|c| c.count() as usize)
+            .unwrap_or(TARGET_CHANNELS as usize);
         let channels_u32: u32 = channels.try_into().unwrap();
 
         // Decode all packets
@@ -139,7 +142,8 @@ impl AudioDecoder {
 
             match decoder.decode(&packet) {
                 Ok(audio_buf) => {
-                    let converted = Self::convert_audio_buffer(audio_buf, sample_rate, channels_u32)?;
+                    let converted =
+                        Self::convert_audio_buffer(audio_buf, sample_rate, channels_u32)?;
                     all_samples.extend_from_slice(&converted);
                 }
                 Err(symphonia::core::errors::Error::DecodeError(_)) => {
@@ -152,7 +156,12 @@ impl AudioDecoder {
 
         // Resample if needed
         let final_samples = if sample_rate != TARGET_SAMPLE_RATE {
-            Self::resample(&all_samples, channels as u32, sample_rate, TARGET_SAMPLE_RATE)?
+            Self::resample(
+                &all_samples,
+                channels as u32,
+                sample_rate,
+                TARGET_SAMPLE_RATE,
+            )?
         } else {
             all_samples
         };
@@ -189,14 +198,42 @@ impl AudioDecoder {
         let mut channel_data: Vec<Vec<f32>> = Vec::with_capacity(channels);
         for ch in 0..channels {
             let samples: Vec<f32> = match &audio_buf {
-                AudioBufferRef::U8(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 255.0 * 2.0 - 1.0).collect(),
-                AudioBufferRef::U16(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 65535.0 * 2.0 - 1.0).collect(),
-                AudioBufferRef::U24(ref buf) => buf.chan(ch).iter().map(|&v| v.0 as f32 / 16777215.0 * 2.0 - 1.0).collect(),
-                AudioBufferRef::U32(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 4294967295.0 * 2.0 - 1.0).collect(),
-                AudioBufferRef::S8(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 128.0).collect(),
-                AudioBufferRef::S16(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 32768.0).collect(),
-                AudioBufferRef::S24(ref buf) => buf.chan(ch).iter().map(|&v| v.0 as f32 / 8388608.0).collect(),
-                AudioBufferRef::S32(ref buf) => buf.chan(ch).iter().map(|&v| v as f32 / 2147483648.0).collect(),
+                AudioBufferRef::U8(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v as f32 / 255.0 * 2.0 - 1.0)
+                    .collect(),
+                AudioBufferRef::U16(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v as f32 / 65535.0 * 2.0 - 1.0)
+                    .collect(),
+                AudioBufferRef::U24(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v.0 as f32 / 16777215.0 * 2.0 - 1.0)
+                    .collect(),
+                AudioBufferRef::U32(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v as f32 / 4294967295.0 * 2.0 - 1.0)
+                    .collect(),
+                AudioBufferRef::S8(ref buf) => {
+                    buf.chan(ch).iter().map(|&v| v as f32 / 128.0).collect()
+                }
+                AudioBufferRef::S16(ref buf) => {
+                    buf.chan(ch).iter().map(|&v| v as f32 / 32768.0).collect()
+                }
+                AudioBufferRef::S24(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v.0 as f32 / 8388608.0)
+                    .collect(),
+                AudioBufferRef::S32(ref buf) => buf
+                    .chan(ch)
+                    .iter()
+                    .map(|&v| v as f32 / 2147483648.0)
+                    .collect(),
                 AudioBufferRef::F32(ref buf) => buf.chan(ch).iter().copied().collect(),
                 AudioBufferRef::F64(ref buf) => buf.chan(ch).iter().map(|&v| v as f32).collect(),
             };

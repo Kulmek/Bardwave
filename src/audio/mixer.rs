@@ -230,12 +230,7 @@ impl AudioMixer {
     /// The send is non-blocking: if the forwarder is behind, the frame is
     /// dropped rather than stalling the audio callback.
     pub fn publish_broadcast(&self, buffer: &[f32]) {
-        Self::publish_broadcast_parts(
-            &self.broadcast_tx,
-            &self.timestamp,
-            &self.seq_no,
-            buffer,
-        );
+        Self::publish_broadcast_parts(&self.broadcast_tx, &self.timestamp, &self.seq_no, buffer);
     }
 
     fn mix_into_parts(
@@ -276,15 +271,13 @@ impl AudioMixer {
                         }
                     }
 
-                    let frames_to_mix =
-                        (track.audio.frames - src_pos).min(frames - dst_frame);
+                    let frames_to_mix = (track.audio.frames - src_pos).min(frames - dst_frame);
                     let src_start = src_pos * CHANNELS;
                     let dst_start = dst_frame * CHANNELS;
                     let sample_count = frames_to_mix * CHANNELS;
 
                     for i in 0..sample_count {
-                        out[dst_start + i] +=
-                            track.audio.samples[src_start + i] * track.volume;
+                        out[dst_start + i] += track.audio.samples[src_start + i] * track.volume;
                     }
 
                     dst_frame += frames_to_mix;
@@ -340,8 +333,7 @@ impl AudioMixer {
 
         // Drop frames when the forwarder is behind. Never block the audio
         // callback on a network consumer.
-        if let Err(crossbeam_channel::TrySendError::Disconnected(_)) =
-            broadcast_tx.try_send(output)
+        if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = broadcast_tx.try_send(output)
         {
             // Receiver dropped; the mixer can keep running harmlessly.
         }

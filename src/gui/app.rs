@@ -1,6 +1,6 @@
 //! GUI application state and logic
 
-use crate::audio::{AudioEngine, SoundId};
+use crate::audio::{AudioEngine, LocalOutputStatus, SoundId};
 use crate::gui::groups::{GroupFilter, GroupId, Library};
 use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Sound entry in the library (for GUI display)
 #[derive(Debug, Clone)]
@@ -56,6 +56,22 @@ pub enum Dialog {
 
 /// How long the library may stay unsaved before it is flushed to disk.
 const LIBRARY_FLUSH: Duration = Duration::from_millis(400);
+
+/// How long the `SAVED` confirmation stays under the CONFIGURATION fields.
+const CONFIG_SAVED_HOLD: Duration = Duration::from_millis(1500);
+
+/// Longest text the PORT well may hold before it can never be a valid port.
+pub const PORT_INPUT_MAX_CHARS: usize = 5;
+
+/// Longest text the BIND ADDRESS well may hold. Fits a full IPv6 literal
+/// (`ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255`, 45 characters).
+pub const BIND_INPUT_MAX_CHARS: usize = 45;
+
+/// Why the PORT well was rejected, phrased for the inline error line.
+pub const PORT_ERROR: &str = "Port must be 1–65535";
+
+/// Why the BIND ADDRESS well was rejected, phrased for the inline error line.
+pub const BIND_ERROR: &str = "Bind must be an IP address";
 
 /// Why a group name was rejected, phrased for the modal's error line.
 fn group_name_error(name: &str) -> String {
@@ -137,6 +153,33 @@ pub struct SoundSharedApp {
     last_persist: Instant,
     /// Master volume stashed while muted.
     muted: Option<f32>,
+
+    /// Last known state of the desktop output (`Running`, `Headless`, `Failed`).
+    ///
+    /// Refreshed once per frame from the engine so the status strip can explain a
+    /// silent desktop: the web listeners keep playing in every one of these
+    /// states, which is exactly the asymmetry the strip has to make visible.
+    local_output: LocalOutputStatus,
+
+    /// Whether the live-dot pulse and the backdrop scanline are switched off.
+    ///
+    /// Resolved once at startup from `[gui] reduce_motion` and the
+    /// `SOUNDSHARED_REDUCED_MOTION` override — see [`crate::gui::motion`].
+    reduced_motion: bool,
+
+    /// Text in the CONFIGURATION `PORT` well. It may hold an invalid value while
+    /// the operator is typing; only valid text is ever committed to the config.
+    port_input: String,
+    /// Text in the CONFIGURATION `BIND ADDRESS` well.
+    bind_input: String,
+    /// Inline error under the CONFIGURATION wells, e.g. `PORT MUST BE 1–65535`.
+    config_error: Option<String>,
+    /// When the last valid server-configuration edit was accepted, for the
+    /// brief `SAVED` label.
+    config_saved_at: Option<Instant>,
+    /// Replies from the server thread for pushed `ServerCommand::SetBind`s.
+    bind_result_rx: Receiver<Result<(), String>>,
+    bind_result_tx: Sender<Result<(), String>>,
 }
 
 impl SoundSharedApp {
@@ -150,14 +193,19 @@ impl SoundSharedApp {
         // Create channels for receiving updates from background threads
         let (sound_list_tx, sound_list_rx) = bounded(1);
         let (server_status_tx, server_status_rx) = bounded(1);
+        let (bind_result_tx, bind_result_rx) = bounded(4);
 
         // Restore the saved library (groups + sounds) before the first frame,
-        // so the console opens on the operator's actual collection.
-        let (initial_master_vol, library) = {
+        // so the console opens on the operator's actual collection. The two
+        // CONFIGURATION wells start on the values currently in the config.
+        let (initial_master_vol, library, initial_host, initial_port, reduced_motion) = {
             let config = app_state.config.lock().unwrap();
             (
                 config.audio.master_volume,
                 Library::from_config(&config.library),
+                config.server.host.clone(),
+                config.server.port,
+                crate::gui::motion::reduced_motion(config.gui.reduce_motion),
             )
         };
 
@@ -186,6 +234,14 @@ impl SoundSharedApp {
             library_dirty: false,
             last_persist: Instant::now(),
             muted: None,
+            local_output: LocalOutputStatus::stopped(),
+            reduced_motion,
+            port_input: initial_port.to_string(),
+            bind_input: initial_host,
+            config_error: None,
+            config_saved_at: None,
+            bind_result_rx,
+            bind_result_tx,
         };
 
         // Request initial sound list
@@ -580,24 +636,149 @@ impl SoundSharedApp {
         });
     }
 
-    /// Get server port from config
+    /// Get server port from config — the last *valid* value in force.
     pub fn get_server_port(&self) -> u16 {
         self.app_state.config.lock().unwrap().server.port
     }
 
-    /// Set server port in config
-    pub fn set_server_port(&self, port: u16) {
-        self.app_state.config.lock().unwrap().server.port = port;
-    }
-
-    /// Get server bind address from config
+    /// Get server bind address from config — the last *valid* value in force.
     pub fn get_server_bind_addr(&self) -> String {
         self.app_state.config.lock().unwrap().server.host.clone()
     }
 
-    /// Set server bind address in config
-    pub fn set_server_bind_addr(&self, addr: String) {
-        self.app_state.config.lock().unwrap().server.host = addr;
+    // ===== LOCAL OUTPUT STATUS =====
+
+    /// Latest desktop-output state, for the status strip.
+    ///
+    /// `Running` means the speakers are being fed; `Headless` and `Failed` mean
+    /// the network keeps streaming while the desktop stays silent.
+    pub fn local_output(&self) -> &LocalOutputStatus {
+        &self.local_output
+    }
+
+    /// Read the engine's current local-output state. Cheap: one `RwLock` read.
+    fn poll_local_output(&mut self) {
+        if let Some(engine) = self.audio_engine.lock().unwrap().as_ref() {
+            self.local_output = engine.local_output_status();
+        }
+    }
+
+    // ===== MOTION =====
+
+    /// True when the operator switched off decorative motion.
+    ///
+    /// Panels gate their pulses on this: the state a dot reports is always
+    /// shown, only the opacity breath is dropped.
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced_motion
+    }
+
+    // ===== CONFIGURATION fields (PORT / BIND ADDRESS) =====
+
+    /// Text currently in the CONFIGURATION port well.
+    pub fn port_input_mut(&mut self) -> &mut String {
+        &mut self.port_input
+    }
+
+    /// Text currently in the CONFIGURATION bind-address well.
+    pub fn bind_input_mut(&mut self) -> &mut String {
+        &mut self.bind_input
+    }
+
+    /// Inline error under the CONFIGURATION wells, when the last edit was invalid.
+    pub fn config_error(&self) -> Option<&str> {
+        self.config_error.as_deref()
+    }
+
+    /// Whether the last accepted edit should still show its `SAVED` label.
+    pub fn config_saved(&self) -> bool {
+        self.config_saved_at
+            .is_some_and(|at| at.elapsed() < CONFIG_SAVED_HOLD)
+    }
+
+    /// Called after the operator typed in the PORT well.
+    ///
+    /// Valid text is committed — config, `config.toml` and the server thread.
+    /// Invalid text leaves the last valid port in force and raises an inline
+    /// error instead of applying garbage.
+    pub fn on_port_edited(&mut self) {
+        match crate::config::parse_port(&self.port_input) {
+            Some(port) => {
+                let host = self.get_server_bind_addr();
+                self.commit_server_config(host, port);
+            }
+            None => self.config_error = Some(PORT_ERROR.to_string()),
+        }
+    }
+
+    /// Called after the operator typed in the BIND ADDRESS well.
+    ///
+    /// Same contract as [`Self::on_port_edited`].
+    pub fn on_bind_edited(&mut self) {
+        match crate::config::parse_bind_host(&self.bind_input) {
+            Some(ip) => {
+                let port = self.get_server_port();
+                self.commit_server_config(ip.to_string(), port);
+            }
+            None => self.config_error = Some(BIND_ERROR.to_string()),
+        }
+    }
+
+    /// Put a validated host/port in force without restarting the app.
+    ///
+    /// The value goes to `AppState::config`, is handed to the server thread
+    /// (whose next `Start` binds it), and marks the config dirty so the existing
+    /// debounced flush — [`Self::persist_library`] — writes the whole config,
+    /// `[server]` section included, to `config.toml`.
+    fn commit_server_config(&mut self, host: String, port: u16) {
+        {
+            let mut config = self.app_state.config.lock().unwrap();
+            config.server.host = host.clone();
+            config.server.port = port;
+        }
+
+        self.push_bind_to_server(host, port);
+        self.library_dirty = true;
+    }
+
+    /// Ask the server thread to use `host:port` for the next start.
+    fn push_bind_to_server(&mut self, host: String, port: u16) {
+        let (response_tx, response_rx) = bounded(1);
+        let cmd = ServerCommand::SetBind {
+            host,
+            port,
+            response: response_tx,
+        };
+
+        // Non-blocking send to avoid freezing GUI if channel is full
+        if let Err(e) = self.app_state.server_cmd_tx.try_send(cmd) {
+            error!(
+                "Failed to send bind address to server (channel full): {}",
+                e
+            );
+            self.config_error = Some("SERVER BUSY".to_string());
+            return;
+        }
+
+        let results = self.bind_result_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(result) = response_rx.recv_timeout(Duration::from_secs(5)) {
+                let _ = results.try_send(result);
+            }
+        });
+    }
+
+    /// Collect bind-change replies from the server thread.
+    fn poll_bind_results(&mut self) {
+        while let Ok(result) = self.bind_result_rx.try_recv() {
+            match result {
+                Ok(()) => {
+                    self.config_error = None;
+                    self.config_saved_at = Some(Instant::now());
+                }
+                Err(message) => self.config_error = Some(message.to_uppercase()),
+            }
+        }
     }
 
     /// Copied feedback
@@ -976,6 +1157,12 @@ impl SoundSharedApp {
         // Poll server status
         self.poll_server_status();
 
+        // Collect replies for CONFIGURATION edits pushed to the server thread
+        self.poll_bind_results();
+
+        // Keep the status strip's "local audio" readout current
+        self.poll_local_output();
+
         // Flush the library if it changed and the debounce window elapsed.
         self.maybe_persist();
 
@@ -999,27 +1186,48 @@ impl SoundSharedApp {
                                     .and_then(|s| s.to_str())
                                     .unwrap_or("Unknown")
                                     .to_string();
+
+                                // A sound that was saved at a lower level must come
+                                // back at that level: the engine starts every sound
+                                // at 1.0, so the saved value is pushed into it here
+                                // rather than being silently forgotten on restart.
+                                let path_buf = PathBuf::from(&path);
+                                let saved_volume = self
+                                    .library
+                                    .sound(&path_buf)
+                                    .map(|sound| sound.volume)
+                                    .unwrap_or(1.0);
+                                if let Err(e) = engine.set_sound_volume(sound_id, saved_volume) {
+                                    warn!(
+                                        "Could not apply saved volume {:.2} to {}: {}",
+                                        saved_volume,
+                                        path_buf.display(),
+                                        e
+                                    );
+                                }
+
                                 let info = SoundInfo {
                                     id: sound_id,
                                     name: name.clone(),
                                     path: path.clone(),
                                     duration,
                                     is_playing: false,
-                                    volume: 1.0,
+                                    volume: saved_volume,
                                 };
 
                                 // Register the sound in the saved library. When the
                                 // operator is focused on a group, the new sound lands
                                 // in that group — the RPG-sounds workflow.
-                                let path_buf = PathBuf::from(&path);
                                 let target_group = match self.group_filter {
                                     GroupFilter::Group(id) => Some(id),
                                     _ => None,
                                 };
-                                if self
-                                    .library
-                                    .insert_sound(&path_buf, &name, 1.0, target_group)
-                                {
+                                if self.library.insert_sound(
+                                    &path_buf,
+                                    &name,
+                                    saved_volume,
+                                    target_group,
+                                ) {
                                     self.library_dirty = true;
                                 }
                                 let group = self.library.sound(&path_buf).and_then(|s| s.group);
@@ -1036,7 +1244,7 @@ impl SoundSharedApp {
                                     name,
                                     path: path_buf,
                                     playing: false,
-                                    volume: 1.0,
+                                    volume: saved_volume,
                                     looped,
                                     group,
                                     duration,
@@ -1085,8 +1293,10 @@ impl SoundSharedApp {
                         volume,
                         response,
                     } => {
-                        // For now, set master volume (track volume requires track ID)
-                        let result = engine.set_master_volume(volume);
+                        // Per-sound level: it scales this sound only. Routing it to
+                        // `set_master_volume` made one row's slider drag the whole
+                        // mix, so the other sounds moved with it.
+                        let result = engine.set_sound_volume(id, volume);
                         if result.is_ok() {
                             if let Some(entry) = self.sounds.lock().unwrap().get_mut(&id) {
                                 entry.volume = volume;

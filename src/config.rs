@@ -2,7 +2,8 @@
 
 use crate::error::{ConfigError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,10 @@ pub struct Config {
     /// Persistent sound library and group configuration
     #[serde(default)]
     pub library: LibraryConfig,
+
+    /// Desktop GUI options
+    #[serde(default)]
+    pub gui: GuiConfig,
 }
 
 /// Network server configuration
@@ -63,6 +68,22 @@ pub struct LoggingConfig {
     /// Enable file logging in addition to stdout
     #[serde(default)]
     pub file_logging: bool,
+}
+
+/// Desktop GUI options.
+///
+/// These are console presentation choices, not features: the design system
+/// requires the app to respect reduced motion, and egui 0.30 exposes no such
+/// signal, so the operator states it here. Missing section in an older
+/// `config.toml` means "animated" (the default), so nothing changes for configs
+/// written before this existed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GuiConfig {
+    /// Disable the live-dot pulse and the backdrop scanline.
+    ///
+    /// State changes stay instant; only the two decorative motions stop.
+    #[serde(default)]
+    pub reduce_motion: bool,
 }
 
 /// Persistent library + groups configuration
@@ -155,6 +176,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             logging: LoggingConfig::default(),
             library: LibraryConfig::default(),
+            gui: GuiConfig::default(),
         }
     }
 }
@@ -188,37 +210,73 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Parse a port typed into the CONFIGURATION field.
+///
+/// Only `1..=65535` is accepted: empty text, `0`, out-of-range values and
+/// anything that is not plain ASCII digits are rejected, so the caller can keep
+/// the last valid port in force instead of applying garbage.
+pub fn parse_port(text: &str) -> Option<u16> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match trimmed.parse::<u16>() {
+        Ok(0) | Err(_) => None,
+        Ok(port) => Some(port),
+    }
+}
+
+/// Parse a bind address typed into the CONFIGURATION field.
+///
+/// Only IP literals are accepted (`0.0.0.0`, `127.0.0.1`, `192.168.1.245`,
+/// `::`, `::1`). Host names are rejected because the value is handed straight to
+/// `TcpListener::bind`, which takes a numeric address.
+pub fn parse_bind_host(text: &str) -> Option<IpAddr> {
+    text.trim().parse::<IpAddr>().ok()
+}
+
 impl Config {
     /// Load configuration from config.toml next to the executable
     /// Falls back to defaults if file doesn't exist or is invalid
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path()?;
+        Self::load_from(&Self::config_path()?)
+    }
 
-        if !config_path.exists() {
-            tracing::info!("Config file not found at {:?}, using defaults", config_path);
+    /// Load configuration from an explicit path.
+    ///
+    /// Split out of [`Config::load`] so tests (and any caller that knows its own
+    /// config location) can round-trip a temporary file instead of the real
+    /// `config.toml` that sits next to the executable.
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            tracing::info!("Config file not found at {:?}, using defaults", path);
             return Ok(Self::default());
         }
 
-        let content = std::fs::read_to_string(&config_path)
-            .map_err(|e| ConfigError::NotFound(format!("{:?}: {}", config_path, e)))?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::NotFound(format!("{:?}: {}", path, e)))?;
 
         let config: Config = toml::from_str(&content)
-            .map_err(|e| ConfigError::Parse(format!("{:?}: {}", config_path, e)))?;
+            .map_err(|e| ConfigError::Parse(format!("{:?}: {}", path, e)))?;
 
-        tracing::info!("Loaded configuration from {:?}", config_path);
+        tracing::info!("Loaded configuration from {:?}", path);
         Ok(config)
     }
 
     /// Save configuration to config.toml next to the executable
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path()?;
+        self.save_to(&Self::config_path()?)
+    }
+
+    /// Save configuration to an explicit path (see [`Config::load_from`]).
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::Write(format!("Serialization failed: {}", e)))?;
 
-        std::fs::write(&config_path, content)
-            .map_err(|e| ConfigError::Write(format!("{:?}: {}", config_path, e)))?;
+        std::fs::write(path, content)
+            .map_err(|e| ConfigError::Write(format!("{:?}: {}", path, e)))?;
 
-        tracing::info!("Saved configuration to {:?}", config_path);
+        tracing::info!("Saved configuration to {:?}", path);
         Ok(())
     }
 
@@ -243,6 +301,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scratch path for round-trip tests. It lives under `target/`, which the
+    /// running test binary can always write, and it never matches the real
+    /// `config.toml` next to the executable.
+    fn temp_config_path(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-config");
+        std::fs::create_dir_all(&dir).expect("create test config dir");
+        dir.join(format!("{}-{}.toml", name, std::process::id()))
+    }
 
     #[test]
     fn test_default_config() {
@@ -393,5 +462,132 @@ name = "Combat"
         assert_eq!(entry.group, None);
         // Configs written before the repeat toggle existed must load as "off".
         assert!(!entry.looped);
+    }
+
+    // ===== GUI options =====
+
+    /// A `config.toml` written before `[gui]` existed must load with the console
+    /// animating, so upgrading never changes how the app looks.
+    #[test]
+    fn missing_gui_section_defaults_to_animated() {
+        let text = r#"
+[server]
+port = 8080
+host = "0.0.0.0"
+
+[audio]
+[logging]
+"#;
+
+        let config: Config = toml::from_str(text).expect("parse");
+
+        assert!(!config.gui.reduce_motion);
+    }
+
+    #[test]
+    fn reduce_motion_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.gui.reduce_motion = true;
+
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+
+        assert!(back.gui.reduce_motion);
+        assert!(text.contains("reduce_motion = true"));
+    }
+
+    // ===== CONFIGURATION field validation =====
+
+    #[test]
+    fn parse_port_accepts_the_valid_range() {
+        assert_eq!(parse_port("1"), Some(1));
+        assert_eq!(parse_port("8080"), Some(8080));
+        assert_eq!(parse_port(" 65535 "), Some(65535));
+    }
+
+    #[test]
+    fn parse_port_rejects_invalid_text() {
+        for bad in [
+            "", "   ", "0", "65536", "99999", "80a", "-1", "+80", "80.5", "0x1f",
+        ] {
+            assert_eq!(parse_port(bad), None, "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_bind_host_accepts_ip_literals() {
+        assert_eq!(parse_bind_host("0.0.0.0"), "0.0.0.0".parse::<IpAddr>().ok());
+        assert_eq!(
+            parse_bind_host(" 127.0.0.1 "),
+            "127.0.0.1".parse::<IpAddr>().ok()
+        );
+        assert_eq!(
+            parse_bind_host("192.168.1.245"),
+            "192.168.1.245".parse::<IpAddr>().ok()
+        );
+        assert_eq!(parse_bind_host("::"), "::".parse::<IpAddr>().ok());
+        assert_eq!(parse_bind_host("::1"), "::1".parse::<IpAddr>().ok());
+        assert_eq!(parse_bind_host("fe80::1"), "fe80::1".parse::<IpAddr>().ok());
+    }
+
+    #[test]
+    fn parse_bind_host_rejects_non_literals() {
+        for bad in [
+            "",
+            "   ",
+            "localhost",
+            "192.168.1",
+            "192.168.1.256",
+            "8080",
+            "soundshared.local",
+            "0.0.0.0:8080",
+        ] {
+            assert_eq!(
+                parse_bind_host(bad),
+                None,
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    /// An edited host + port must survive the exact save/load pair the GUI uses
+    /// to persist the CONFIGURATION fields.
+    #[test]
+    fn save_to_and_load_from_roundtrip_edited_host_and_port() {
+        let path = temp_config_path("server-edit");
+        let mut config = Config::default();
+        config.server.host = "192.168.1.245".to_string();
+        config.server.port = 9000;
+        config.audio.master_volume = 0.42;
+
+        config.save_to(&path).expect("save_to");
+        let back = Config::load_from(&path).expect("load_from");
+
+        assert_eq!(back.server.host, "192.168.1.245");
+        assert_eq!(back.server.port, 9000);
+        assert_eq!(back.audio.master_volume, 0.42);
+        assert_eq!(back.library, config.library);
+
+        // IPv6 literals must round-trip too; the value is re-serialised as a
+        // plain TOML string and handed straight to `TcpListener::bind`.
+        config.server.host = "::1".to_string();
+        config.server.port = 65535;
+        config.save_to(&path).expect("save_to ipv6");
+        let back = Config::load_from(&path).expect("load_from ipv6");
+        assert_eq!(back.server.host, "::1");
+        assert_eq!(back.server.port, 65535);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_missing_path_falls_back_to_defaults() {
+        let path = temp_config_path("missing");
+        let _ = std::fs::remove_file(&path);
+
+        let config = Config::load_from(&path).expect("defaults");
+
+        assert_eq!(config.server.port, default_port());
+        assert_eq!(config.server.host, default_host());
     }
 }

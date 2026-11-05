@@ -16,6 +16,7 @@
 pub mod app;
 pub mod dialog;
 pub mod groups;
+pub mod motion;
 pub mod server_panel;
 pub mod sound_list;
 pub mod theme;
@@ -83,8 +84,9 @@ impl App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.state.update(ctx);
 
-        // Whole-window noir surface + faint scanline texture.
-        paint_backdrop(ctx);
+        // Whole-window noir surface + faint scanline texture (dropped when the
+        // operator asked for reduced motion).
+        paint_backdrop(ctx, self.state.reduced_motion());
 
         TopBottomPanel::top("top_bar")
             .exact_height(Metrics::TOPBAR_H)
@@ -103,31 +105,51 @@ impl App for GuiApp {
         CentralPanel::default()
             .frame(egui::Frame::none().fill(Palette::APP))
             .show(ctx, |ui| {
-                // The shell sizes both columns; the panels never negotiate the
-                // cursor themselves, so they always line up to the pixel.
-                let content = ui.available_rect_before_wrap().shrink(Metrics::APP_PAD);
-                let height = content.height();
-                let right_w = Metrics::RIGHT_COL_W;
-                let left_w = (content.width() - right_w - Metrics::COL_GAP).max(320.0);
+                // The shell sizes both columns with explicit rects; the panels
+                // never negotiate the cursor themselves, so they always line up
+                // to the pixel with the design: 24px outer padding, 24px gap,
+                // 340px right column (all measured as painted border boxes).
+                //
+                // `console_panel` strokes the hairline *outside* its rect, so a
+                // rect here is the FILL box: it is inset by one stroke from the
+                // painted border box. Getting this wrong is what previously left
+                // the right column 15px off the window edge while the left one
+                // sat at 24px.
+                const STROKE: f32 = 1.0;
 
-                // `scope_builder` keeps the inset rect, so the console sits on the
-                // window padding exactly like the mockup instead of hugging the edges.
+                let content = ui.available_rect_before_wrap().shrink(Metrics::APP_PAD);
+                let inner = egui::Rect::from_min_max(
+                    egui::pos2(content.left() + STROKE, content.top() + STROKE),
+                    egui::pos2(content.right() - STROKE, content.bottom() - STROKE),
+                );
+
+                let right_fill_w = Metrics::RIGHT_COL_W - 2.0 * STROKE;
+                let right_rect = egui::Rect::from_min_max(
+                    egui::pos2(inner.right() - right_fill_w, inner.top()),
+                    inner.max,
+                );
+                let left_rect = egui::Rect::from_min_max(
+                    inner.min,
+                    egui::pos2(
+                        right_rect.left() - Metrics::COL_GAP - 2.0 * STROKE,
+                        inner.bottom(),
+                    ),
+                );
+
                 ui.scope_builder(
                     egui::UiBuilder::new()
-                        .max_rect(content)
-                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        .max_rect(left_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
                     |ui| {
-                        sound_list::sound_library_panel(
-                            ui,
-                            &mut self.state,
-                            egui::vec2(left_w, height),
-                        );
-                        ui.add_space(Metrics::COL_GAP);
-                        server_panel::server_panel(
-                            ui,
-                            &mut self.state,
-                            egui::vec2(right_w, height),
-                        );
+                        sound_list::sound_library_panel(ui, &mut self.state, left_rect.size());
+                    },
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(right_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                    |ui| {
+                        server_panel::server_panel(ui, &mut self.state, right_rect.size());
                     },
                 );
             });
@@ -146,14 +168,20 @@ impl App for GuiApp {
     }
 }
 
-/// Paints the near-black backdrop and a very faint red scanline texture.
+/// Paints the near-black backdrop and, unless motion is reduced, a very faint
+/// red scanline texture.
 ///
 /// The scanline is purely decorative (~2.5% opacity) and sits on the
-/// background layer, so no widget is drawn on top of it.
-fn paint_backdrop(ctx: &egui::Context) {
+/// background layer, so no widget is drawn on top of it. Reduced motion drops
+/// the texture and keeps the flat surface.
+fn paint_backdrop(ctx: &egui::Context, reduced_motion: bool) {
     let screen = ctx.screen_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
     painter.rect_filled(screen, Rounding::ZERO, Palette::APP);
+
+    if reduced_motion {
+        return;
+    }
 
     let color = theme::alpha(Palette::ROSE_600, 7);
     let mut y = screen.top();
