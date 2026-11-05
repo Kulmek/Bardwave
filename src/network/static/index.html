@@ -1,147 +1,145 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SoundShared | Red Noir Listener</title>
+    <meta name="color-scheme" content="dark">
+    <title>SoundShared | Red Noir</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
 </head>
 <body>
-    <div class="noise-overlay"></div>
-    <div class="container">
-        <!-- Legacy JS-compatible elements (hidden, kept for app.js) -->
-        <span id="statusIndicator" class="status-indicator disconnected" hidden></span>
-        <span id="statusText" class="status-text disconnected" hidden>Disconnected</span>
-        <div id="bufferIndicator" class="buffer-panel" hidden></div>
-        <header>
-            <span class="brand-kicker">SoundShared Protocol</span>
-            <h1>Listener<span class="accent">.</span>v2</h1>
-            <p class="subtitle">High-fidelity, ultra-low latency spatial audio stream monitoring and synchronization node.</p>
+    <div class="page">
+        <div class="noise-overlay" aria-hidden="true"></div>
+
+        <header class="site-header">
+            <div class="brand">
+                <span class="brand-kicker">SoundShared Protocol</span>
+                <h1 class="brand-title">Listener<span class="accent">.</span>v2</h1>
+                <p class="brand-subtitle">High-fidelity, ultra-low latency spatial audio stream monitoring and synchronization node.</p>
+            </div>
+
+            <div class="status-chip" role="status" aria-live="polite">
+                <div class="status-copy">
+                    <span class="status-label">Status</span>
+                    <span class="status-text disconnected" id="statusText">Node Offline</span>
+                </div>
+                <span class="status-dot disconnected" id="statusIndicator" aria-hidden="true"></span>
+            </div>
         </header>
 
-        <main>
-            <!-- Connection Status -->
-            <section class="connection-panel" id="connection-panel">
-                <div class="flex-between">
-                    <div class="status-group">
-                        <h2 class="panel-title">Main Output Control</h2>
-                        <p class="panel-sub">Connect to the broadcast server to begin audio decoding.</p>
-                    </div>
-                    <button class="btn btn-primary" id="connectBtn">
-                        <span class="btn-text">Establish Link</span>
-                        <span class="btn-loader" hidden></span>
-                    </button>
-                </div>
+        <main class="layout">
+            <div class="layout-main">
+                <section class="panel connection-panel scanline" id="connection-panel">
+                    <div class="panel-head">
+                        <div class="panel-heading">
+                            <h2 class="panel-title">Main Output Control</h2>
+                            <p class="panel-sub">Connect to the broadcast server to begin audio decoding.</p>
+                        </div>
 
-                <!-- Audio Level Meter -->
-                <div class="audio-panel" id="audioIndicator" hidden>
-                    <div class="meter-group">
-                        <label class="meter-label">Live Audio Levels (LR)</label>
-                        <span class="meter-value stat-mono" id="meterValue">-INF dB</span>
+                        <button class="btn btn-primary" id="connectBtn" type="button">
+                            <span class="btn-text" id="btnText">Establish Link</span>
+                            <iconify-icon id="btnIcon" icon="lucide:zap" class="btn-icon"></iconify-icon>
+                            <span class="btn-loader" id="btnLoader" hidden aria-hidden="true"></span>
+                            <span class="btn-sheen" aria-hidden="true"></span>
+                        </button>
                     </div>
-                    <div class="audio-level-bars" id="audioLevelBars">
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                        <div class="level-bar"></div>
-                    </div>
-                </div>
 
-                <!-- Buffer Health -->
-                <div class="buffer-panel">
-                    <div class="buffer-group">
-                        <label class="buffer-label">Buffer Health Monitor</label>
-                        <span class="buffer-value stat-mono" id="bufferText">0ms / 200ms</span>
-                    </div>
-                    <div class="buffer-bar">
-                        <div class="buffer-fill" id="bufferFill"></div>
-                    </div>
-                    <div class="buffer-grid" id="bufferGrid">
-                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
-                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
-                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
-                        <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
-                    </div>
-                </div>
-            </section>
+                    <div class="meters">
+                        <div class="meter">
+                            <div class="meter-head">
+                                <label class="meter-label" for="audioIndicator">Live Audio Levels (LR)</label>
+                                <span class="meter-value stat-mono" id="meterValue">-INF dB</span>
+                            </div>
+                            <div class="level-track" id="audioIndicator">
+                                <div class="level-fill" id="levelFill"></div>
+                                <div class="level-peak" id="levelPeak" aria-hidden="true"></div>
+                            </div>
+                        </div>
 
-            <!-- Messages -->
-            <section class="message-panel" id="messagePanel" hidden>
-                <div class="message-content">
-                    <iconify-icon icon="lucide:info" class="message-icon"></iconify-icon>
-                    <p class="message-text" id="messageText"></p>
-                </div>
-                <button class="btn btn-secondary" id="dismissBtn" hidden>Dismiss</button>
-            </section>
+                        <div class="meter">
+                            <div class="meter-head">
+                                <label class="meter-label">Buffer Health Monitor</label>
+                                <span class="buffer-value stat-mono" id="bufferText">0ms / 200ms</span>
+                            </div>
+                            <div class="buffer-grid" id="bufferGrid" aria-hidden="true">
+                                <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                                <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                                <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                                <div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div><div class="buffer-cell"></div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
 
-            <!-- Stats -->
-            <section class="stats-panel" id="stats-panel">
-                <div class="stat-item">
-                    <span class="stat-label">Packets Received</span>
-                    <span class="stat-value stat-mono" id="statsReceived">000,000</span>
-                </div>
-                <div class="stat-item stat-item--accent">
-                    <span class="stat-label">Frames Played</span>
-                    <span class="stat-value stat-mono" id="statsPlayed">000,000</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Underruns</span>
-                    <span class="stat-value stat-mono text-red" id="statsUnderruns">0</span>
-                </div>
-            </section>
+                <section class="stats" id="stats-panel">
+                    <div class="stat-card">
+                        <span class="stat-label">Packets Received</span>
+                        <span class="stat-value stat-mono" id="statsReceived">0</span>
+                    </div>
+                    <div class="stat-card stat-card--accent">
+                        <span class="stat-label">Frames Played</span>
+                        <span class="stat-value stat-mono" id="statsPlayed">0</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">Underruns</span>
+                        <span class="stat-value stat-mono text-red" id="statsUnderruns">0</span>
+                    </div>
+                </section>
+            </div>
+
+            <aside class="layout-aside">
+                <section class="info-panel" id="info-panel">
+                    <details open>
+                        <summary class="info-summary">
+                            <span>Connection Details</span>
+                            <iconify-icon icon="lucide:chevron-down" class="info-chevron"></iconify-icon>
+                        </summary>
+                        <div class="info-grid">
+                            <div class="info-row">
+                                <span class="info-label">Server Endpoint</span>
+                                <span class="info-value stat-mono" id="wsUrl">WS://AUDIO.LOCAL</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Protocol</span>
+                                <span class="info-value stat-mono" id="infoProtocol">PCM F32 / 48KHZ</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Latency Mode</span>
+                                <span class="info-value stat-mono text-red">ULTRA-LOW</span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Bitrate</span>
+                                <span class="info-value stat-mono" id="infoBitrate">3072 KBPS</span>
+                            </div>
+                        </div>
+                    </details>
+                </section>
+
+                <section class="toast-panel" id="toastPanel">
+                    <div class="toast toast--error" id="messagePanel" hidden role="alert">
+                        <iconify-icon icon="lucide:info" class="toast-icon" id="messageIcon"></iconify-icon>
+                        <span class="toast-text" id="messageText"></span>
+                        <button class="toast-dismiss" id="dismissBtn" type="button" aria-label="Dismiss">&times;</button>
+                    </div>
+
+                    <div class="toast toast--idle" id="systemToast">
+                        <iconify-icon icon="lucide:check-circle" id="systemToastIcon"></iconify-icon>
+                        <span id="systemToastText">System ready. Initializing components.</span>
+                    </div>
+                </section>
+            </aside>
         </main>
 
-        <!-- Info Panel -->
-        <section class="info-panel" id="info-panel">
-            <details open>
-                <summary>Connection Details</summary>
-                <div class="info-grid">
-                    <div class="info-item">
-                        <span class="info-label">Server Endpoint</span>
-                        <span class="info-value stat-mono" id="wsUrl">WSS://AUDIO.LOCAL</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Protocol</span>
-                        <span class="info-value stat-mono">OPUS / 48KHZ</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Latency Mode</span>
-                        <span class="info-value stat-mono text-red">ULTRA-LOW</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">Bitrate</span>
-                        <span class="info-value stat-mono">256 KBPS</span>
-                    </div>
-                </div>
-            </details>
-        </section>
-
-        <!-- Toast Panel -->
-        <section class="toast-panel" id="toastPanel">
-            <div class="toast toast-info">
-                <iconify-icon icon="lucide:info"></iconify-icon>
-                <span>Waiting for server handshake...</span>
-            </div>
-            <div class="toast toast-success opacity-50">
-                <iconify-icon icon="lucide:check-circle"></iconify-icon>
-                <span>System ready. Initializing components.</span>
-            </div>
-        </section>
-
-        <footer>
+        <footer class="site-footer">
             <div class="footer-links">
-                <a href="#" id="footer-docs-link">Documentation</a>
-                <a href="#" id="footer-github-link">GitHub</a>
+                <a id="footer-docs-link" href="#">Documentation</a>
+                <a id="footer-github-link" href="#">GitHub</a>
             </div>
-            <span class="footer-copy">© 2024 SoundShared Red Noir Edition</span>
+            <div class="footer-copy">&copy; 2024 SoundShared Red Noir Edition</div>
             <div class="footer-social">
-                <iconify-icon icon="mdi:twitter"></iconify-icon>
-                <iconify-icon icon="mdi:discord"></iconify-icon>
+                <iconify-icon icon="mdi:twitter" aria-label="Twitter"></iconify-icon>
+                <iconify-icon icon="mdi:discord" aria-label="Discord"></iconify-icon>
             </div>
         </footer>
     </div>

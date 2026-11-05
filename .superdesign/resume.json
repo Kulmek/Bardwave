@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "/": {
+      "targetKind": "existing-ui",
+      "projectId": "fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62",
+      "activeDraftId": "ba2a6a33-bdfc-4c62-b956-50977b891f84",
+      "contextFiles": [
+        "src/network/static/index.html",
+        "src/network/static/style.css",
+        "src/network/static/app.js"
+      ],
+      "fingerprints": {
+        "src/network/static/index.html": "4a1345f24cf19a770992bd616e4e6bf258572c8c8a5b1b21d81fda56bf90d41e",
+        "src/network/static/style.css": "7d798dae1f542ef25e25034cbd82243afbb7689b2a2e206ed235a3f5abf1ebd7",
+        "src/network/static/app.js": "36c68ee8e0dae0ce339a991d7a79a6226089e559adf200b19189443184f91c84"
+      },
+      "drafts": {
+        "ba2a6a33-bdfc-4c62-b956-50977b891f84": {
+          "title": "SoundShared Listener - Red Noir",
+          "visualDirection": "red noir / industrial audio console",
+          "currentVersion": 1
+        }
+      },
+      "updatedAt": "2026-11-05T18:12:49.201Z"
+    },
+    "desktop-gui": {
+      "targetKind": "existing-ui",
+      "projectId": "fd99a6f6-e5b5-4b4b-9437-a8d600ffdd62",
+      "activeDraftId": "89f1c08c-4668-40ba-831f-fa8dfcbc50fe",
+      "designSystemPath": ".superdesign/design-system.md",
+      "referenceIds": [
+        "1c4f8e99-b7ce-4ebb-bf3f-04a1150b8472"
+      ],
+      "contextFiles": [
+        ".superdesign/design-system.md",
+        "src/gui/mod.rs",
+        "src/gui/theme.rs",
+        "src/gui/top_bar.rs",
+        "src/gui/sound_list.rs",
+        "src/gui/server_panel.rs",
+        "src/gui/types.rs",
+        "src/network/static/style.css",
+        "src/network/static/index.html"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "16ec876fae8e710164c24067d4b76edf9635b7a6c521fddf6a5cd3dacd01847a",
+        "src/gui/mod.rs": "097fd0029fd847f4a91798f7210fc0d3fa3d99d03d8f2f2a87652f0b48af6032",
+        "src/gui/theme.rs": "6dc6696c6b7ab624e41d9fc42f685156289b3c32483725c1111a8635fe3abd7a",
+        "src/gui/top_bar.rs": "00a1b73e805d1198f86dd9313add2eb5fce5855dc67f353840497bdf72417f18",
+        "src/gui/sound_list.rs": "a3b406811246bc81b0ae22dee2e29b2eb1857c696895c5a24f5c0cbb141b00fa",
+        "src/gui/server_panel.rs": "ea0745afdc8e0ae99b4e524dccd49ecdc056961ab30414baeeb55ae708d87943",
+        "src/gui/types.rs": "5ad0ca673df1bd4e87792b28abe4b2c634d6f18d50595bc9f46ec77b1d30b072",
+        "src/network/static/style.css": "7d798dae1f542ef25e25034cbd82243afbb7689b2a2e206ed235a3f5abf1ebd7",
+        "src/network/static/index.html": "4a1345f24cf19a770992bd616e4e6bf258572c8c8a5b1b21d81fda56bf90d41e"
+      },
+      "drafts": {
+        "89f1c08c-4668-40ba-831f-fa8dfcbc50fe": {
+          "title": "SoundShared Desktop - Red Noir Broadcast Console",
+          "visualDirection": "red noir / industrial broadcast console",
+          "currentVersion": 4
+        }
+      },
+      "updatedAt": "2026-11-06T00:00:00.000Z"
+    }
+  }
+}

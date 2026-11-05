@@ -337,6 +337,7 @@ fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
     let (listener_count_tx, listener_count_rx) = bounded::<usize>(1);
     let (server_handle_tx, server_handle_rx) = bounded::<ServerHandle>(1);
+    let server_cmd_tx_for_start = server_cmd_tx.clone();
 
     // Create audio engine
     let audio_engine = AudioEngine::new()
@@ -345,9 +346,6 @@ fn main() -> Result<()> {
     // Set master volume from config
     audio_engine.set_master_volume(config.audio.master_volume)
         .map_err(|e| SoundSharedError::Audio(soundshared::error::AudioError::Mixer(e.to_string())))?;
-
-    // Get the mixed output receiver from the engine (for CPAL local playback)
-    let mixed_output_rx = audio_engine.mixed_output_receiver().clone();
 
     // Get the broadcast output receiver for WebSocket streaming
     let broadcast_output_rx = audio_engine.broadcast_output_receiver();
@@ -417,26 +415,58 @@ fn main() -> Result<()> {
         processor.run();
     });
 
-    // Start the audio engine output stream (on main thread)
+    // Start the audio engine output stream (on main thread). If no local
+    // output device is available, keep streaming to network listeners.
     {
         let engine_guard = audio_engine_shared.lock().unwrap();
         if let Some(engine) = engine_guard.as_ref() {
             if let Err(e) = engine.start_output() {
-                warn!("Failed to start audio output: {}", e);
+                warn!(
+                    "Failed to start local audio output: {}. Falling back to headless streaming.",
+                    e
+                );
+                if let Err(headless_err) = engine.start_headless_output() {
+                    error!("Failed to start headless audio engine: {}", headless_err);
+                }
             }
         }
     }
 
     if server_only {
         info!("Running in server-only mode (no GUI). Press Ctrl+C to stop.");
-        // Wait for shutdown signal (Ctrl+C)
-        let shutdown_tx_clone = shutdown_tx.clone();
+
+        // There is no GUI to press "Start", so start the listener server here.
+        let (response_tx, response_rx) = bounded::<anyhow::Result<String>>(1);
+        if let Err(e) = server_cmd_tx_for_start.send(ServerCommand::Start { response: response_tx }) {
+            error!("Failed to request server start: {}", e);
+        } else {
+            match response_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(url)) => info!("Listener server available at {}", url),
+                Ok(Err(e)) => error!("Failed to start listener server: {}", e),
+                Err(e) => error!("Timed out waiting for listener server to start: {}", e),
+            }
+        }
+
+        // Wait for Ctrl+C. The process exits after this, which tears down the
+        // server and audio threads.
+        let (ctrlc_tx, ctrlc_rx) = bounded::<()>(1);
         ctrlc::set_handler(move || {
-            let _ = shutdown_tx_clone.send(());
+            let _ = ctrlc_tx.send(());
         }).expect("Error setting Ctrl+C handler");
-        
-        // Keep main thread alive
-        std::thread::park();
+
+        let _ = ctrlc_rx.recv();
+
+        info!("Shutting down...");
+        let _ = shutdown_tx.send(());
+        thread::sleep(Duration::from_millis(300));
+
+        if let Some(mut engine) = audio_engine_shared.lock().unwrap().take() {
+            if let Err(e) = engine.stop_output() {
+                warn!("Error stopping audio engine: {}", e);
+            }
+        }
+
+        info!("SoundShared stopped");
         Ok(())
     } else {
         // Run the GUI (blocks until window closes)

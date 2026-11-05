@@ -1,23 +1,29 @@
 //! Audio mixer for combining multiple PCM streams
 //! Thread-safe, non-blocking, lock-free where possible
 //!
-//! The mixer runs a single central mix loop that combines all active playing
-//! tracks into one buffer per interval (480 frames = 10 ms at 48 kHz) and
-//! sends the mixed result to both the local CPAL output and the network
-//! broadcast channel. This ensures all tracks are properly sample-aligned
-//! before being streamed to WebSocket clients.
+//! The mixer exposes a pull-based [`AudioMixer::mix_into`] API. The audio
+//! device callback (CPAL) is the master clock: every time the device asks for
+//! N frames, the mixer advances every active track by exactly N frames and
+//! fills the callback buffer. This removes the old `thread::sleep(10ms)` loop
+//! whose Windows timer granularity (~15.6 ms) caused constant underruns.
+//!
+//! When no output device is available, [`AudioMixer::start`] runs an
+//! equivalent deadline-paced loop so network streaming still works.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use crate::audio::decoder::DecodedAudio;
+use crate::audio::decoder::{DecodedAudio, TARGET_SAMPLE_RATE};
+
+/// Number of interleaved channels produced by the mixer.
+const CHANNELS: usize = 2;
 
 /// Errors that can occur in the mixer
 #[derive(Debug, thiserror::Error)]
@@ -53,11 +59,11 @@ pub struct MixedOutput {
 pub struct MixerConfig {
     /// Buffer size in frames (stereo pairs). 480 = 10 ms at 48 kHz.
     pub buffer_frames: usize,
-    /// Number of buffers to keep in each output channel
+    /// Number of buffers to keep in the broadcast output channel
     pub channel_capacity: usize,
     /// Master volume (0.0 - 1.0)
     pub master_volume: f32,
-    /// Interval between mix iterations (ms). Default 10 ms.
+    /// Interval between mix iterations (ms) for the headless fallback loop.
     pub mix_interval_ms: u64,
 }
 
@@ -66,7 +72,7 @@ impl Default for MixerConfig {
         Self {
             // ~10 ms at 48 kHz = 480 frames
             buffer_frames: 480,
-            // Increased from 8 to 64 to prevent drops under load (~640 ms buffer)
+            // ~640 ms of buffering for the network forwarder.
             channel_capacity: 64,
             master_volume: 1.0,
             mix_interval_ms: 10,
@@ -90,24 +96,21 @@ struct TrackState {
     looped: bool,
 }
 
-/// High-performance audio mixer
+/// High-performance audio mixer.
 ///
-/// A single central mix loop (started via `start()`) reads from all active
-/// tracks, mixes them into one buffer, and pushes to both output channels.
-/// This replaces the old per-track feeder threads which sent un-mixed audio
-/// independently, causing crackling and buffer overflows.
+/// Tracks are mixed on demand by the audio callback (or by the headless loop
+/// when no device is available). There is no separate feeder thread per track
+/// and no fixed-size intermediate channel for local playback, so the mixer can
+/// never fall behind the device clock.
 #[derive(Debug)]
 pub struct AudioMixer {
     config: MixerConfig,
     master_volume: Arc<parking_lot::Mutex<f32>>,
     tracks: Arc<RwLock<HashMap<Uuid, TrackState>>>,
-    /// Output channel for mixed audio (CPAL local playback)
-    output_tx: Sender<MixedOutput>,
-    output_rx: Receiver<MixedOutput>,
     /// Broadcast channel for network streaming (WebSocket clients)
     broadcast_tx: Sender<MixedOutput>,
     broadcast_rx: Receiver<MixedOutput>,
-    /// Mixer running state
+    /// Headless mixer running state
     running: Arc<AtomicBool>,
     /// Timestamp counter
     timestamp: Arc<AtomicU64>,
@@ -115,44 +118,25 @@ pub struct AudioMixer {
     seq_no: Arc<AtomicU64>,
     /// Next track ID generator
     next_track_id: Arc<AtomicU64>,
-    /// Handle to the central mix loop thread
+    /// Handle to the headless mix loop thread (None when the device drives us)
     mix_handle: parking_lot::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl AudioMixer {
     /// Create a new audio mixer with default configuration
     pub fn new() -> Self {
-        let config = MixerConfig::default();
-        let (output_tx, output_rx) = bounded(config.channel_capacity);
-        let (broadcast_tx, broadcast_rx) = bounded(config.channel_capacity);
-
-        Self {
-            config,
-            master_volume: Arc::new(parking_lot::Mutex::new(1.0)),
-            tracks: Arc::new(RwLock::new(HashMap::new())),
-            output_tx,
-            output_rx,
-            broadcast_tx,
-            broadcast_rx,
-            running: Arc::new(AtomicBool::new(false)),
-            timestamp: Arc::new(AtomicU64::new(0)),
-            seq_no: Arc::new(AtomicU64::new(0)),
-            next_track_id: Arc::new(AtomicU64::new(0)),
-            mix_handle: parking_lot::Mutex::new(None),
-        }
+        Self::with_config(MixerConfig::default())
     }
 
     /// Create a new audio mixer with custom configuration
     pub fn with_config(config: MixerConfig) -> Self {
-        let (output_tx, output_rx) = bounded(config.channel_capacity);
         let (broadcast_tx, broadcast_rx) = bounded(config.channel_capacity);
+        let master_volume = config.master_volume;
 
         Self {
-            config: config.clone(),
-            master_volume: Arc::new(parking_lot::Mutex::new(config.master_volume)),
+            config,
+            master_volume: Arc::new(parking_lot::Mutex::new(master_volume)),
             tracks: Arc::new(RwLock::new(HashMap::new())),
-            output_tx,
-            output_rx,
             broadcast_tx,
             broadcast_rx,
             running: Arc::new(AtomicBool::new(false)),
@@ -166,8 +150,7 @@ impl AudioMixer {
     /// Add a new track to the mixer
     ///
     /// Returns the track ID. The track is created in a stopped state; call
-    /// [`play_track`] to begin playback. The mix loop reads audio directly
-    /// from the track's decoded samples, so no input sender is needed.
+    /// [`play_track`](Self::play_track) to begin playback.
     pub fn add_track(&self, audio: Arc<DecodedAudio>, looped: bool) -> Uuid {
         let id = Uuid::from_u64_pair(0, self.next_track_id.fetch_add(1, Ordering::Relaxed));
 
@@ -184,28 +167,28 @@ impl AudioMixer {
         id
     }
 
-    /// Start the central mix loop.
+    /// Start the headless mix loop.
     ///
-    /// Spawns a thread that runs at `mix_interval_ms` intervals, mixes all
-    /// active playing tracks into one buffer, and sends to both output
-    /// channels. Must be called before tracks will produce any output.
+    /// This is only needed when there is no CPAL output device. When a device
+    /// is present, the device callback drives [`mix_into`](Self::mix_into) and
+    /// this method must not be called.
     pub fn start(&self) {
-        self.running.store(true, Ordering::Release);
+        if self.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
         let config = self.config.clone();
-        let tracks = self.tracks.clone();
-        let output_tx = self.output_tx.clone();
+        let tracks = Arc::clone(&self.tracks);
         let broadcast_tx = self.broadcast_tx.clone();
-        let running = self.running.clone();
-        let timestamp = self.timestamp.clone();
-        let seq_no = self.seq_no.clone();
-        let master_volume = self.master_volume.clone();
+        let running = Arc::clone(&self.running);
+        let timestamp = Arc::clone(&self.timestamp);
+        let seq_no = Arc::clone(&self.seq_no);
+        let master_volume = Arc::clone(&self.master_volume);
 
         let handle = thread::spawn(move || {
-            Self::mix_loop(
+            Self::headless_loop(
                 config,
                 tracks,
-                output_tx,
                 broadcast_tx,
                 running,
                 timestamp,
@@ -217,7 +200,7 @@ impl AudioMixer {
         *self.mix_handle.lock() = Some(handle);
     }
 
-    /// Stop the mixer and wait for the mix loop to finish.
+    /// Stop the headless mixer and wait for the loop to finish.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
         if let Some(handle) = self.mix_handle.lock().take() {
@@ -225,138 +208,180 @@ impl AudioMixer {
         }
     }
 
-    /// Check if mixer is running
+    /// Check if the headless mixer loop is running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
 
-    /// Central mix loop — runs on its own thread.
+    /// Mix all active tracks into `out`.
     ///
-    /// Every `mix_interval_ms` it:
-    /// 1. Allocates a zeroed mix buffer
-    /// 2. For each active playing track, reads the next chunk of PCM from
-    ///    the track's decoded samples and adds it into the mix buffer
-    /// 3. Applies master volume
-    /// 4. Sends the single mixed buffer to both output channels
+    /// `out` is interleaved stereo f32 and may be any length the device asks
+    /// for (CPAL callbacks are not guaranteed to be 480 frames). The mixer
+    /// advances every playing track by exactly `out.len() / 2` frames and
+    /// applies the master volume exactly once.
     ///
-    /// This ensures all tracks are sample-aligned and mixed together before
-    /// being sent to local output or WebSocket clients.
-    fn mix_loop(
+    /// Returns `true` when at least one track was playing during this call.
+    pub fn mix_into(&self, out: &mut [f32]) -> bool {
+        Self::mix_into_parts(&self.tracks, &self.master_volume, out)
+    }
+
+    /// Publish an already-mixed buffer to the network broadcast channel.
+    ///
+    /// The send is non-blocking: if the forwarder is behind, the frame is
+    /// dropped rather than stalling the audio callback.
+    pub fn publish_broadcast(&self, buffer: &[f32]) {
+        Self::publish_broadcast_parts(
+            &self.broadcast_tx,
+            &self.timestamp,
+            &self.seq_no,
+            buffer,
+        );
+    }
+
+    fn mix_into_parts(
+        tracks: &RwLock<HashMap<Uuid, TrackState>>,
+        master_volume: &parking_lot::Mutex<f32>,
+        out: &mut [f32],
+    ) -> bool {
+        let frames = out.len() / CHANNELS;
+        out.fill(0.0);
+        if frames == 0 {
+            return false;
+        }
+
+        let master = *master_volume.lock();
+        let mut any_playing = false;
+        // (track_id, new_position, still_playing)
+        let mut updates: Vec<(Uuid, usize, bool)> = Vec::new();
+
+        {
+            let tracks_read = tracks.read();
+            for (track_id, track) in tracks_read.iter() {
+                if !track.playing || track.audio.frames == 0 {
+                    continue;
+                }
+
+                any_playing = true;
+                let mut src_pos = track.position.min(track.audio.frames);
+                let mut dst_frame = 0usize;
+                let mut finished = false;
+
+                while dst_frame < frames {
+                    if src_pos >= track.audio.frames {
+                        if track.looped {
+                            src_pos = 0;
+                        } else {
+                            finished = true;
+                            break;
+                        }
+                    }
+
+                    let frames_to_mix =
+                        (track.audio.frames - src_pos).min(frames - dst_frame);
+                    let src_start = src_pos * CHANNELS;
+                    let dst_start = dst_frame * CHANNELS;
+                    let sample_count = frames_to_mix * CHANNELS;
+
+                    for i in 0..sample_count {
+                        out[dst_start + i] +=
+                            track.audio.samples[src_start + i] * track.volume;
+                    }
+
+                    dst_frame += frames_to_mix;
+                    src_pos += frames_to_mix;
+                }
+
+                updates.push((*track_id, src_pos, !finished));
+            }
+        }
+
+        // Apply master volume once, after all tracks have been summed. The
+        // CPAL callback used to multiply by master volume a second time.
+        if (master - 1.0).abs() > f32::EPSILON {
+            for sample in out.iter_mut() {
+                *sample *= master;
+            }
+        }
+
+        if !updates.is_empty() {
+            let mut tracks_write = tracks.write();
+            for (track_id, new_position, still_playing) in updates {
+                if let Some(track) = tracks_write.get_mut(&track_id) {
+                    if still_playing {
+                        track.position = new_position;
+                    } else {
+                        track.position = track.audio.frames;
+                        track.playing = false;
+                    }
+                }
+            }
+        }
+
+        any_playing
+    }
+
+    fn publish_broadcast_parts(
+        broadcast_tx: &Sender<MixedOutput>,
+        timestamp: &AtomicU64,
+        seq_no: &AtomicU64,
+        buffer: &[f32],
+    ) {
+        if buffer.is_empty() {
+            return;
+        }
+
+        let ts = timestamp.fetch_add(1, Ordering::Relaxed);
+        let seq = seq_no.fetch_add(1, Ordering::Relaxed);
+        let output = MixedOutput {
+            buffer: buffer.to_vec(),
+            seq_no: seq,
+            timestamp: ts,
+        };
+
+        // Drop frames when the forwarder is behind. Never block the audio
+        // callback on a network consumer.
+        if let Err(crossbeam_channel::TrySendError::Disconnected(_)) =
+            broadcast_tx.try_send(output)
+        {
+            // Receiver dropped; the mixer can keep running harmlessly.
+        }
+    }
+
+    /// Headless mix loop — only used when no CPAL device is available.
+    ///
+    /// Uses a fixed deadline instead of `sleep(interval)`, so scheduler
+    /// oversleep does not accumulate into a permanent underrun.
+    fn headless_loop(
         config: MixerConfig,
         tracks: Arc<RwLock<HashMap<Uuid, TrackState>>>,
-        output_tx: Sender<MixedOutput>,
         broadcast_tx: Sender<MixedOutput>,
         running: Arc<AtomicBool>,
         timestamp: Arc<AtomicU64>,
         seq_no: Arc<AtomicU64>,
         master_volume: Arc<parking_lot::Mutex<f32>>,
     ) {
-        let buffer_frames = config.buffer_frames;
-        let channels = 2; // stereo
-        let buffer_size = buffer_frames * channels;
-        let interval = Duration::from_millis(config.mix_interval_ms);
+        let frames = config.buffer_frames.max(1);
+        let mut buffer = vec![0.0f32; frames * CHANNELS];
 
-        let mut mix_buffer = vec![0.0f32; buffer_size];
+        let sample_rate = TARGET_SAMPLE_RATE.max(1) as u64;
+        let period = Duration::from_nanos((frames as u64 * 1_000_000_000) / sample_rate);
+        let mut next_deadline = Instant::now() + period;
 
         while running.load(Ordering::Acquire) {
-            // Start from silence
-            mix_buffer.fill(0.0);
-            let master_vol = *master_volume.lock();
-
-            // Collect tracks that need position updates while holding read lock,
-            // then apply updates under brief write locks to avoid long lock holds.
-            let mut tracks_to_advance: Vec<(Uuid, usize)> = Vec::new();
-
-            {
-                let tracks_read = tracks.read();
-                for (track_id, track) in tracks_read.iter() {
-                    if !track.playing {
-                        continue;
-                    }
-
-                    let position = track.position;
-                    let frames_to_mix = buffer_frames.min(track.audio.frames.saturating_sub(position));
-                    if frames_to_mix == 0 {
-                        // Track finished
-                        if track.looped {
-                            tracks_to_advance.push((*track_id, 0));
-                        }
-                        // Non-looping tracks: position will be updated to end
-                        // and playing set to false in the apply section below.
-                        // Track stays in mixer so stop/remove can still find it.
-                        continue;
-                    }
-
-                    let samples_to_mix = frames_to_mix * channels;
-                    let src_start = position * channels;
-
-                    // Mix this track's samples into the shared buffer
-                    for i in 0..samples_to_mix {
-                        if i < buffer_size {
-                            mix_buffer[i] += track.audio.samples[src_start + i] * track.volume;
-                        }
-                    }
-
-                    tracks_to_advance.push((*track_id, position + frames_to_mix));
-                }
+            let playing = Self::mix_into_parts(&tracks, &master_volume, &mut buffer);
+            if playing {
+                Self::publish_broadcast_parts(&broadcast_tx, &timestamp, &seq_no, &buffer);
             }
 
-            // Apply position updates and track stops
-            {
-                let mut tracks_write = tracks.write();
-                for (track_id, new_pos) in tracks_to_advance {
-                    if let Some(track) = tracks_write.get_mut(&track_id) {
-                        track.position = new_pos;
-                        if track.position >= track.audio.frames && !track.looped {
-                            // Track finished — mark as stopped but do NOT remove it from the mixer.
-                            // Removing it would make subsequent stop/remove operations fail with
-                            // TrackNotFound, leaving the GUI stuck in a "playing" state.
-                            track.playing = false;
-                            // Do not push to tracks_to_stop — keep the track in the map so
-                            // stop_track/remove_sound can still find and operate on it.
-                        }
-                    }
-                }
-                // No track removal here — tracks stay in the mixer until explicitly removed
-                // via remove_track/unload_sound.
+            let now = Instant::now();
+            if next_deadline > now {
+                thread::sleep(next_deadline - now);
+            } else if now.duration_since(next_deadline) > period * 4 {
+                // The process was descheduled or suspended for a long time.
+                // Resync instead of trying to catch up with a burst.
+                next_deadline = now;
             }
-
-            // Apply master volume
-            for sample in &mut mix_buffer {
-                *sample *= master_vol;
-            }
-
-            let ts = timestamp.fetch_add(1, Ordering::Relaxed);
-            let seq = seq_no.fetch_add(1, Ordering::Relaxed);
-            let output = MixedOutput {
-                buffer: mix_buffer.clone(),
-                seq_no: seq,
-                timestamp: ts,
-            };
-
-            // Send to CPAL local playback channel (non-blocking — drop if full)
-            match output_tx.try_send(output.clone()) {
-                Ok(()) => {}
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break,
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    // Channel full — drop frame, CPAL will output silence
-                }
-            }
-
-            // Send to broadcast channel for WebSocket clients only when at least
-            // one track is playing — otherwise we'd stream silence and fill
-            // client buffers with useless data (causing buffer overflow before
-            // any music has even been started).
-            let any_playing = {
-                let tracks_read = tracks.read();
-                tracks_read.values().any(|t| t.playing)
-            };
-            if any_playing {
-                let _ = broadcast_tx.try_send(output);
-            }
-
-            // Sleep until next mix interval
-            thread::sleep(interval);
+            next_deadline += period;
         }
     }
 
@@ -450,11 +475,6 @@ impl AudioMixer {
         }
     }
 
-    /// Get the mixed output receiver for CPAL local playback
-    pub fn output_receiver(&self) -> &Receiver<MixedOutput> {
-        &self.output_rx
-    }
-
     /// Get the broadcast output receiver for network streaming (WebSocket clients)
     pub fn broadcast_output_receiver(&self) -> Receiver<MixedOutput> {
         self.broadcast_rx.clone()
@@ -472,12 +492,12 @@ impl AudioMixer {
 
     /// Get sample rate
     pub fn sample_rate(&self) -> u32 {
-        crate::audio::decoder::TARGET_SAMPLE_RATE
+        TARGET_SAMPLE_RATE
     }
 
     /// Get channels
     pub fn channels(&self) -> u32 {
-        crate::audio::decoder::TARGET_CHANNELS
+        CHANNELS as u32
     }
 }
 
@@ -544,6 +564,64 @@ mod tests {
         mixer.play_track(id).unwrap();
         assert!(mixer.is_track_playing(id).unwrap());
         mixer.stop_track(id).unwrap();
+        assert!(!mixer.is_track_playing(id).unwrap());
+    }
+
+    #[test]
+    fn test_mix_into_applies_master_volume_once() {
+        let mixer = AudioMixer::new();
+        mixer.set_master_volume(0.5).unwrap();
+
+        let audio = Arc::new(DecodedAudio::new(vec![1.0; 480 * 2], 48000, 2));
+        let id = mixer.add_track(audio, false);
+        mixer.play_track(id).unwrap();
+
+        let mut out = vec![0.0f32; 480 * 2];
+        assert!(mixer.mix_into(&mut out));
+        assert!((out[0] - 0.5).abs() < 1e-6);
+        assert!((out[out.len() - 1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mix_into_respects_arbitrary_buffer_size() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.25; 48000 * 2], 48000, 2));
+        let id = mixer.add_track(audio, false);
+        mixer.play_track(id).unwrap();
+
+        // A device callback may ask for more or fewer frames than the
+        // nominal 10 ms mix size.
+        for frames in [64usize, 480, 1024, 37] {
+            let mut out = vec![0.0f32; frames * 2];
+            assert!(mixer.mix_into(&mut out));
+            assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        }
+    }
+
+    #[test]
+    fn test_mix_into_loops_track() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.25; 100 * 2], 48000, 2));
+        let id = mixer.add_track(audio, true);
+        mixer.play_track(id).unwrap();
+
+        let mut out = vec![0.0f32; 480 * 2];
+        assert!(mixer.mix_into(&mut out));
+        assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(mixer.is_track_playing(id).unwrap());
+    }
+
+    #[test]
+    fn test_mix_into_marks_finished_track_stopped() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.5; 100 * 2], 48000, 2));
+        let id = mixer.add_track(audio, false);
+        mixer.play_track(id).unwrap();
+
+        let mut out = vec![0.0f32; 480 * 2];
+        assert!(mixer.mix_into(&mut out));
+        assert!(out[..200].iter().all(|s| (*s - 0.5).abs() < 1e-6));
+        assert!(out[200..].iter().all(|s| *s == 0.0));
         assert!(!mixer.is_track_playing(id).unwrap());
     }
 }

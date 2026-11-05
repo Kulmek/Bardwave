@@ -1,33 +1,46 @@
-# Design Tokens (SoundShared Listener)
+# Design Tokens (SoundShared Listener — Red Noir)
 
 Source: `src/network/static/style.css` `:root` variables
 
-## Color palette (current)
+## Color palette
 | Token | Value | Role |
 |-------|-------|------|
-| --bg-primary | #0f172a | Page background |
-| --bg-secondary | #1e293b | Panel backgrounds |
-| --bg-tertiary | #334155 | Elevated surfaces, buffer bar bg |
-| --fg-primary | #f8fafc | Primary text |
-| --fg-secondary | #94a3b8 | Secondary text |
-| --fg-muted | #64748b | Muted / label text |
-| --accent-primary | #22d3ee | Primary accent (cyan) |
-| --accent-secondary | #818cf8 | Secondary accent (indigo) |
-| --accent-warning | #fbbf24 | Warning / connecting |
-| --accent-error | #f87171 | Error / low buffer |
-| --accent-success | #34d399 | Success / connected |
-| --border-color | #334155 | Borders |
-| --shadow-color | rgba(0,0,0,0.4) | Drop shadows |
+| --noir-black | #0A0A0A | Page background |
+| --noir-panel | #111111 | Primary panel background |
+| --noir-zinc-950 | #09090B | Deepest surface |
+| --noir-zinc-900 | #18181B | Elevated surface / toast background |
+| --noir-zinc-800 | #27272A | Borders / inactive toast edge |
+| --noir-zinc-700 | #3F3F46 | Strong border |
+| --noir-zinc-600 | #52525B | Footer copy |
+| --noir-zinc-500 | #71717A | Muted / label text |
+| --noir-zinc-400 | #A1A1AA | Secondary text |
+| --noir-zinc-300 | #D4D4D8 | Toast body text |
+| --rose-400 | #FB7185 | Error / clipping accent |
+| --rose-500 | #F43F5E | Connected accent |
+| --rose-600 | #E11D48 | Primary accent (brand red) |
+| --rose-700 | #BE123C | Primary button hover |
+| --rose-950 | #4C0519 | Meter gradient start / buffer cell base |
+| --amber-400 | #FBBF24 | Connecting / buffer warning |
+| --white | #FFFFFF | Primary text |
+| --white-5 / -10 / -20 | rgba(255,255,255,.05/.10/.20) | Hairlines, borders, peak marker |
 
 ## Typography
-- System font stack: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif
-- Monospace: 'SF Mono', Monaco, 'Cascadia Code', monospace (stats, buffer text)
-- Sizes: 0.7rem labels, 0.75rem small, 0.875rem subtitle/small value, 0.9rem secondary btn, 1rem primary text, 1.125rem stat value, 1.75rem h1
+- Sans: 'Archivo' (400/500/700/900) with system fallbacks
+- Mono: 'JetBrains Mono' (400/700) for stats, URLs, meters
+- Brand title: clamp(2.75rem, 8vw, 4.5rem), weight 900, uppercase, tight tracking
+- Panel title: 1.5rem, weight 900, uppercase
+- Labels: 10–11px, uppercase, wide tracking
+- Body/subtitle: 0.875–1rem, zinc-500
 
 ## Spacing / Radius
-- --radius-sm: 6px, --radius-md: 10px, --radius-lg: 16px
-- Panel padding: 28px 24px (connection), 20px 24px (message), 16px 20px (info), 20px 16px (stats)
+- Page max width: 72rem (1152px, Tailwind max-w-6xl)
+- Panel padding: 2rem (1.5rem below 480px)
+- Layout gap: 2rem
+- Radius: 2px (`--radius-sm`); buttons and buffer cells are square
 
 ## Transitions / Animation
-- --transition-fast: 150ms ease, --transition-normal: 250ms ease
-- Keyframes: pulse-ring, pulse-error, spin, fade-in, slide-down
+- --transition-fast: 150ms ease
+- --transition-normal: 250ms ease
+- --transition-slow: 300ms ease
+- Keyframes: pulse-dot, scan (red scanline), spin (loader), buffer-warning, toast-in
+- `prefers-reduced-motion` disables animations/transitions

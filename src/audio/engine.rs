@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, SampleRate, StreamConfig};
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -237,7 +237,8 @@ impl AudioEngine {
             stream_config.buffer_size
         );
 
-        // Override buffer size for low latency (~10ms)
+        // Ask for a 10 ms buffer. Not every backend accepts a fixed size, so
+        // we retry with the device default below instead of failing outright.
         let stream_config = StreamConfig {
             buffer_size: BufferSize::Fixed(480), // 480 frames = 10ms at 48kHz
             ..stream_config
@@ -246,56 +247,77 @@ impl AudioEngine {
         // Use Arc::clone since these are already wrapped in Arcs
         let mixer = Arc::clone(&self.inner.mixer);
         let running = Arc::clone(&self.inner.running);
-        let master_volume = Arc::clone(&self.inner.master_volume);
 
-        // Start the mixer
-        mixer.start();
-
-        // Build the output stream
-        let stream = device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if !running.load(Ordering::Acquire) {
-                    data.fill(0.0);
-                    return;
-                }
-
-                // Try to get mixed audio from mixer
-                match mixer.output_receiver().try_recv() {
-                    Ok(mixed) => {
-                        let master_vol = *master_volume.lock();
-                        let frames = data.len() / 2; // stereo
-                        let mixed_frames = mixed.buffer.len() / 2;
-
-                        for i in 0..frames.min(mixed_frames) {
-                            data[i * 2] = mixed.buffer[i * 2] * master_vol;
-                            data[i * 2 + 1] = mixed.buffer[i * 2 + 1] * master_vol;
-                        }
-
-                        // Fill remaining with silence if needed
-                        for i in frames.min(mixed_frames)..frames {
-                            data[i * 2] = 0.0;
-                            data[i * 2 + 1] = 0.0;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => {
-                        // No mixed data available, output silence
+        // The device callback is the master clock: it pulls exactly the
+        // number of frames the hardware needs and immediately publishes the
+        // same buffer to the network forwarder. No intermediate 10 ms channel
+        // and no `thread::sleep` timing, both of which caused underruns.
+        let build_stream = |config: &StreamConfig| -> Result<cpal::Stream, cpal::BuildStreamError> {
+            let mixer = Arc::clone(&mixer);
+            let running = Arc::clone(&running);
+            device.build_output_stream(
+                config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if !running.load(Ordering::Acquire) {
                         data.fill(0.0);
+                        return;
                     }
-                    Err(TryRecvError::Disconnected) => {
-                        data.fill(0.0);
-                    }
-                }
-            },
-            move |err| error!("Audio stream error: {}", err),
-            None,
-        )?;
 
-        stream.play()?;
+                    // Master volume is applied inside `mix_into`, exactly once.
+                    let playing = mixer.mix_into(data);
+                    if playing {
+                        mixer.publish_broadcast(data);
+                    }
+                },
+                move |err| error!("Audio stream error: {}", err),
+                None,
+            )
+        };
+
+        let stream = match build_stream(&stream_config) {
+            Ok(stream) => stream,
+            Err(first_err) => {
+                warn!(
+                    "Failed to build 10 ms output stream ({}); retrying with the device default buffer size",
+                    first_err
+                );
+                let fallback_config = StreamConfig {
+                    buffer_size: BufferSize::Default,
+                    ..stream_config.clone()
+                };
+                build_stream(&fallback_config)?
+            }
+        };
+
+        // Mark the engine running before starting the stream so the first
+        // callback already mixes instead of emitting one silent buffer.
         self.inner.running.store(true, Ordering::Release);
+        if let Err(e) = stream.play() {
+            self.inner.running.store(false, Ordering::Release);
+            return Err(e.into());
+        }
+
         *self.inner.stream.lock().unwrap() = Some(stream);
 
-        info!("Audio engine started successfully");
+        info!("Audio engine started successfully (device-driven mixer)");
+        Ok(())
+    }
+
+    /// Start the audio engine without a local output device.
+    ///
+    /// Used when CPAL cannot open an output stream (headless server, no sound
+    /// card, exclusive-mode conflict). The mixer then runs its own deadline-
+    /// paced loop and still publishes frames to the network broadcaster.
+    pub fn start_headless_output(&self) -> Result<(), EngineError> {
+        if self.inner.running.load(Ordering::Acquire) {
+            warn!("Audio engine already running");
+            return Ok(());
+        }
+
+        self.inner.running.store(true, Ordering::Release);
+        self.inner.mixer.start();
+
+        info!("Audio engine started in headless mode (network streaming only)");
         Ok(())
     }
 
@@ -305,8 +327,10 @@ impl AudioEngine {
             return Ok(());
         }
 
-        self.inner.mixer.stop();
+        // Stop the clock first so the callback emits silence, then join the
+        // headless loop if it was the one driving the mixer.
         self.inner.running.store(false, Ordering::Release);
+        self.inner.mixer.stop();
 
         if let Some(stream) = self.inner.stream.lock().unwrap().take() {
             // Drop the stream to stop it (pause() returns PauseStreamError not in EngineError)
@@ -520,11 +544,6 @@ impl AudioEngine {
         self.stop_sound(sound_id)?;
         self.inner.sounds.write().remove(&sound_id);
         Ok(())
-    }
-
-    /// Get the mixer's output receiver for network broadcasting
-    pub fn mixed_output_receiver(&self) -> &Receiver<MixedOutput> {
-        self.inner.mixer.output_receiver()
     }
 
     /// Get the mixer's broadcast output receiver for network streaming (WebSocket clients)

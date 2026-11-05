@@ -1,107 +1,312 @@
 /**
- * SoundShared Listener - WebSocket Audio Player
- * Handles WebSocket connection, Web Audio API playback via AudioWorkletNode,
- * and UI state management. Rewritten to fix audio stuttering caused by
- * ScriptProcessorNode running on the main thread.
+ * SoundShared Listener — WebSocket audio player
+ *
+ * Wire format (server -> browser):
+ *   [seq_no: u32 LE][pcm: f32 LE, interleaved stereo, 48 kHz]
+ *
+ * Playback uses an AudioWorklet with a ring buffer and a real jitter buffer:
+ *   - wait for ~200 ms before starting
+ *   - rebuffer when the queue drops below ~30 ms
+ *   - cap latency at ~1.5 s
+ *   - fade in/out over ~8 ms to avoid clicks
+ *
+ * The worklet runs on the audio rendering thread and reports buffer/underrun
+ * statistics back to the main thread. No per-callback allocation or slicing.
  */
 
-(function() {
+(function () {
     'use strict';
 
-    // =============================================================================
+    // =========================================================================
     // Configuration
-    // =============================================================================
+    // =========================================================================
     const CONFIG = {
         sampleRate: 48000,
         channels: 2,
-        // Target playback buffer before starting (ms) - higher = more resilient to jitter
-        targetBufferMs: 400,
-        // Maximum buffer duration before dropping old data (ms)
-        maxBufferMs: 2000,
-        // Warn level (ms) - below this shows buffer low indicator
-        lowBufferMs: 150,
-        // Reconnection settings
+        // Playback starts once this much audio is queued.
+        targetBufferMs: 200,
+        // If the queue falls below this, pause and rebuffer.
+        lowWaterMs: 30,
+        // Hard latency cap; older audio is discarded above this.
+        maxBufferMs: 1500,
+        // Ring buffer capacity.
+        capacityMs: 2000,
+        // UI refresh interval for fallback stats (ms).
+        uiUpdateInterval: 100,
         reconnect: {
             initialDelay: 1000,
             maxDelay: 30000,
             factor: 1.8,
             jitter: 0.3,
             maxAttempts: Infinity
-        },
-        // UI update interval (ms)
-        uiUpdateInterval: 100
+        }
     };
 
-    // =============================================================================
-    // AudioWorklet Processor Code (runs on the audio rendering thread)
-    // Injected as Blob to avoid needing a separate file served by the server.
-    // =============================================================================
+    // =========================================================================
+    // AudioWorklet processor
+    // Injected as a Blob so the server does not need an extra static route.
+    // =========================================================================
     const WORKLET_CODE = `
-class AudioStreamProcessor extends AudioWorkletProcessor {
-    constructor() {
+class SoundSharedStreamProcessor extends AudioWorkletProcessor {
+    constructor(options) {
         super();
-        // Interleaved stereo Float32 buffer: [L, R, L, R, ...]
-        this.buffer = new Float32Array(0);
-        this.port.onmessage = (event) => {
-            if (event.data && event.data.channelData instanceof Float32Array) {
-                const newData = event.data.channelData;
-                const combined = new Float32Array(this.buffer.length + newData.length);
-                combined.set(this.buffer);
-                combined.set(newData, this.buffer.length);
-                this.buffer = combined;
-            }
-        };
+        const opts = (options && options.processorOptions) || {};
+        this.channels = opts.channels || 2;
+        this.sampleRate = (typeof sampleRate === 'number' && sampleRate > 0)
+            ? sampleRate
+            : (opts.sampleRate || 48000);
+
+        this.capacityFrames = Math.ceil(this.sampleRate * (opts.capacitySeconds || 2));
+        this.capacity = this.capacityFrames * this.channels;
+        this.ring = new Float32Array(this.capacity);
+
+        this.writePos = 0;
+        this.readPos = 0;
+        this.available = 0;
+
+        this.started = false;
+        this.fadeGain = 0;
+        this.fadeFrames = Math.max(1, Math.floor(this.sampleRate * 0.008));
+        this.fadeStep = 1 / this.fadeFrames;
+
+        this.targetFrames = Math.floor(this.sampleRate * (opts.targetMs || 200) / 1000);
+        this.lowWaterFrames = Math.floor(this.sampleRate * (opts.lowWaterMs || 30) / 1000);
+        this.maxFrames = Math.floor(this.sampleRate * (opts.maxMs || 1500) / 1000);
+
+        this.underruns = 0;
+        this.overruns = 0;
+        this.playedFrames = 0;
+        this.receivedFrames = 0;
+        this.lastReportPlayed = 0;
+        this.lastReportReceived = 0;
+
+        this.port.onmessage = (event) => this.onMessage(event.data);
     }
 
-    process(inputs, outputs, parameters) {
+    onMessage(msg) {
+        if (!msg) return;
+        if (msg.type === 'push' && msg.samples instanceof Float32Array) {
+            this.push(msg.samples);
+        } else if (msg.type === 'reset') {
+            this.reset();
+        }
+    }
+
+    push(samples) {
+        let frames = Math.floor(samples.length / this.channels);
+        if (frames <= 0) return;
+
+        this.receivedFrames += frames;
+        let incoming = frames * this.channels;
+
+        if (frames > this.capacityFrames) {
+            const skipFrames = frames - this.capacityFrames;
+            samples = samples.subarray(skipFrames * this.channels);
+            incoming = this.capacityFrames * this.channels;
+            this.writePos = 0;
+            this.readPos = 0;
+            this.available = 0;
+            this.overruns++;
+        }
+
+        if (this.available + incoming > this.capacity) {
+            const excessFrames = Math.ceil(
+                (this.available + incoming - this.capacity) / this.channels
+            );
+            this.discard(excessFrames);
+            this.overruns++;
+        }
+
+        if (this.available + incoming > this.maxFrames * this.channels) {
+            const excessFrames = Math.ceil(
+                (this.available + incoming - this.maxFrames * this.channels) / this.channels
+            );
+            this.discard(excessFrames);
+            this.overruns++;
+        }
+
+        const first = Math.min(incoming, this.capacity - this.writePos);
+        this.ring.set(samples.subarray(0, first), this.writePos);
+        if (first < incoming) {
+            this.ring.set(samples.subarray(first, incoming), 0);
+        }
+        this.writePos = (this.writePos + incoming) % this.capacity;
+        this.available += incoming;
+
+        // Report while the buffer is filling so the UI shows progress even
+        // though the audio thread is not consuming frames yet.
+        if (this.receivedFrames - this.lastReportReceived >= Math.floor(this.sampleRate / 10)) {
+            this.lastReportReceived = this.receivedFrames;
+            this.report();
+        }
+    }
+
+    discard(frames) {
+        let samples = Math.min(frames * this.channels, this.available);
+        samples -= samples % this.channels;
+        this.readPos = (this.readPos + samples) % this.capacity;
+        this.available -= samples;
+    }
+
+    reset() {
+        this.writePos = 0;
+        this.readPos = 0;
+        this.available = 0;
+        this.started = false;
+        this.fadeGain = 0;
+        this.underruns = 0;
+        this.overruns = 0;
+        this.playedFrames = 0;
+        this.receivedFrames = 0;
+        this.lastReportPlayed = 0;
+        this.lastReportReceived = 0;
+        this.report();
+    }
+
+    report() {
+        this.port.postMessage({
+            type: 'stats',
+            availableFrames: Math.floor(this.available / this.channels),
+            playedFrames: this.playedFrames,
+            receivedFrames: this.receivedFrames,
+            underruns: this.underruns,
+            overruns: this.overruns,
+            started: this.started,
+            sampleRate: this.sampleRate
+        });
+    }
+
+    process(inputs, outputs) {
         const output = outputs[0];
-        const outputL = output.getChannelData(0);
-        const outputR = output.getChannelData(1);
-        const framesToFill = outputL.length;
-        const samplesToFill = framesToFill * 2;
+        const left = output[0];
+        const right = output.length > 1 ? output[1] : null;
+        const frames = left.length;
 
-        let samplesFilled = 0;
+        const targetSamples = this.targetFrames * this.channels;
+        const lowSamples = this.lowWaterFrames * this.channels;
 
-        // Consume from our internal buffer
-        while (samplesFilled < samplesToFill && this.buffer.length >= 2) {
-            const samplesToCopy = Math.min(samplesToFill - samplesFilled, this.buffer.length);
-            const framesToCopy = Math.floor(samplesToCopy / 2);
-            const samplesToCopyActual = framesToCopy * 2;
+        if (!this.started && this.available >= targetSamples) {
+            this.started = true;
+            this.report();
+        }
 
-            for (let i = 0; i < framesToCopy; i++) {
-                const outIdx = samplesFilled / 2 + i;
-                outputL[outIdx] = this.buffer[samplesFilled + i * 2];
-                outputR[outIdx] = this.buffer[samplesFilled + i * 2 + 1];
+        for (let i = 0; i < frames; i++) {
+            let l = 0;
+            let r = 0;
+            const consuming = this.started || this.fadeGain > 0;
+
+            if (consuming && this.available >= this.channels) {
+                l = this.ring[this.readPos];
+                r = this.ring[this.readPos + 1];
+                this.readPos = (this.readPos + this.channels) % this.capacity;
+                this.available -= this.channels;
+                this.playedFrames++;
             }
 
-            samplesFilled += samplesToCopyActual;
+            if (this.started) {
+                this.fadeGain = Math.min(1, this.fadeGain + this.fadeStep);
+            } else if (this.fadeGain > 0) {
+                this.fadeGain = Math.max(0, this.fadeGain - this.fadeStep);
+            }
 
-            // Drop consumed samples from the front
-            if (samplesToCopyActual < this.buffer.length) {
-                this.buffer = this.buffer.slice(samplesToCopyActual);
-            } else {
-                this.buffer = new Float32Array(0);
+            left[i] = l * this.fadeGain;
+            if (right) {
+                right[i] = r * this.fadeGain;
             }
         }
 
-        // Fill any remaining frames with silence (underrun protection)
-        const framesRemaining = framesToFill - samplesFilled / 2;
-        for (let i = 0; i < framesRemaining; i++) {
-            const idx = samplesFilled / 2 + i;
-            outputL[idx] = 0;
-            outputR[idx] = 0;
+        if (this.started && this.available < lowSamples) {
+            this.started = false;
+            this.underruns++;
+            this.report();
+        } else if (this.playedFrames - this.lastReportPlayed >= Math.floor(this.sampleRate / 10)) {
+            this.lastReportPlayed = this.playedFrames;
+            this.report();
         }
 
         return true;
     }
 }
 
-registerProcessor('audio-stream-processor', AudioStreamProcessor);
+registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 `;
 
-    // =============================================================================
+    // =========================================================================
+    // Main-thread ring buffer (ScriptProcessor fallback only)
+    // =========================================================================
+    class RingBuffer {
+        constructor(capacityFrames, channels, maxFrames) {
+            this.channels = channels;
+            this.capacityFrames = capacityFrames;
+            this.capacity = capacityFrames * channels;
+            this.maxFrames = maxFrames;
+            this.buffer = new Float32Array(this.capacity);
+            this.writePos = 0;
+            this.readPos = 0;
+            this.available = 0;
+            this.overruns = 0;
+        }
+
+        push(samples) {
+            let frames = Math.floor(samples.length / this.channels);
+            if (frames <= 0) return;
+
+            let incoming = frames * this.channels;
+
+            if (frames > this.capacityFrames) {
+                const skipFrames = frames - this.capacityFrames;
+                samples = samples.subarray(skipFrames * this.channels);
+                incoming = this.capacityFrames * this.channels;
+                this.writePos = 0;
+                this.readPos = 0;
+                this.available = 0;
+                this.overruns++;
+            }
+
+            if (this.available + incoming > this.capacity) {
+                const excessFrames = Math.ceil(
+                    (this.available + incoming - this.capacity) / this.channels
+                );
+                this.discard(excessFrames);
+                this.overruns++;
+            }
+
+            if (this.available + incoming > this.maxFrames * this.channels) {
+                const excessFrames = Math.ceil(
+                    (this.available + incoming - this.maxFrames * this.channels) / this.channels
+                );
+                this.discard(excessFrames);
+                this.overruns++;
+            }
+
+            const first = Math.min(incoming, this.capacity - this.writePos);
+            this.buffer.set(samples.subarray(0, first), this.writePos);
+            if (first < incoming) {
+                this.buffer.set(samples.subarray(first, incoming), 0);
+            }
+            this.writePos = (this.writePos + incoming) % this.capacity;
+            this.available += incoming;
+        }
+
+        discard(frames) {
+            let samples = Math.min(frames * this.channels, this.available);
+            samples -= samples % this.channels;
+            this.readPos = (this.readPos + samples) % this.capacity;
+            this.available -= samples;
+        }
+
+        reset() {
+            this.writePos = 0;
+            this.readPos = 0;
+            this.available = 0;
+            this.overruns = 0;
+            this.buffer.fill(0);
+        }
+    }
+
+    // =========================================================================
     // State
-    // =============================================================================
+    // =========================================================================
     const state = {
         // Connection
         ws: null,
@@ -111,172 +316,278 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         isConnecting: false,
         shouldReconnect: false,
 
-        // Audio
+        // Audio graph
         audioContext: null,
-        audioWorkletNode: null,
-        scriptProcessor: null,
-        scriptBuffer: new Float32Array(0),
+        workletNode: null,
         analyserNode: null,
         gainNode: null,
+        playbackMode: null, // 'worklet' | 'script' | null
+        timeData: null,
 
-        // Buffer tracking (main thread mirror of worklet buffer)
-        bufferDuration: 0,       // ms of audio queued for playback
-        isPlaying: false,
-        startedPlayback: false,
-        tabHidden: false,
-        lastBufferUpdateTime: 0, // performance.now() timestamp of last buffer drain
+        // Fallback ScriptProcessor
+        scriptProcessor: null,
+        scriptRing: null,
+        scriptStarted: false,
+        scriptFade: 0,
 
-        // Audio playback mode
-        playbackMode: null,      // 'worklet' | 'scriptprocessor' | null
-
-        // Frame sequence tracking (server prepends u32 LE seq_no to each binary frame)
-        lastSeqNo: null,         // last sequence number received
-        missedFrames: 0,         // count of frames skipped due to gaps
-
-        // Stats
+        // Buffer / playback statistics
+        bufferFrames: 0,
+        bufferSampleRate: CONFIG.sampleRate,
+        workletStarted: false,
+        packetsReceived: 0,
         framesReceived: 0,
         framesPlayed: 0,
         underruns: 0,
-        overflows: 0,
+        overruns: 0,
+        missedFrames: 0,
 
-        // UI
+        // Sequence tracking
+        lastSeqNo: null,
+        lastPacketFrames: 0,
+        lastPacketAt: 0,
+        streamActive: false,
+
+        // Meter peak hold
+        peakLevel: 0,
+        peakHoldUntil: 0,
+
+        // UI loop
         animationFrame: null,
         lastUiUpdate: 0
     };
 
-    // =============================================================================
-    // DOM Elements
-    // =============================================================================
+    // =========================================================================
+    // DOM
+    // =========================================================================
     const els = {};
+    let bufferCells = [];
 
     function cacheElements() {
         els.statusIndicator = document.getElementById('statusIndicator');
         els.statusText = document.getElementById('statusText');
+
         els.connectBtn = document.getElementById('connectBtn');
-        els.btnText = els.connectBtn.querySelector('.btn-text');
-        els.btnLoader = els.connectBtn.querySelector('.btn-loader');
+        els.btnText = document.getElementById('btnText');
+        els.btnIcon = document.getElementById('btnIcon');
+        els.btnLoader = document.getElementById('btnLoader');
+
         els.audioIndicator = document.getElementById('audioIndicator');
-        els.audioLevelBars = document.getElementById('audioLevelBars');
-        els.bufferIndicator = document.getElementById('bufferIndicator');
-        els.bufferFill = document.getElementById('bufferFill');
+        els.levelFill = document.getElementById('levelFill');
+        els.levelPeak = document.getElementById('levelPeak');
+        els.meterValue = document.getElementById('meterValue');
+
+        els.bufferGrid = document.getElementById('bufferGrid');
         els.bufferText = document.getElementById('bufferText');
+        bufferCells = els.bufferGrid ? Array.from(els.bufferGrid.children) : [];
+
         els.messagePanel = document.getElementById('messagePanel');
+        els.messageIcon = document.getElementById('messageIcon');
         els.messageText = document.getElementById('messageText');
         els.dismissBtn = document.getElementById('dismissBtn');
+
+        els.systemToast = document.getElementById('systemToast');
+        els.systemToastIcon = document.getElementById('systemToastIcon');
+        els.systemToastText = document.getElementById('systemToastText');
+
         els.wsUrl = document.getElementById('wsUrl');
+        els.infoProtocol = document.getElementById('infoProtocol');
+        els.infoBitrate = document.getElementById('infoBitrate');
+
         els.statsReceived = document.getElementById('statsReceived');
         els.statsPlayed = document.getElementById('statsPlayed');
         els.statsUnderruns = document.getElementById('statsUnderruns');
     }
 
-    // =============================================================================
-    // Utility Functions
-    // =============================================================================
-    function log(...args) {
-        console.log('[SoundShared]', new Date().toISOString(), ...args);
+    // =========================================================================
+    // Logging / formatting
+    // =========================================================================
+    function log() {
+        console.log('[SoundShared]', new Date().toISOString(), ...arguments);
     }
 
-    function error(...args) {
-        console.error('[SoundShared]', new Date().toISOString(), ...args);
+    function error() {
+        console.error('[SoundShared]', new Date().toISOString(), ...arguments);
     }
 
+    function formatNumber(value) {
+        return Number(value || 0).toLocaleString('en-US');
+    }
+
+    // =========================================================================
+    // UI state helpers
+    // =========================================================================
     function setStatus(status, text) {
-        const indicator = els.statusIndicator;
-        const textEl = els.statusText;
-
-        indicator.classList.remove('connecting', 'connected', 'error', 'disconnected');
-        textEl.classList.remove('connecting', 'connected', 'error', 'disconnected');
-
-        if (status !== 'disconnected') {
-            indicator.classList.add(status);
-            textEl.classList.add(status);
+        if (els.statusIndicator) {
+            els.statusIndicator.className = 'status-dot ' + status;
         }
-
-        textEl.textContent = text || status.charAt(0).toUpperCase() + status.slice(1);
-    }
-
-    function setConnecting(isConnecting) {
-        state.isConnecting = isConnecting;
-        els.connectBtn.disabled = isConnecting;
-        els.btnText.hidden = isConnecting;
-        els.btnLoader.hidden = !isConnecting;
-
-        if (!isConnecting) {
-            if (els.connectBtn.classList.contains('disconnected')) {
-                els.connectBtn.textContent = 'Connect & Listen';
-            } else {
-                els.connectBtn.textContent = 'Disconnect';
-            }
-            els.connectBtn.appendChild(els.btnLoader);
-            els.connectBtn.insertBefore(els.btnText, els.btnLoader);
+        if (els.statusText) {
+            els.statusText.className = 'status-text ' + status;
+            els.statusText.textContent = text;
         }
     }
 
-    function setButtonDisconnected() {
-        els.connectBtn.textContent = 'Connect & Listen';
+    function setButtonState(mode) {
+        if (!els.connectBtn) return;
+
+        if (mode === 'connecting') {
+            els.connectBtn.disabled = true;
+            els.btnText.textContent = 'Linking...';
+            els.btnIcon.hidden = true;
+            els.btnLoader.hidden = false;
+            return;
+        }
+
         els.connectBtn.disabled = false;
-        els.btnText.hidden = false;
         els.btnLoader.hidden = true;
-        els.connectBtn.appendChild(els.btnLoader);
-        els.connectBtn.insertBefore(els.btnText, els.btnLoader);
-    }
+        els.btnIcon.hidden = false;
 
-    function setButtonConnected() {
-        els.connectBtn.textContent = 'Disconnect';
-        els.connectBtn.disabled = false;
-        els.btnText.hidden = false;
-        els.btnLoader.hidden = true;
-        els.connectBtn.appendChild(els.btnLoader);
-        els.connectBtn.insertBefore(els.btnText, els.btnLoader);
-    }
-
-    function showAudioIndicator(show) {
-        els.audioIndicator.hidden = !show;
-        state.isPlaying = show;
-    }
-
-    function updateBufferUI() {
-        const ms = state.bufferDuration;
-        const pct = Math.min(100, (ms / CONFIG.maxBufferMs) * 100);
-
-        els.bufferFill.style.width = pct + '%';
-        els.bufferText.textContent = ms.toFixed(0) + ' ms buffered';
-
-        // Color coding
-        els.bufferFill.classList.remove('buffer-low', 'buffer-ok', 'buffer-high');
-        if (ms < CONFIG.lowBufferMs) {
-            els.bufferFill.classList.add('buffer-low');
-        } else if (ms > CONFIG.maxBufferMs * 0.8) {
-            els.bufferFill.classList.add('buffer-high');
+        if (mode === 'connected') {
+            els.btnText.textContent = 'Terminate Link';
+            els.btnIcon.setAttribute('icon', 'lucide:power');
         } else {
-            els.bufferFill.classList.add('buffer-ok');
+            els.btnText.textContent = 'Establish Link';
+            els.btnIcon.setAttribute('icon', 'lucide:zap');
         }
     }
 
-    function showMessage(message, isError = false, showDismiss = true) {
-        els.messageText.textContent = message;
+    function setSystemToast(text, active, icon) {
+        if (!els.systemToast) return;
+        if (els.systemToastText) els.systemToastText.textContent = text;
+        els.systemToast.classList.toggle('is-active', !!active);
+        if (icon && els.systemToastIcon) {
+            els.systemToastIcon.setAttribute('icon', icon);
+        }
+    }
+
+    function showMessage(message, severity, showDismiss) {
+        if (!els.messagePanel) return;
+
+        const kind = severity || 'error';
+        const icons = {
+            error: 'lucide:alert-triangle',
+            info: 'lucide:info',
+            success: 'lucide:check-circle'
+        };
+
+        els.messagePanel.className = 'toast toast--' + kind;
         els.messagePanel.hidden = false;
-        els.dismissBtn.hidden = !showDismiss;
-        els.messagePanel.style.borderLeftColor = isError ? 'var(--accent-error)' : 'var(--accent-warning)';
+        els.messageText.textContent = message;
+        els.messageIcon.setAttribute('icon', icons[kind] || icons.info);
+        els.dismissBtn.hidden = showDismiss === false;
     }
 
     function hideMessage() {
-        els.messagePanel.hidden = true;
+        if (els.messagePanel) els.messagePanel.hidden = true;
     }
 
-    function buildWsUrl() {
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const host = location.host || 'localhost:8080';
-        return `${protocol}//${host}/ws/audio`;
+    function updateWsUrlUI() {
+        if (!els.wsUrl) return;
+        const url = state.wsUrl || buildWsUrl();
+        els.wsUrl.textContent = url;
+        els.wsUrl.title = url;
     }
 
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    function updateInfoUI(format) {
+        if (!els.infoProtocol || !els.infoBitrate) return;
+
+        const sampleRate = (format && format.sample_rate) || CONFIG.sampleRate;
+        const channels = (format && format.channels) || CONFIG.channels;
+        const formatName = String((format && format.format) || 'f32').toUpperCase();
+
+        els.infoProtocol.textContent =
+            formatName + ' / ' + Math.round(sampleRate / 1000) + 'KHZ';
+        els.infoBitrate.textContent =
+            Math.round((sampleRate * channels * 32) / 1000) + ' KBPS';
     }
 
-    // =============================================================================
-    // Audio Playback - AudioWorkletNode (runs on audio thread)
-    // =============================================================================
+    function updateBufferUI() {
+        if (!els.bufferText || !els.bufferGrid) return;
+
+        const frames = Math.max(0, state.bufferFrames);
+        const sampleRate = state.bufferSampleRate || CONFIG.sampleRate;
+        const ms = (frames / sampleRate) * 1000;
+        const target = CONFIG.targetBufferMs;
+        const pct = Math.max(0, Math.min(1, ms / target));
+        const activeCells = Math.round(pct * bufferCells.length);
+
+        els.bufferText.textContent = Math.round(ms) + 'ms / ' + target + 'ms';
+
+        for (let i = 0; i < bufferCells.length; i++) {
+            const active = i < activeCells;
+            bufferCells[i].classList.toggle('active', active);
+            bufferCells[i].classList.toggle(
+                'warn',
+                active && ms > CONFIG.maxBufferMs * 0.75
+            );
+        }
+
+        els.bufferGrid.classList.toggle(
+            'is-low',
+            state.streamActive && ms < CONFIG.lowWaterMs
+        );
+    }
+
+    function updateStatsUI() {
+        if (els.statsReceived) {
+            els.statsReceived.textContent = formatNumber(state.packetsReceived);
+        }
+        if (els.statsPlayed) {
+            els.statsPlayed.textContent = formatNumber(state.framesPlayed);
+        }
+        if (els.statsUnderruns) {
+            els.statsUnderruns.textContent = formatNumber(state.underruns);
+        }
+    }
+
+    function updateMeter() {
+        if (!state.analyserNode || !state.timeData) return;
+
+        state.analyserNode.getFloatTimeDomainData(state.timeData);
+
+        let sum = 0;
+        let peak = 0;
+        for (let i = 0; i < state.timeData.length; i++) {
+            const value = state.timeData[i];
+            sum += value * value;
+            const abs = Math.abs(value);
+            if (abs > peak) peak = abs;
+        }
+
+        const rms = Math.sqrt(sum / state.timeData.length);
+        const db = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+        const level = db === -Infinity ? 0 : Math.max(0, Math.min(1, (db + 60) / 60));
+
+        if (els.levelFill) {
+            els.levelFill.style.width = (level * 100).toFixed(1) + '%';
+        }
+        if (els.meterValue) {
+            els.meterValue.textContent = db === -Infinity ? '-INF dB' : db.toFixed(1) + ' dB';
+        }
+        if (els.audioIndicator) {
+            els.audioIndicator.classList.toggle('is-clipping', level > 0.95);
+        }
+
+        const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+        const peakLevel =
+            peakDb === -Infinity ? 0 : Math.max(0, Math.min(1, (peakDb + 60) / 60));
+
+        // Peak-hold marker: jump to a new peak immediately, then hold it for a
+        // moment before the slow decay in updateUI() takes over.
+        const now = performance.now();
+        if (peakLevel > state.peakLevel) {
+            state.peakLevel = peakLevel;
+            state.peakHoldUntil = now + 900;
+        }
+
+        if (els.levelPeak) {
+            els.levelPeak.style.left =
+                'calc(' + (state.peakLevel * 100).toFixed(1) + '% - 1px)';
+        }
+    }
+
+    // =========================================================================
+    // Audio graph
+    // =========================================================================
     async function initAudio() {
         if (state.audioContext) {
             if (state.audioContext.state === 'suspended') {
@@ -285,280 +596,300 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
             return;
         }
 
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) {
+            throw new Error('Web Audio API is not supported in this browser');
+        }
+
+        let context;
         try {
-            state.audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: CONFIG.sampleRate
+            context = new AudioContextCtor({
+                sampleRate: CONFIG.sampleRate,
+                latencyHint: 'interactive'
             });
-            log('AudioContext created, sampleRate:', state.audioContext.sampleRate);
-
-            // Create AnalyserNode for real-time visualization
-            state.analyserNode = state.audioContext.createAnalyser();
-            state.analyserNode.fftSize = 256;
-            state.analyserNode.smoothingTimeConstant = 0.6;
-
-            // Create GainNode for volume control
-            state.gainNode = state.audioContext.createGain();
-            state.gainNode.gain.value = 1.0;
-
-            // Try AudioWorklet first (runs on audio thread, no main-thread blocking)
-            try {
-                const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
-                const blobUrl = URL.createObjectURL(blob);
-                await state.audioContext.audioWorklet.addModule(blobUrl);
-                URL.revokeObjectURL(blobUrl);
-
-                state.audioWorkletNode = new AudioWorkletNode(
-                    state.audioContext,
-                    'audio-stream-processor'
-                );
-
-                // Connect: worklet -> analyser -> gain -> destination
-                state.audioWorkletNode.connect(state.analyserNode);
-                state.analyserNode.connect(state.gainNode);
-                state.gainNode.connect(state.audioContext.destination);
-
-                state.playbackMode = 'worklet';
-                log('AudioWorkletNode + AnalyserNode + GainNode connected');
-            } catch (workletErr) {
-                // AudioWorklet not available — fall back to ScriptProcessorNode
-                error('AudioWorklet unavailable, falling back to ScriptProcessorNode:', workletErr);
-                state.audioWorkletNode = null;
-
-                const bufferSize = 4096;
-                state.scriptProcessor = state.audioContext.createScriptProcessor(bufferSize, 2, 2);
-
-                state.scriptProcessor.onaudioprocess = (event) => {
-                    const outputL = event.outputBuffer.getChannelData(0);
-                    const outputR = event.outputBuffer.getChannelData(1);
-                    const framesToFill = outputL.length;
-                    const samplesToFill = framesToFill * 2;
-
-                    let samplesFilled = 0;
-
-                    while (samplesFilled < samplesToFill && state.scriptBuffer.length >= 2) {
-                        const samplesToCopy = Math.min(samplesToFill - samplesFilled, state.scriptBuffer.length);
-                        const framesToCopy = Math.floor(samplesToCopy / 2);
-                        const samplesToCopyActual = framesToCopy * 2;
-
-                        for (let i = 0; i < framesToCopy; i++) {
-                            const outIdx = samplesFilled / 2 + i;
-                            outputL[outIdx] = state.scriptBuffer[samplesFilled + i * 2];
-                            outputR[outIdx] = state.scriptBuffer[samplesFilled + i * 2 + 1];
-                        }
-
-                        samplesFilled += samplesToCopyActual;
-
-                        if (samplesToCopyActual < state.scriptBuffer.length) {
-                            state.scriptBuffer = state.scriptBuffer.slice(samplesToCopyActual);
-                        } else {
-                            state.scriptBuffer = new Float32Array(0);
-                        }
-                    }
-
-                    // Fill remaining with silence
-                    for (let i = samplesFilled / 2; i < framesToFill; i++) {
-                        outputL[i] = 0;
-                        outputR[i] = 0;
-                    }
-                };
-
-                state.scriptProcessor.connect(state.analyserNode);
-                state.analyserNode.connect(state.gainNode);
-                state.gainNode.connect(state.audioContext.destination);
-
-                state.playbackMode = 'scriptprocessor';
-                log('ScriptProcessorNode + AnalyserNode + GainNode connected (fallback)');
-            }
-
-            log('Audio initialized, mode:', state.playbackMode);
         } catch (e) {
-            error('Failed to initialize audio:', e);
-            throw e;
+            // Some browsers reject an explicit sample rate; use the default.
+            context = new AudioContextCtor({ latencyHint: 'interactive' });
+        }
+
+        state.audioContext = context;
+        if (context.sampleRate !== CONFIG.sampleRate) {
+            log(
+                'AudioContext sample rate is',
+                context.sampleRate,
+                'Hz; source stream is',
+                CONFIG.sampleRate,
+                'Hz'
+            );
+        }
+
+        state.analyserNode = context.createAnalyser();
+        state.analyserNode.fftSize = 1024;
+        state.analyserNode.smoothingTimeConstant = 0.5;
+        state.timeData = new Float32Array(state.analyserNode.fftSize);
+
+        state.gainNode = context.createGain();
+        state.gainNode.gain.value = 1.0;
+
+        try {
+            const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+            const blobUrl = URL.createObjectURL(blob);
+            await context.audioWorklet.addModule(blobUrl);
+            URL.revokeObjectURL(blobUrl);
+
+            const node = new AudioWorkletNode(context, 'soundshared-stream-processor', {
+                numberOfInputs: 0,
+                numberOfOutputs: 1,
+                outputChannelCount: [CONFIG.channels],
+                processorOptions: {
+                    sampleRate: CONFIG.sampleRate,
+                    channels: CONFIG.channels,
+                    targetMs: CONFIG.targetBufferMs,
+                    lowWaterMs: CONFIG.lowWaterMs,
+                    maxMs: CONFIG.maxBufferMs,
+                    capacitySeconds: CONFIG.capacityMs / 1000
+                }
+            });
+
+            node.port.onmessage = onWorkletMessage;
+            node.connect(state.analyserNode);
+            state.analyserNode.connect(state.gainNode);
+            state.gainNode.connect(context.destination);
+
+            state.workletNode = node;
+            state.playbackMode = 'worklet';
+            log('AudioWorklet ready');
+        } catch (workletError) {
+            error('AudioWorklet unavailable; using ScriptProcessor fallback:', workletError);
+            setupScriptProcessor();
+        }
+
+        if (context.state === 'suspended') {
+            await context.resume();
         }
     }
 
-    function queueAudioData(float32Array) {
-        // float32Array is interleaved stereo: [L, R, L, R, ...]
-        // Drop audio while tab is hidden — the audio thread isn't consuming,
-        // and updateUI isn't draining, so data would just pile up and overflow.
-        if (state.tabHidden) {
-            return;
-        }
+    function setupScriptProcessor() {
+        const context = state.audioContext;
 
-        const frameCount = float32Array.length / 2;
-        const durationMs = frameCount / CONFIG.sampleRate * 1000;
+        state.scriptRing = new RingBuffer(
+            Math.ceil((CONFIG.sampleRate * CONFIG.capacityMs) / 1000),
+            CONFIG.channels,
+            Math.floor((CONFIG.sampleRate * CONFIG.maxBufferMs) / 1000)
+        );
 
-        state.bufferDuration += durationMs;
-        state.framesReceived += frameCount;
+        const processor = context.createScriptProcessor(
+            2048,
+            CONFIG.channels,
+            CONFIG.channels
+        );
+        processor.onaudioprocess = onScriptProcess;
+
+        processor.connect(state.analyserNode);
+        state.analyserNode.connect(state.gainNode);
+        state.gainNode.connect(context.destination);
+
+        state.scriptProcessor = processor;
+        state.playbackMode = 'script';
+        log('ScriptProcessorNode fallback ready');
+    }
+
+    function onWorkletMessage(event) {
+        const msg = event.data;
+        if (!msg || msg.type !== 'stats') return;
+
+        state.bufferFrames = msg.availableFrames;
+        if (msg.sampleRate) state.bufferSampleRate = msg.sampleRate;
+        state.framesPlayed = msg.playedFrames;
+        state.underruns = msg.underruns;
+        state.overruns = msg.overruns;
+        state.workletStarted = msg.started;
+
+        updateBufferUI();
         updateStatsUI();
+    }
 
-        // Send to audio processor (worklet or script processor)
-        if (state.playbackMode === 'worklet' && state.audioWorkletNode) {
-            state.audioWorkletNode.port.postMessage({
-                channelData: float32Array
-            });
-        } else if (state.playbackMode === 'scriptprocessor' && state.scriptProcessor) {
-            // Append to script processor buffer
-            const combined = new Float32Array(state.scriptBuffer.length + float32Array.length);
-            combined.set(state.scriptBuffer);
-            combined.set(float32Array, state.scriptBuffer.length);
-            state.scriptBuffer = combined;
+    function onScriptProcess(event) {
+        const ring = state.scriptRing;
+        if (!ring) return;
+
+        const outL = event.outputBuffer.getChannelData(0);
+        const outR = event.outputBuffer.getChannelData(1);
+        const frames = outL.length;
+
+        const targetSamples =
+            Math.floor((CONFIG.sampleRate * CONFIG.targetBufferMs) / 1000) * CONFIG.channels;
+        const lowSamples =
+            Math.floor((CONFIG.sampleRate * CONFIG.lowWaterMs) / 1000) * CONFIG.channels;
+        const fadeStep = 1 / Math.max(1, Math.floor(CONFIG.sampleRate * 0.008));
+
+        if (!state.scriptStarted && ring.available >= targetSamples) {
+            state.scriptStarted = true;
         }
 
-        // Prevent unbounded buffer growth
-        if (state.bufferDuration > CONFIG.maxBufferMs) {
-            state.overflows++;
-            log('Buffer overflow, queueDuration:', state.bufferDuration.toFixed(1), 'ms');
+        for (let i = 0; i < frames; i++) {
+            let l = 0;
+            let r = 0;
+            const consuming = state.scriptStarted || state.scriptFade > 0;
+
+            if (consuming && ring.available >= CONFIG.channels) {
+                l = ring.buffer[ring.readPos];
+                r = ring.buffer[ring.readPos + 1];
+                ring.readPos = (ring.readPos + CONFIG.channels) % ring.capacity;
+                ring.available -= CONFIG.channels;
+                state.framesPlayed++;
+            }
+
+            if (state.scriptStarted) {
+                state.scriptFade = Math.min(1, state.scriptFade + fadeStep);
+            } else if (state.scriptFade > 0) {
+                state.scriptFade = Math.max(0, state.scriptFade - fadeStep);
+            }
+
+            outL[i] = l * state.scriptFade;
+            outR[i] = r * state.scriptFade;
+        }
+
+        if (state.scriptStarted && ring.available < lowSamples) {
+            state.scriptStarted = false;
+            state.underruns++;
+        }
+
+        state.bufferFrames = Math.floor(ring.available / CONFIG.channels);
+        state.overruns = ring.overruns;
+
+        const now = performance.now();
+        if (now - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
+            state.lastUiUpdate = now;
+            updateBufferUI();
             updateStatsUI();
         }
+    }
 
-        // Auto-start playback when we have enough buffered
-        if (!state.startedPlayback && state.bufferDuration >= CONFIG.targetBufferMs) {
-            state.startedPlayback = true;
-            state.lastBufferUpdateTime = performance.now();
-            showAudioIndicator(true);
-            log('Playback started, buffered:', state.bufferDuration.toFixed(1), 'ms');
+    function pushSamples(samples) {
+        if (!samples || samples.length < CONFIG.channels) return;
+
+        if (state.playbackMode === 'worklet' && state.workletNode) {
+            // Transfer ownership of the PCM buffer; no copy on the main thread.
+            state.workletNode.port.postMessage(
+                { type: 'push', samples: samples },
+                [samples.buffer]
+            );
+        } else if (state.playbackMode === 'script' && state.scriptRing) {
+            state.scriptRing.push(samples);
         }
-
-        updateBufferUI();
     }
 
-    /// Insert silence for missed frames to maintain smooth playback
-    function insertSilenceForMissedFrames(missedCount) {
-        if (missedCount <= 0) return;
-        const samplesPerFrame = CONFIG.sampleRate * CONFIG.channels * 0.01; // 10 ms per frame
-        const silenceSamples = Math.floor(samplesPerFrame * missedCount);
-        const silence = new Float32Array(silenceSamples);
+    // =========================================================================
+    // Audio frame parsing
+    // =========================================================================
+    function handleBinary(arrayBuffer) {
+        if (!arrayBuffer || arrayBuffer.byteLength < 8) return;
 
-        state.bufferDuration += silenceSamples / CONFIG.sampleRate * 1000;
-        state.missedFrames += missedCount;
-        state.framesReceived += silenceSamples / 2;
-        updateStatsUI();
-
-        if (state.playbackMode === 'worklet' && state.audioWorkletNode) {
-            state.audioWorkletNode.port.postMessage({
-                channelData: silence
-            });
-        } else if (state.playbackMode === 'scriptprocessor' && state.scriptProcessor) {
-            const combined = new Float32Array(state.scriptBuffer.length + silence.length);
-            combined.set(state.scriptBuffer);
-            combined.set(silence, state.scriptBuffer.length);
-            state.scriptBuffer = combined;
-        }
-
-        updateBufferUI();
-    }
-
-    function clearAudioQueue() {
-        state.bufferDuration = 0;
-        state.startedPlayback = false;
-        state.lastBufferUpdateTime = 0;
-        state.lastSeqNo = null;
-        state.missedFrames = 0;
-        state.underruns = 0;
-        state.overflows = 0;
-        state.framesReceived = 0;
-        state.framesPlayed = 0;
-        state.scriptBuffer = new Float32Array(0);
-        showAudioIndicator(false);
-        updateBufferUI();
-        updateStatsUI();
-    }
-
-    // =============================================================================
-    // UI Update Loop (runs on main thread, reads buffer state)
-    // =============================================================================
-    const analyserData = new Uint8Array(128);
-
-    function updateUI() {
-        const now = performance.now();
-
-        if (!state.audioContext || state.audioContext.state !== 'running') {
-            // Still schedule next frame if we might start soon
-            state.animationFrame = requestAnimationFrame(updateUI);
+        const pcmBytes = arrayBuffer.byteLength - 4;
+        if (pcmBytes % 4 !== 0) {
+            log('Dropping malformed frame: PCM length is not 4-byte aligned', pcmBytes);
             return;
         }
 
-        // Drain bufferDuration based on elapsed time (audio is being played by the context)
-        if (state.startedPlayback && state.lastBufferUpdateTime > 0) {
-            const elapsedMs = now - state.lastBufferUpdateTime;
-            if (elapsedMs > 0) {
-                state.bufferDuration = Math.max(0, state.bufferDuration - elapsedMs);
-                state.lastBufferUpdateTime = now;
+        const sampleCount = pcmBytes / 4;
+        if (sampleCount < CONFIG.channels || sampleCount % CONFIG.channels !== 0) {
+            log('Dropping malformed frame: invalid sample count', sampleCount);
+            return;
+        }
 
-                // Estimate frames played based on elapsed time
-                const framesPlayed = Math.floor(elapsedMs / 1000 * CONFIG.sampleRate);
-                state.framesPlayed += framesPlayed;
-                updateStatsUI();
+        const view = new DataView(arrayBuffer);
+        const seq = view.getUint32(0, true);
+        const samples = new Float32Array(arrayBuffer, 4, sampleCount);
+        const frames = sampleCount / CONFIG.channels;
+
+        // Sequence gap detection. Insert silence for short gaps so the
+        // playback timeline stays aligned; ignore huge jumps (reconnect).
+        if (state.lastSeqNo !== null) {
+            const gap = (seq - state.lastSeqNo) >>> 0;
+
+            if (gap === 0) {
+                return; // duplicate packet
+            }
+
+            if (gap > 1) {
+                const missed = gap - 1;
+                if (missed <= 50 && state.lastPacketFrames > 0) {
+                    const silenceSamples =
+                        missed * state.lastPacketFrames * CONFIG.channels;
+                    pushSamples(new Float32Array(silenceSamples));
+                    state.missedFrames += missed;
+                } else {
+                    log('Large sequence gap; skipping silence insertion:', missed);
+                }
             }
         }
 
-        // Get real-time audio levels from AnalyserNode
-        if (state.analyserNode) {
-            state.analyserNode.getByteFrequencyData(analyserData);
+        state.lastSeqNo = seq;
+        state.lastPacketFrames = frames;
+        state.packetsReceived++;
+        state.framesReceived += frames;
+        state.lastPacketAt = performance.now();
+        state.streamActive = true;
 
-            let sum = 0;
-            for (let i = 0; i < analyserData.length; i++) {
-                sum += analyserData[i];
-            }
-            const avg = sum / analyserData.length;
-            const level = avg / 255; // 0 to 1
+        pushSamples(samples);
 
-            // Update audio level bars
-            const bars = els.audioLevelBars.children;
-            const barCount = bars.length;
-            for (let i = 0; i < barCount; i++) {
-                const bar = bars[i];
-                const bandIdx = Math.floor(i * analyserData.length / barCount);
-                const barLevel = analyserData[bandIdx] / 255;
-                const height = Math.max(10, barLevel * 100);
-                bar.style.height = height + '%';
-                bar.style.opacity = Math.min(1, barLevel + 0.3);
-            }
-
-            // Show/hide audio indicator based on activity
-            if (state.isPlaying && level > 0.01) {
-                els.audioIndicator.hidden = false;
-            }
+        if (state.packetsReceived === 1) {
+            setSystemToast('Stream active. Decoding 48 kHz PCM.', true, 'lucide:radio');
+            hideMessage();
         }
 
-        // Update buffer UI
-        updateBufferUI();
-
-        // Check for underrun (buffer empty while we should be playing)
-        if (state.startedPlayback && state.bufferDuration < CONFIG.lowBufferMs) {
-            if (state.bufferDuration <= 0) {
-                state.underruns++;
-                updateStatsUI();
-            }
-        }
-
-        // Schedule next update
-        state.animationFrame = requestAnimationFrame(updateUI);
+        updateStatsUI();
     }
 
-    function updateStatsUI() {
-        if (els.statsReceived) els.statsReceived.textContent = state.framesReceived.toLocaleString();
-        if (els.statsPlayed) els.statsPlayed.textContent = state.framesPlayed.toLocaleString();
-        if (els.statsUnderruns) els.statsUnderruns.textContent = state.underruns.toLocaleString();
-        const elsMissed = document.getElementById('statsMissed');
-        if (elsMissed) elsMissed.textContent = state.missedFrames.toLocaleString();
+    function handleControlMessage(msg) {
+        if (!msg || typeof msg.type !== 'string') return;
+
+        switch (msg.type) {
+            case 'format':
+                updateInfoUI(msg.data || {});
+                log('Server format:', msg.data);
+                break;
+
+            case 'welcome':
+                log('Welcome from server:', msg.data);
+                break;
+
+            case 'error':
+                showMessage(msg.message || 'Server error', 'error');
+                break;
+
+            case 'info':
+                showMessage(msg.message || 'Info from server', 'info', false);
+                break;
+
+            default:
+                log('Unknown control message:', msg.type);
+        }
     }
 
-    // =============================================================================
-    // WebSocket Connection
-    // =============================================================================
+    // =========================================================================
+    // WebSocket
+    // =========================================================================
+    function buildWsUrl() {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = location.host || 'localhost:8080';
+        return protocol + '//' + host + '/ws/audio';
+    }
+
     function connect() {
-        if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
-            log('Already connected or connecting');
+        if (
+            state.ws &&
+            (state.ws.readyState === WebSocket.OPEN ||
+                state.ws.readyState === WebSocket.CONNECTING)
+        ) {
             return;
         }
 
         state.wsUrl = buildWsUrl();
-        els.wsUrl.textContent = state.wsUrl;
+        updateWsUrlUI();
         state.shouldReconnect = true;
         state.reconnectAttempt = 0;
-
         doConnect();
     }
 
@@ -566,22 +897,22 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         if (!state.shouldReconnect) return;
 
         state.isConnecting = true;
-        setStatus('connecting', 'Connecting...');
-        setConnecting(true);
+        setStatus('connecting', 'Linking...');
+        setButtonState('connecting');
+        setSystemToast('Negotiating WebSocket handshake...', false, 'lucide:radio-tower');
         hideMessage();
 
-        log('Connecting to:', state.wsUrl);
+        log('Connecting to', state.wsUrl);
 
         try {
-            state.ws = new WebSocket(state.wsUrl);
-            state.ws.binaryType = 'arraybuffer';
-
-            state.ws.onopen = onWsOpen;
-            state.ws.onmessage = onWsMessage;
-            state.ws.onclose = onWsClose;
-            state.ws.onerror = onWsError;
+            const ws = new WebSocket(state.wsUrl);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = onWsOpen;
+            ws.onmessage = onWsMessage;
+            ws.onclose = onWsClose;
+            ws.onerror = onWsError;
+            state.ws = ws;
         } catch (e) {
-            error('WebSocket creation failed:', e);
             handleConnectionError(e);
         }
     }
@@ -590,100 +921,72 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         log('WebSocket connected');
         state.isConnecting = false;
         state.reconnectAttempt = 0;
-        setStatus('connected', 'Connected');
-        setButtonConnected();
-        clearAudioQueue();
+
+        setStatus('connected', 'Node Online');
+        setButtonState('connected');
+        setSystemToast('Link established. Waiting for audio frames.', true, 'lucide:radio');
+
+        resetAudioPipeline();
     }
 
     function onWsMessage(event) {
-        if (event.data instanceof ArrayBuffer) {
-            // Binary audio data format: [seq_no: u32 LE][pcm_samples: f32 LE ...]
-            const data = new DataView(event.data);
-            const seqNo = data.getUint32(0, true); // little-endian
-
-            // Detect gaps in sequence numbers
-            if (state.lastSeqNo !== null) {
-                const gap = seqNo - state.lastSeqNo - 1;
-                if (gap > 0) {
-                    log('Frame gap detected, missed', gap, 'frame(s) after seq', state.lastSeqNo);
-                    insertSilenceForMissedFrames(gap);
-                }
-            }
-            state.lastSeqNo = seqNo;
-
-            // Skip the 4-byte sequence header, remaining bytes are PCM
-            const pcmBytes = event.data.byteLength - 4;
-            const float32Array = new Float32Array(event.data, 4, pcmBytes / 4);
-            queueAudioData(float32Array);
-        } else if (typeof event.data === 'string') {
+        if (typeof event.data === 'string') {
             try {
-                const msg = JSON.parse(event.data);
-                handleControlMessage(msg);
+                handleControlMessage(JSON.parse(event.data));
             } catch (e) {
-                log('Received text message:', event.data);
+                log('Text message from server:', event.data);
             }
+            return;
         }
-    }
 
-    function handleControlMessage(msg) {
-        log('Control message:', msg);
-
-        switch (msg.type) {
-            case 'format':
-                log('Format confirmed:', msg);
-                break;
-            case 'error':
-                showMessage(msg.message || 'Server error', true);
-                break;
-            case 'info':
-                showMessage(msg.message || 'Info from server', false);
-                break;
-            case 'welcome':
-                log('Welcome from server');
-                break;
-            default:
-                log('Unknown message type:', msg.type);
+        if (event.data instanceof ArrayBuffer) {
+            handleBinary(event.data);
         }
     }
 
     function onWsClose(event) {
         log('WebSocket closed:', event.code, event.reason);
         state.isConnecting = false;
+        state.ws = null;
+        state.streamActive = false;
 
-        state.audioWorkletNode = null;
-        state.analyserNode = null;
-        state.gainNode = null;
+        resetAudioPipeline();
+        updateBufferUI();
+        updateStatsUI();
 
         if (state.shouldReconnect) {
             if (event.code === 1000) {
-                setStatus('disconnected', 'Disconnected');
-                setButtonDisconnected();
-                showMessage('Disconnected from server', false, true);
+                setStatus('disconnected', 'Node Offline');
+                setButtonState('idle');
+                setSystemToast('Link closed. Standing by.', false, 'lucide:check-circle');
+                showMessage('Disconnected from server.', 'info', false);
             } else {
-                setStatus('disconnected', 'Disconnected - Reconnecting...');
-                setButtonDisconnected();
-                scheduleReconnect(event.reason || `Code ${event.code}`);
+                setStatus('disconnected', 'Node Offline');
+                setButtonState('idle');
+                scheduleReconnect(event.reason || 'Code ' + event.code);
             }
         } else {
-            setStatus('disconnected', 'Disconnected');
-            setButtonDisconnected();
+            setStatus('disconnected', 'Node Offline');
+            setButtonState('idle');
+            setSystemToast('System ready. Initializing components.', false, 'lucide:check-circle');
         }
-
-        state.ws = null;
-        showAudioIndicator(false);
-        clearAudioQueue();
     }
 
     function onWsError(event) {
         error('WebSocket error:', event);
-        // onclose will be called after this
+        // `onclose` follows and drives the reconnect/state handling.
     }
 
     function handleConnectionError(err) {
         state.isConnecting = false;
-        setButtonDisconnected();
-        setStatus('error', 'Connection Error');
-        showMessage(`Failed to connect: ${err.message}`, true, true);
+        state.shouldReconnect = false;
+        setStatus('error', 'Link Error');
+        setButtonState('idle');
+        setSystemToast('Connection failed. Check the server.', false, 'lucide:alert-triangle');
+        showMessage(
+            'Failed to connect: ' + (err && err.message ? err.message : err),
+            'error'
+        );
     }
 
     function scheduleReconnect(reason) {
@@ -693,24 +996,40 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         const { initialDelay, maxDelay, factor, jitter, maxAttempts } = CONFIG.reconnect;
 
         if (state.reconnectAttempt > maxAttempts) {
-            log('Max reconnect attempts reached');
-            setStatus('error', 'Connection Failed');
-            showMessage('Max reconnection attempts reached. Please refresh the page.', true, true);
+            setStatus('error', 'Link Error');
+            setSystemToast('Reconnection attempts exhausted.', false, 'lucide:alert-triangle');
+            showMessage('Max reconnection attempts reached. Refresh the page.', 'error');
             return;
         }
 
-        const baseDelay = Math.min(initialDelay * Math.pow(factor, state.reconnectAttempt - 1), maxDelay);
-        const jitterAmount = baseDelay * jitter * Math.random();
-        const delay = Math.floor(baseDelay + jitterAmount);
+        const base = Math.min(
+            initialDelay * Math.pow(factor, state.reconnectAttempt - 1),
+            maxDelay
+        );
+        const delay = Math.floor(base + base * jitter * Math.random());
 
-        log(`Reconnect attempt ${state.reconnectAttempt} in ${delay}ms (reason: ${reason})`);
-        showMessage(`Reconnecting in ${(delay / 1000).toFixed(1)}s... (attempt ${state.reconnectAttempt})`, false, false);
+        log(
+            'Reconnect attempt',
+            state.reconnectAttempt,
+            'in',
+            delay + 'ms',
+            '(' + reason + ')'
+        );
+
+        showMessage(
+            'Reconnecting in ' + (delay / 1000).toFixed(1) + 's...',
+            'info',
+            false
+        );
+        setSystemToast(
+            'Reconnecting in ' + (delay / 1000).toFixed(1) + 's...',
+            false,
+            'lucide:radio-tower'
+        );
 
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = setTimeout(() => {
-            if (state.shouldReconnect) {
-                doConnect();
-            }
+        state.reconnectTimer = setTimeout(function () {
+            if (state.shouldReconnect) doConnect();
         }, delay);
     }
 
@@ -723,73 +1042,129 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
             state.reconnectTimer = null;
         }
 
-        if (state.animationFrame) {
-            cancelAnimationFrame(state.animationFrame);
-            state.animationFrame = null;
-        }
-
         if (state.ws) {
-            state.ws.close(1000, 'User disconnected');
+            try {
+                state.ws.close(1000, 'User disconnected');
+            } catch (e) {
+                // Ignore close errors.
+            }
             state.ws = null;
         }
 
-        // Suspend audio context
         if (state.audioContext && state.audioContext.state === 'running') {
-            state.audioContext.suspend().catch(() => {});
+            state.audioContext.suspend().catch(function () {});
         }
 
-        setStatus('disconnected', 'Disconnected');
-        setButtonDisconnected();
-        showAudioIndicator(false);
-        clearAudioQueue();
+        state.isConnecting = false;
+        state.streamActive = false;
+        resetAudioPipeline();
+        updateBufferUI();
+        updateStatsUI();
+
+        setStatus('disconnected', 'Node Offline');
+        setButtonState('idle');
+        setSystemToast('System ready. Initializing components.', false, 'lucide:check-circle');
         hideMessage();
     }
 
-    // =============================================================================
-    // Event Handlers
-    // =============================================================================
+    function resetAudioPipeline() {
+        state.bufferFrames = 0;
+        state.workletStarted = false;
+        state.packetsReceived = 0;
+        state.framesReceived = 0;
+        state.framesPlayed = 0;
+        state.underruns = 0;
+        state.overruns = 0;
+        state.missedFrames = 0;
+        state.lastSeqNo = null;
+        state.lastPacketFrames = 0;
+        state.scriptStarted = false;
+        state.scriptFade = 0;
+        state.peakLevel = 0;
+        state.peakHoldUntil = 0;
+
+        if (state.workletNode) {
+            state.workletNode.port.postMessage({ type: 'reset' });
+        }
+        if (state.scriptRing) {
+            state.scriptRing.reset();
+        }
+
+        if (els.levelFill) els.levelFill.style.width = '0%';
+        if (els.levelPeak) els.levelPeak.style.left = '0%';
+        if (els.meterValue) els.meterValue.textContent = '-INF dB';
+        if (els.audioIndicator) els.audioIndicator.classList.remove('is-clipping');
+    }
+
+    // =========================================================================
+    // UI loop
+    // =========================================================================
+    function updateUI(now) {
+        const t = typeof now === 'number' ? now : performance.now();
+
+        updateMeter();
+
+        if (state.streamActive && t - state.lastPacketAt > 1000) {
+            state.streamActive = false;
+            updateBufferUI();
+        }
+
+        if (t > state.peakHoldUntil && state.peakLevel > 0) {
+            state.peakLevel = Math.max(0, state.peakLevel - 0.01);
+            if (els.levelPeak) {
+                els.levelPeak.style.left =
+                    'calc(' + (state.peakLevel * 100).toFixed(1) + '% - 1px)';
+            }
+        }
+
+        state.animationFrame = requestAnimationFrame(updateUI);
+    }
+
+    // =========================================================================
+    // Events
+    // =========================================================================
     async function onConnectClick() {
         if (state.isConnecting) return;
 
-        // Toggle: if connected, disconnect; otherwise connect
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
             disconnect();
             return;
         }
 
         try {
-            // Initialize audio context on user interaction (autoplay policy)
             await initAudio();
 
-            if (state.audioContext.state === 'running') {
-                connect();
-            } else {
+            if (state.audioContext.state === 'suspended') {
                 await state.audioContext.resume();
-                connect();
             }
+
+            connect();
         } catch (e) {
             error('Failed to initialize audio:', e);
             setStatus('error', 'Audio Error');
-            showMessage(`Failed to initialize audio: ${e.message}. Please check browser permissions.`, true, true);
+            setButtonState('idle');
+            setSystemToast('Audio initialization failed.', false, 'lucide:alert-triangle');
+            showMessage(
+                'Failed to initialize audio: ' +
+                    (e && e.message ? e.message : e) +
+                    '. Check browser audio permissions.',
+                'error'
+            );
         }
     }
 
-    function onDismissClick() {
-        hideMessage();
-    }
-
     function onVisibilityChange() {
-        state.tabHidden = document.hidden;
-        if (document.hidden && state.ws && state.ws.readyState === WebSocket.OPEN) {
-            log('Tab hidden, keeping connection alive');
-        } else if (!document.hidden) {
-            // Tab became visible: resume audio context if needed and clear stale buffer
-            if (state.audioContext && state.audioContext.state === 'suspended') {
-                state.audioContext.resume().catch(() => {});
-            }
-            // Drop any data that accumulated while hidden to avoid a burst of old audio
-            clearAudioQueue();
-            log('Tab visible, buffer cleared');
+        // Keep the stream running while hidden. The worklet continues to
+        // consume audio; the ring buffer caps latency, so there is no need to
+        // drop packets or clear the queue when the tab becomes visible again.
+        if (
+            !document.hidden &&
+            state.audioContext &&
+            state.audioContext.state === 'suspended' &&
+            state.ws &&
+            state.ws.readyState === WebSocket.OPEN
+        ) {
+            state.audioContext.resume().catch(function () {});
         }
     }
 
@@ -797,36 +1172,30 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         disconnect();
     }
 
-    // =============================================================================
-    // Initialization
-    // =============================================================================
+    // =========================================================================
+    // Init
+    // =========================================================================
     function init() {
         cacheElements();
 
-        els.wsUrl.textContent = buildWsUrl();
+        updateWsUrlUI();
+        updateInfoUI({
+            sample_rate: CONFIG.sampleRate,
+            channels: CONFIG.channels,
+            format: 'f32'
+        });
 
-        // Event listeners
+        setStatus('disconnected', 'Node Offline');
+        setButtonState('idle');
+        updateBufferUI();
+        updateStatsUI();
+
         els.connectBtn.addEventListener('click', onConnectClick);
-        els.dismissBtn.addEventListener('click', onDismissClick);
+        els.dismissBtn.addEventListener('click', hideMessage);
         document.addEventListener('visibilitychange', onVisibilityChange);
         window.addEventListener('beforeunload', onBeforeUnload);
 
-        // Check autoplay policy (non-fatal hint)
-        try {
-            const testCtx = new (window.AudioContext || window.webkitAudioContext)();
-            if (testCtx.state === 'suspended') {
-                testCtx.close().catch(() => {});
-                log('AudioContext starts suspended - user interaction required');
-            }
-        } catch (e) {
-            log('AudioContext check failed (non-fatal):', e);
-        }
-
-        // Start UI update loop
         state.animationFrame = requestAnimationFrame(updateUI);
-
-        // Enable Connect button initially
-        setButtonDisconnected();
 
         log('SoundShared Listener initialized');
     }
@@ -837,10 +1206,12 @@ registerProcessor('audio-stream-processor', AudioStreamProcessor);
         init();
     }
 
-    // Expose for debugging
+    // Expose for debugging.
     window.SoundShared = {
-        getState: () => ({ ...state }),
-        connect,
-        disconnect
+        getState: function () {
+            return Object.assign({}, state);
+        },
+        connect: connect,
+        disconnect: disconnect
     };
 })();

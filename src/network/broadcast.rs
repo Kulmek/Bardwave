@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, broadcast, oneshot};
 use axum::extract::ws::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Audio format information sent to clients on connect
@@ -41,7 +41,7 @@ impl Default for BroadcasterConfig {
 /// Internal messages for broadcaster control
 enum BroadcasterCommand {
     RegisterClient(mpsc::Sender<Message>, oneshot::Sender<Uuid>),
-    UnregisterClient(Uuid),
+    UnregisterClient(Uuid, oneshot::Sender<()>),
 }
 
 /// Handle to control the broadcaster
@@ -88,10 +88,14 @@ impl BroadcasterHandle {
 
     /// Unregister a WebSocket client
     pub async fn unregister_client(&self, id: Uuid) -> Result<(), BroadcastError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
         self.command_tx
-            .send(BroadcasterCommand::UnregisterClient(id))
+            .send(BroadcasterCommand::UnregisterClient(id, resp_tx))
             .await
-            .map_err(|_| BroadcastError::NotRunning)
+            .map_err(|_| BroadcastError::NotRunning)?;
+        // Wait until the broadcaster has actually removed the client so that
+        // `listener_count` reflects the change as soon as this returns.
+        resp_rx.await.map_err(|_| BroadcastError::NotRunning)
     }
 }
 
@@ -136,9 +140,18 @@ impl AudioFrame {
     ///
     /// Format: [seq_no: u32 LE][pcm_samples: f32 LE ...]
     /// The sequence number allows clients to detect missing frames.
+    ///
+    /// `seq_no` is stored as a `u64` internally, but the wire header is a
+    /// 32-bit little-endian integer. Writing all 8 bytes here was the source
+    /// of the browser-side crackle: the player skipped only 4 header bytes,
+    /// so the upper half of the sequence number was interpreted as the first
+    /// PCM sample, shifting every stereo frame by one sample.
     pub fn to_binary(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(4 + self.samples.len() * 4);
-        result.extend_from_slice(&self.seq_no.to_le_bytes());
+        result.extend_from_slice(&(self.seq_no as u32).to_le_bytes());
+        // `bytemuck::cast_slice` preserves native byte order. All supported
+        // targets are little-endian, which matches the documented wire format.
+        debug_assert!(cfg!(target_endian = "little"));
         result.extend_from_slice(bytemuck::cast_slice(&self.samples));
         result
     }
@@ -303,11 +316,22 @@ impl AudioBroadcaster {
         let mut disconnected = Vec::new();
 
         for client in clients.iter_mut() {
-            // Try to send; if full, skip this frame for this client but keep
-            // the connection open — dropping clients causes reconnect storms.
-            if client.ws_tx.try_send(message.clone()).is_err() {
-                // Mark for removal only if the channel is closed (not just full)
-                disconnected.push(client.id);
+            // Try to send; if the per-client buffer is full, skip this frame
+            // for that client but keep the connection open. Only a closed
+            // channel means the WebSocket task is really gone. Treating a
+            // full buffer as a disconnect caused reconnect storms whenever
+            // the network hiccuped.
+            match client.ws_tx.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!(
+                        "Client {} send buffer full; dropping frame {}",
+                        client.id, seq
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    disconnected.push(client.id);
+                }
             }
         }
 
@@ -342,8 +366,9 @@ impl AudioBroadcaster {
                             let id = self.register_client(ws_tx).await;
                             let _ = resp_tx.send(id);
                         }
-                        BroadcasterCommand::UnregisterClient(id) => {
+                        BroadcasterCommand::UnregisterClient(id, resp_tx) => {
                             self.unregister_client(id).await;
+                            let _ = resp_tx.send(());
                         }
                     }
                 }
@@ -398,6 +423,22 @@ mod tests {
         
         let binary = frame.to_binary();
         assert_eq!(binary.len(), frame.samples.len() * 4 + 4); // f32 = 4 bytes + 4 byte seq_no header
+        assert_eq!(AudioFrame::seq_no_from_binary(&binary), Some(0));
+    }
+
+    #[test]
+    fn test_sequence_header_is_exactly_four_bytes() {
+        let mut frame = create_test_frame();
+        frame.seq_no = 0x1_0000_0005;
+        let binary = frame.to_binary();
+
+        // The header must stay 4 bytes even when the internal counter is u64.
+        assert_eq!(binary.len(), frame.samples.len() * 4 + 4);
+        assert_eq!(AudioFrame::seq_no_from_binary(&binary), Some(5));
+
+        // The first PCM sample must start immediately after the 4-byte header.
+        let first_sample = f32::from_le_bytes([binary[4], binary[5], binary[6], binary[7]]);
+        assert!((first_sample - frame.samples[0]).abs() < f32::EPSILON);
     }
 
     #[tokio::test]
