@@ -21,7 +21,8 @@ use soundshared::{
     },
     network::{
         broadcast::{AudioBroadcaster, AudioFrame, BroadcasterConfig, BroadcasterHandle, BroadcastError},
-        server::{build_router, detect_local_ip, listen_url, Router, ServerConfig, ServerHandle, ServerState},
+        local_ip::detect_for_bind,
+        server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
         websocket::WebSocketConfig,
     },
 };
@@ -96,7 +97,6 @@ async fn start_listener(
     app: &Router,
     bind_addr: std::net::IpAddr,
     bind_port: u16,
-    detected_ip: Option<std::net::IpAddr>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> std::result::Result<(String, tokio::task::JoinHandle<()>), String> {
     let addr = std::net::SocketAddr::new(bind_addr, bind_port);
@@ -108,7 +108,9 @@ async fn start_listener(
 
     // Advertise somewhere the listener is actually reachable, recomputed on
     // every Start so an edited bind address is reflected in the URL the GUI
-    // displays and copies.
+    // displays and copies. The family follows the bind: a socket on 0.0.0.0
+    // serves IPv4 and must not advertise an IPv6 address.
+    let detected_ip = detect_for_bind(bind_addr);
     let url = listen_url(bind_addr, actual_addr, detected_ip);
 
     let app_clone = app.clone();
@@ -166,9 +168,6 @@ fn run_server_and_get_handle(
         // Create broadcaster
         let (broadcaster_handle, broadcaster) = AudioBroadcaster::new(config.broadcaster_config.clone());
 
-        // Detect local IP
-        let detected_ip = detect_local_ip().await;
-
         // The bind target is live state, not a snapshot: the GUI can change the
         // CONFIGURATION port / bind address while the server is down, and the
         // next Start has to use the new values.
@@ -193,7 +192,6 @@ fn run_server_and_get_handle(
             shutdown_tx: shutdown_tx_for_handle,
             url: Arc::new(tokio::sync::Mutex::new(None)),
             broadcaster: broadcaster_handle.clone(),
-            local_ip: Arc::new(tokio::sync::Mutex::new(detected_ip)),
         };
 
         // Send handle to audio processor
@@ -243,14 +241,8 @@ fn run_server_and_get_handle(
                                 // Reported through the response channel, not by
                                 // bubbling up: a bind failure must not kill the
                                 // server thread.
-                                let started = start_listener(
-                                    &app,
-                                    bind_addr,
-                                    bind_port,
-                                    detected_ip,
-                                    &shutdown_tx,
-                                )
-                                .await;
+                                let started =
+                                    start_listener(&app, bind_addr, bind_port, &shutdown_tx).await;
 
                                 match started {
                                     Ok((url, task)) => {

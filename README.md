@@ -1,0 +1,219 @@
+<!--
+  Bardwave — free, open-source ambience for your table.
+  Repo: https://github.com/adamantida/Bardwave
+-->
+
+<div align="center">
+
+# 🎲 Bardwave
+
+**Free, open-source ambience, music and sound effects for your tabletop RPG.**
+
+Run the mix on your own PC and let every player hear it in their browser over the local network.
+No subscriptions, no accounts, no cloud. A self-hosted alternative to Syrinscape and RPG Sounds.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-a04a4a.svg?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-7a3b3b.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Windows-3b3b3b.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-a04a4a.svg?style=flat-square)](#contributing)
+
+[Why](#why) · [Features](#features) · [Getting started](#getting-started) · [Configuration](#configuration) · [How it works](#how-it-works) · [Roadmap](#roadmap)
+
+</div>
+
+---
+
+> A tavern taproom. A rain-soaked alley at midnight. The low drone before the dragon wakes.
+> You hit play. Your four players, on four different laptops, hear exactly what you hear — no Discord screen-share, no file sharing, no "wait, send me that MP3 again".
+
+## Why
+
+Running ambience in a tabletop game is still surprisingly awkward. The paid options tie you to a subscription and their own sound packs. The free options make you share files, run a second voice channel, or host something in the cloud you do not control.
+
+**Bardwave** takes the opposite approach:
+
+- your sound library stays **on your machine**, in whatever format you already own (MP3, FLAC, OGG, WAV, …);
+- the mix is built **live** on your desktop, not pre-rendered;
+- players need **nothing but a browser** — they open one URL and press Connect;
+- *you* stay in control of every fader while the scene plays.
+
+## Features
+
+<table>
+<tr><td width="50%" valign="top">
+
+**Console**
+- Desktop soundboard built with [egui](https://github.com/emilk/egui) — native, single binary, no runtime
+- Sound **groups** (tavern, dungeon, combat, …) with live filtering
+- **Per-sound volume**, master volume, and a live level meter
+- **Loop** toggle per sound for pads and drones
+- Drag-free dialogs for new/rename/delete group and moving sounds between groups
+- Player/stopped state per sound, with duration readout
+- Reduced-motion mode for the decorative effects
+
+</td><td width="50%" valign="top">
+
+**Streaming**
+- WebSocket broadcast of the **final mix** — players hear what the GM hears
+- Low-latency: small mixing buffers, compact binary frames
+- Browser listener page is **embedded in the binary**, so there is no static folder to ship
+- **Live listener counter** in the console
+- Automatic local address detection that ignores VPN/TUN adapters
+- Graceful start/stop that does not leave the server thread hung
+
+</td></tr>
+<tr><td valign="top">
+
+**Library**
+- WAV, FLAC, MP3, OGG-Vorbis and AAC/MP4 decoding via [Symphonia](https://github.com/pdeljanov/Symphonia)
+- Library, groups, per-sound volume and loop flags **persist across restarts**
+- Everything stored in a plain, human-readable `config.toml` next to the executable
+
+</td><td valign="top">
+
+**Engineering**
+- Rust, one binary, one config file
+- 127 tests (`cargo test --all-targets`), including end-to-end broadcast and WebSocket wire-format tests
+- Typed commands between GUI, audio engine and network — no shared mutable soup
+- Streaming resampled to 48 kHz / stereo f32 in the mix pipeline
+
+</td></tr>
+</table>
+
+## Getting started
+
+### Requirements
+
+- **Windows 10/11** (the audio and network code is portable Rust; only the local-IP detection is Windows-specific today — see [Roadmap](#roadmap)).
+- [Rust toolchain](https://rustup.rs) 1.80 or newer.
+- A sound card. No, really — this is the point of the app.
+
+### Build & run
+
+```bash
+git clone https://github.com/adamantida/Bardwave.git
+cd Bardwave
+cargo run --release
+```
+
+The console window opens. Click **Add sound** (or the ⨁ button) and pick a few audio files from your library, then press **Start** in the SERVER panel.
+
+> Built binary, if you do not want a terminal hanging around: `cargo build --release` puts `target/release/soundshared.exe` — rename it to `Bardwave.exe` if you like. Keep `config.toml` in the **same folder** as the executable.
+
+### Connect your players
+
+The SERVER panel shows two addresses:
+
+| Address | Who uses it |
+|---|---|
+| `http://192.168.x.x:8080` | **Your players.** Open it on any device in the same network. |
+| `http://127.0.0.1:8080` | **You**, to test the listener page on your own machine. |
+
+The LISTEN URL is click-to-copy. Players open it, hit **Establish Link**, and the stream starts.
+
+### Headless
+
+```bash
+soundshared.exe --server-only
+```
+
+> ⚠️ The current `--server-only` mode starts the HTTP/WebSocket server but has no console to load sounds, so it broadcasts silence. It is useful for protocol and network testing, not for a session. Planned to be finished — see [Roadmap](#roadmap).
+
+## Configuration
+
+`config.toml` lives **next to the executable** and is created by the app when settings change. Everything is optional; missing keys fall back to the defaults below.
+
+```toml
+[server]
+host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
+port = 8080
+
+[audio]
+buffer_size = 1024 # samples per channel
+sample_rate = 48000
+channels = 2
+master_volume = 0.8
+
+[logging]
+level = "info"     # trace | debug | info | warn | error
+file_logging = false
+
+[gui]
+reduce_motion = false  # stop the pulsing dot and backdrop animation
+
+[library]              # managed by the app — your sounds and groups
+```
+
+Environment variable `RUST_LOG` overrides `logging.level`.
+
+## Using it at the table
+
+1. Group your sounds by scene — **Crowd**, **Nature**, **Combat**, **Effects**. Grouping is by hand; a group is just a filter over the library.
+2. Add looping pads (rain, fire, tavern murmur) with **loop** on and a low per-sound volume.
+3. Add one-shot stingers (door slam, sword hit) with loop off at full volume.
+4. Start the server before the session. Players open the URL on their phones and laptops.
+5. Ride the faders live: drop the ambience under a monologue, bring it back on a scene change.
+
+Because players hear the **mix** and not the files, you can edit, replace or re-level anything mid-session and nobody sees a download.
+
+## How it works
+
+```
+┌─────────────────────── Bardwave.exe ────────────────────────┐
+│                                                             │
+│   egui console ──AudioCommand──▶  audio engine              │
+│   (sounds, groups,     ◀─status─  ├─ decoder  (Symphonia)   │
+│    server panel)                  ├─ mixer    (48k/stereo)  │
+│                                   └─ cpal output ─▶ speakers │
+│                                          │                  │
+│                                          │ MixedOutput      │
+│                                          ▼                  │
+│                              broadcaster (tokio broadcast)  │
+│                                          │                  │
+│                              axum HTTP + WebSocket          │
+└──────────────────────────────────────────┼──────────────────┘
+                                           │ ws://<lan-ip>:8080/ws
+                          ┌────────────────┼────────────────┐
+                          ▼                ▼                ▼
+                     🧝 browser        🧙 browser       🧟 browser
+                     (Web Audio API ring buffer → speakers)
+```
+
+- `src/audio` — decoding, mixing, resampling, device output.
+- `src/network` — axum server, WebSocket sessions, broadcaster, embedded listener page, local-IP detection.
+- `src/gui` — the console: theme, widgets, sound list, groups, server panel, dialogs.
+- `src/config.rs` — `config.toml` schema and persistence.
+
+## Building & testing
+
+```bash
+cargo test --all-targets     # 127 tests
+cargo clippy --all-targets   # lint
+cargo build --release
+```
+
+## Roadmap
+
+Honest list of what is **not** done yet — this is an early build, not a finished competitor:
+
+- [ ] Higher-quality resampling (the current one is linear interpolation; 96/192 kHz sources will alias)
+- [ ] Apply `[audio]` sample rate / channels / buffer size from the config (only master volume is wired up today)
+- [ ] File logging (`logging.file_logging` is parsed but ignored)
+- [ ] A working `--server-only` mode that can load a library
+- [ ] Cross-platform local-IP detection (macOS/Linux)
+- [ ] Crossfade between scenes; per-listener volume control
+- [ ] Packaging: installer, portable build, maybe a Steam/itch release
+
+Ideas, bug reports and pull requests are welcome.
+
+## Contributing
+
+- Open an issue describing the bug or the feature before a large PR.
+- Keep the console buildable and the tests green (`cargo test --all-targets`).
+- Match the existing style: typed commands over shared state, no blocking work on the render thread.
+
+## License
+
+[MIT](LICENSE) © 2026 adamantida
+
+Bardwave is not affiliated with, endorsed by, or sponsored by Syrinscape, RPG Sounds, or Wizards of the Coast. Those names are mentioned only to describe what this project is an alternative to. D&D, Pathfinder and other game systems are trademarks of their respective owners.

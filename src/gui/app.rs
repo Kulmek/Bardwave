@@ -103,6 +103,12 @@ pub enum ServerStatus {
 pub struct ServerState {
     pub status: ServerStatus,
     pub bind_url: Option<String>,
+    /// Loopback URL of the same server, for this machine.
+    ///
+    /// The advertised URL carries the LAN address so it can be sent to the
+    /// players; the operator checking the page locally does not have to go
+    /// through the network for it.
+    pub local_url: Option<String>,
     pub listener_count: usize,
 }
 
@@ -220,6 +226,7 @@ impl SoundSharedApp {
             server_state: Arc::new(Mutex::new(ServerState {
                 status: ServerStatus::Stopped,
                 bind_url: None,
+                local_url: None,
                 listener_count: 0,
             })),
             copied_feedback: Arc::new(Mutex::new(false)),
@@ -606,6 +613,12 @@ impl SoundSharedApp {
         let mut state = self.server_state.lock().unwrap();
         // Read real-time listener count from the shared counter (updated by server thread)
         state.listener_count = *self.app_state.listener_count.lock().unwrap();
+        // Derived, never stored separately: it follows the advertised URL and
+        // disappears with it when the server stops.
+        state.local_url = state
+            .bind_url
+            .as_deref()
+            .and_then(crate::network::server::loopback_url);
         state.clone()
     }
 

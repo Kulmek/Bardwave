@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 *.swp
 *.swo
 *~
@@ -8,3 +7,6 @@ Cargo.lock
 .vscode/
 *.log
 .env
+# build artifacts
+*.pdb
+*.exe

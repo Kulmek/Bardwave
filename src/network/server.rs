@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use crate::network::broadcast::{AudioBroadcaster, BroadcasterConfig, BroadcasterHandle, BroadcastError};
+use crate::network::local_ip::{detect_for_bind, is_advertisable};
 use crate::network::websocket::{handle_websocket_upgrade, WebSocketConfig};
 
 // Embedded static files (compiled into binary)
@@ -56,8 +57,6 @@ pub struct ServerHandle {
     pub url: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Broadcaster handle for audio engine
     pub broadcaster: BroadcasterHandle,
-    /// Listener for local IP detection
-    pub local_ip: Arc<tokio::sync::Mutex<Option<IpAddr>>>,
 }
 
 impl ServerHandle {
@@ -69,11 +68,6 @@ impl ServerHandle {
     /// Get the server URL (available after start)
     pub async fn url(&self) -> Option<String> {
         self.url.lock().await.clone()
-    }
-
-    /// Get the detected local IP
-    pub async fn local_ip(&self) -> Option<IpAddr> {
-        *self.local_ip.lock().await
     }
 
     /// Stop the server
@@ -150,15 +144,14 @@ impl NetworkServer {
     pub async fn start(self) -> Result<ServerHandle, ServerError> {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let url = Arc::new(tokio::sync::Mutex::new(None::<String>));
-        let local_ip = Arc::new(tokio::sync::Mutex::new(None::<IpAddr>));
 
         // Create broadcaster
         let (broadcaster_handle, broadcaster) =
             AudioBroadcaster::new(self.config.broadcaster_config.clone());
 
-        // Detect local IP
-        let detected_ip = detect_local_ip().await;
-        *local_ip.lock().await = detected_ip;
+        // The advertised address is chosen for the family that is being bound,
+        // never taken from the default route alone.
+        let detected_ip = detect_for_bind(self.config.bind_addr);
 
         // Build the shared router
         let state = ServerState {
@@ -201,7 +194,6 @@ impl NetworkServer {
             shutdown_tx: shutdown_tx_for_handle,
             url,
             broadcaster: broadcaster_handle,
-            local_ip,
         };
 
         // Monitor tasks in background
@@ -305,8 +297,8 @@ pub async fn websocket_handler(
 ///
 /// * a loopback bind is only reachable from this machine, so it advertises
 ///   loopback;
-/// * a wildcard bind (0.0.0.0 / ::) advertises the OS-detected LAN address of
-///   the matching family, falling back to loopback when there is none;
+/// * a wildcard bind (0.0.0.0 / ::) advertises a detected address of the
+///   matching family, falling back to loopback when there is none;
 /// * an explicit address advertises itself.
 ///
 /// The actual address supplies the real port, so a bind to port 0 reports the
@@ -317,8 +309,11 @@ pub fn listen_url(bind_addr: IpAddr, actual: SocketAddr, detected: Option<IpAddr
     } else if bind_addr.is_unspecified() {
         match detected {
             // Never advertise an address of the other family: the socket only
-            // listens on the family it was bound to.
-            Some(ip) if ip.is_ipv4() == bind_addr.is_ipv4() => ip,
+            // listens on the family it was bound to. The address also has to be
+            // one a client could actually open, which is checked here as well
+            // as where it was detected, because an unreachable URL is worse
+            // than an honest loopback one.
+            Some(ip) if ip.is_ipv4() == bind_addr.is_ipv4() && is_advertisable(ip) => ip,
             _ if bind_addr.is_ipv4() => IpAddr::V4(Ipv4Addr::LOCALHOST),
             _ => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
         }
@@ -333,35 +328,24 @@ pub fn listen_url(bind_addr: IpAddr, actual: SocketAddr, detected: Option<IpAddr
     }
 }
 
-/// Detect the LAN address of this machine.
+/// The loopback URL of a running server, derived from the advertised one.
 ///
-/// Lives here only: main.rs used to carry a byte-identical copy of this probe.
-pub async fn detect_local_ip() -> Option<IpAddr> {
-    use std::net::UdpSocket;
+/// The listener page is always reachable on the machine that serves it, and
+/// that address never depends on detection: an operator who only wants to check
+/// the page locally should not have to go through the LAN for it. With a
+/// proxy/VPN both sides stay visible this way -- the LAN address above for the
+/// players, this one for the console's own machine.
+pub fn loopback_url(advertised: &str) -> Option<String> {
+    // The URL is built by listen_url, so the port is the last colon segment;
+    // the IPv6 form brackets its host and therefore parses the same way.
+    let port = advertised
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()?
+        .parse::<u16>()
+        .ok()?;
 
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    if let Ok(socket) = UdpSocket::bind("[::]:0") {
-        if socket.connect("[2001:4860:4860::8888]:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip();
-                if !ip.is_loopback() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    None
+    Some(format!("http://127.0.0.1:{port}"))
 }
 
 #[cfg(test)]
@@ -377,12 +361,13 @@ mod tests {
         assert_eq!(config.bind_addr, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     }
 
-    #[tokio::test]
-    async fn test_detect_local_ip() {
-        let ip = detect_local_ip().await;
-        // May be None in test environment, but shouldn't panic
-        if let Some(ip) = ip {
-            assert!(!ip.is_loopback() || ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    /// Detection may answer with nothing in a test environment, but whatever it
+    /// answers with has to be an address a listener could actually open.
+    #[test]
+    fn detection_never_offers_an_unreachable_address() {
+        if let Some(ip) = detect_for_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+            assert!(is_advertisable(ip), "detected {ip}");
+            assert!(!ip.is_loopback(), "loopback is the fallback, not a detection");
         }
     }
 
@@ -599,5 +584,87 @@ mod tests {
             listen_url(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), actual, None),
             "http://10.0.0.7:8080"
         );
+    }
+
+    /// A proxy TUN adapter answers the route probe with an address out of the
+    /// benchmarking range. That URL used to be published verbatim as
+    /// http://198.18.0.1:8080, which neither a player nor the operator can
+    /// open; loopback is what a wildcard bind falls back to instead.
+    #[test]
+    fn listen_url_never_advertises_a_benchmarking_range_address() {
+        let actual = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080));
+
+        // Straight from detection...
+        assert_eq!(
+            listen_url(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                actual,
+                Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)))
+            ),
+            "http://127.0.0.1:8080"
+        );
+
+        // ...and even when something hands one over unchecked.
+        assert_eq!(
+            listen_url(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                actual,
+                Some(IpAddr::V4(Ipv4Addr::new(169, 254, 3, 4)))
+            ),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn loopback_url_keeps_the_bound_port() {
+        assert_eq!(
+            loopback_url("http://192.168.1.245:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        // The IPv6 form brackets the host, so the port is still the last colon
+        // segment.
+        assert_eq!(
+            loopback_url("http://[2a00:1450::1]:9000").as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn loopback_url_rejects_text_without_a_port() {
+        assert_eq!(loopback_url("http://192.168.1.245"), None);
+        assert_eq!(loopback_url("not a url"), None);
+    }
+
+    /// End to end on a real socket: whatever the machine looks like, the URL a
+    /// started server publishes is either loopback or an address a client can
+    /// open -- never the benchmarking address a proxy TUN adapter hands to the
+    /// route probe.
+    #[tokio::test]
+    async fn started_server_never_advertises_an_unreachable_address() {
+        let config = ServerConfig {
+            port: 0,
+            ..Default::default()
+        };
+
+        let handle = match NetworkServer::new(config).start().await {
+            Ok(handle) => handle,
+            Err(_) => return, // Skip if the environment cannot bind
+        };
+
+        let url = handle.url().await.expect("a started server has a URL");
+        let host = url.trim_start_matches("http://");
+        let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+        let ip: IpAddr = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .unwrap_or_else(|_| panic!("advertised host is not an IP literal: {url}"));
+
+        assert!(
+            ip.is_loopback() || is_advertisable(ip),
+            "advertised an address no listener can open: {url}"
+        );
+
+        handle.stop();
     }
 }

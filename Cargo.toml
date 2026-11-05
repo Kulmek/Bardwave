@@ -38,7 +38,13 @@ ctrlc = "3.4"
 name = "soundshared"
 version = "0.1.0"
 edition = "2021"
-description = "Local network audio sharing application"
+description = "Open-source TTRPG soundboard: desktop ambience console streamed to players' browsers over LAN."
+license = "MIT"
+repository = "https://github.com/adamantida/Bardwave"
+homepage = "https://github.com/adamantida/Bardwave"
+readme = "README.md"
+keywords = ["ttrpg", "soundboard", "audio", "streaming", "egui"]
+categories = ["multimedia::audio", "games"]
 
 [dependencies]
 # Workspace deps

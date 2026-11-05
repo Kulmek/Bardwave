@@ -9,6 +9,7 @@
 //! BROADCASTING TO 3 LISTENERS
 //! ─────────────────────────────
 //! LISTEN URL   [ http://192.168.1.245:8080  ⧉ ]
+//!              LOCAL http://127.0.0.1:8080
 //! LISTENERS    03  ▮▮▮▯▯▯▯▯   PEAK 3
 //! ─────────────────────────────
 //! [ ■ STOP SERVER ] [ ⧉ COPY LINK ]
@@ -144,6 +145,18 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                     .color(Palette::ROSE_400)
                     .extra_letter_spacing(1.0),
             );
+        }
+
+        // The URL above carries the LAN address, which is what the players
+        // open. This machine always has loopback, and showing it means a wrong
+        // or blocked address detection can never hide the way in.
+        let advertised_is_loopback =
+            url.starts_with("http://127.0.0.1") || url.starts_with("http://[::1]");
+        if running && !advertised_is_loopback {
+            if let Some(local) = server.local_url.as_deref() {
+                ui.add_space(Metrics::XS);
+                ui.label(micro_label(format!("Local {local}")));
+            }
         }
 
         ui.add_space(Metrics::LG);
