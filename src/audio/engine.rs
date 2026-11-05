@@ -375,6 +375,18 @@ impl AudioEngine {
     /// Play a loaded sound
     /// Returns a TrackHandle for controlling playback
     pub fn play(&self, sound_id: SoundId) -> Result<TrackHandle, EngineError> {
+        self.play_with_loop(sound_id, false)
+    }
+
+    /// Play a loaded sound, optionally repeating it forever.
+    ///
+    /// This is the single playback entry point: `play` and `play_loop` are thin
+    /// wrappers, so the "repeat" flag chosen in the UI travels with the track.
+    pub fn play_with_loop(
+        &self,
+        sound_id: SoundId,
+        looped: bool,
+    ) -> Result<TrackHandle, EngineError> {
         let audio = {
             let sounds = self.inner.sounds.read();
             sounds
@@ -383,7 +395,6 @@ impl AudioEngine {
                 .ok_or(EngineError::SoundNotFound(sound_id))?
         };
 
-        let looped = false; // Default to non-looping
         let track_id = self.inner.mixer.add_track(audio, looped);
 
         // Start playback — the central mix loop will read audio directly from
@@ -399,32 +410,49 @@ impl AudioEngine {
             engine: self.inner.clone(),
         };
 
-        debug!("Started playback of sound {} on track {}", sound_id.0, track_id);
+        debug!(
+            "Started {}playback of sound {} on track {}",
+            if looped { "looped " } else { "" },
+            sound_id.0,
+            track_id
+        );
         Ok(handle)
     }
 
     /// Play a sound with looping enabled
     pub fn play_loop(&self, sound_id: SoundId) -> Result<TrackHandle, EngineError> {
-        let audio = {
-            let sounds = self.inner.sounds.read();
-            sounds
-                .get(&sound_id)
-                .cloned()
-                .ok_or(EngineError::SoundNotFound(sound_id))?
+        self.play_with_loop(sound_id, true)
+    }
+
+    /// Turn repeating on or off for every active track of a sound.
+    ///
+    /// The flag lives on the mixer track, so a sound that is already playing
+    /// starts repeating the moment this is called, and a sound that is not
+    /// playing picks the flag up on its next `play_with_loop`.
+    pub fn set_sound_looped(&self, sound_id: SoundId, looped: bool) -> Result<(), EngineError> {
+        let track_ids: Vec<Uuid> = {
+            let tracks = self.inner.active_tracks.read();
+            tracks
+                .iter()
+                .filter_map(|(tid, sid)| if *sid == sound_id { Some(*tid) } else { None })
+                .collect()
         };
 
-        let track_id = self.inner.mixer.add_track(audio, true);
-        self.inner.mixer.play_track(track_id)?;
-        self.inner.active_tracks.write().insert(track_id, sound_id);
+        for track_id in track_ids {
+            self.inner.mixer.set_track_looped(track_id, looped)?;
+        }
+        Ok(())
+    }
 
-        let handle = TrackHandle {
-            sound_id,
-            track_id,
-            engine: self.inner.clone(),
-        };
-
-        debug!("Started looped playback of sound {} on track {}", sound_id.0, track_id);
-        Ok(handle)
+    /// Whether any active track of this sound is currently set to repeat.
+    pub fn is_sound_looped(&self, sound_id: SoundId) -> Result<bool, EngineError> {
+        let tracks = self.inner.active_tracks.read();
+        for (track_id, sid) in tracks.iter() {
+            if *sid == sound_id && self.inner.mixer.is_track_looped(*track_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Stop a specific track by its handle

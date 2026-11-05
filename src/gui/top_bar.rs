@@ -1,39 +1,241 @@
-use crate::gui::app::SoundSharedApp;
-use crate::gui::theme::*;
-use egui::{Align, Layout, RichText, Ui, Vec2};
+//! Top command bar — brand lockup, master volume, live server status.
+//!
+//! 64px tall, `#0A0A0A`, hairline bottom border, 24px horizontal padding:
+//! brand left · master volume centre-left · live signal right.
 
-/// Top bar: app title, master volume, server status
+use crate::gui::app::{ServerStatus, SoundSharedApp};
+use crate::gui::theme::{alpha, hairline, micro_label, wordmark, Metrics, Palette};
+use crate::gui::widgets::{glyph, level_bar, level_slider, signal_dot, IconButton};
+use egui::{Align, Layout, Rect, Rounding, Sense, Stroke, Ui, Vec2};
+
+/// Height reserved for the master volume slider inside the bar.
+const MASTER_SLIDER_W: f32 = 150.0;
+
+/// Renders the top command bar.
 pub fn top_bar(ui: &mut Ui, state: &mut SoundSharedApp) {
+    let bar_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(bar_rect, Rounding::ZERO, Palette::APP);
+
+    // Reserve the full bar and lay the three groups out on one row.
+    ui.allocate_ui_with_layout(
+        ui.available_size(),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add_space(Metrics::PANEL_PAD);
+            brand(ui);
+            ui.add_space(Metrics::XL);
+            vertical_divider(ui);
+            ui.add_space(Metrics::XL);
+            master_volume(ui, state);
+            ui.add_space(Metrics::XL);
+            vertical_divider(ui);
+            ui.add_space(Metrics::XL);
+            quick_clear(ui, state);
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(Metrics::PANEL_PAD);
+                live_status(ui, state);
+            });
+        },
+    );
+
+    // Bottom hairline.
+    let line = Rect::from_min_size(
+        egui::pos2(bar_rect.left(), bar_rect.bottom() - 1.0),
+        Vec2::new(bar_rect.width(), 1.0),
+    );
+    ui.painter()
+        .rect_filled(line, Rounding::ZERO, Palette::BORDER);
+}
+
+/// Brand lockup: rose signal mark + wordmark + `BROADCAST CONSOLE` subtitle.
+fn brand(ui: &mut Ui) {
     ui.horizontal(|ui| {
-        // App branding
-        ui.add_space(16.0);
-        ui.heading(RichText::new("SoundShared").size(20.0).strong());
-        ui.add_space(8.0);
-        ui.label(RichText::new("Audio Streaming Server").size(12.0).color(SoundSharedColors::TEXT_MUTED));
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(16.0);
-
-        // Master volume
-        ui.label(RichText::new("🔊 Master").size(12.0).color(SoundSharedColors::TEXT_SECONDARY));
-        ui.add_space(4.0);
-        let mut master = (state.get_master_volume() * 100.0) as i32;
-        let vol_response = ui.add(
-            egui::Slider::new(&mut master, 0..=100)
-                .show_value(false)
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        ui.painter()
+            .rect_filled(rect, Rounding::same(2.0), Palette::ROSE_600);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph::WAVE,
+            egui::FontId::new(11.0, egui::FontFamily::Monospace),
+            Palette::WHITE,
         );
-        if vol_response.changed() {
-            state.set_master_volume(master as f32 / 100.0);
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new(format!("{}%", master)).size(11.0).color(SoundSharedColors::TEXT_MUTED).monospace());
-        ui.add_space(24.0);
 
-        // Spacer pushes server status to the right
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(12.0);
-            crate::gui::server_panel::compact_server_status(ui, state);
-            ui.add_space(16.0);
+        ui.add_space(Metrics::SM);
+
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(wordmark("SoundShared"));
+            ui.label(micro_label("Broadcast Console").size(9.0));
         });
     });
+}
+
+/// Master volume: micro label, 150px slider, mono readout.
+fn master_volume(ui: &mut Ui, state: &mut SoundSharedApp) {
+    ui.horizontal(|ui| {
+        ui.label(micro_label("Master"));
+        ui.add_space(Metrics::SM);
+
+        let mut value = state.get_master_volume();
+        let resp = level_slider(ui, &mut value, MASTER_SLIDER_W, "master_top");
+        if resp.changed() {
+            state.set_master_volume(value);
+        }
+
+        ui.add_space(Metrics::SM);
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", value * 100.0))
+                .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                .color(Palette::WHITE),
+        );
+    });
+}
+
+/// A small, quiet "stop everything" action in the command bar.
+fn quick_clear(ui: &mut Ui, state: &mut SoundSharedApp) {
+    let any_playing = state.get_sounds().iter().any(|s| s.playing);
+    let resp = IconButton::new(glyph::STOP)
+        .size(26.0)
+        .font_size(10.0)
+        .tooltip("Stop all sounds")
+        .id_salt("top_stop_all")
+        .show(ui);
+    if resp.clicked() && any_playing {
+        state.stop_all_sounds();
+    }
+    ui.add_space(Metrics::XS);
+    ui.label(micro_label("Panic"));
+}
+
+/// Right-hand live signal: pulsing dot, `LIVE`/`OFF AIR`, secondary line.
+fn live_status(ui: &mut Ui, state: &mut SoundSharedApp) {
+    let server = state.get_server_state();
+    let (color, headline, subline, pulse) = match &server.status {
+        ServerStatus::Running => (
+            Palette::ROSE_500,
+            "Live".to_string(),
+            format!("Server running · :{}", state.get_server_port()),
+            true,
+        ),
+        ServerStatus::Starting => (
+            Palette::AMBER_400,
+            "Starting".to_string(),
+            "Binding listener".to_string(),
+            true,
+        ),
+        ServerStatus::Error(_) => (
+            Palette::ROSE_400,
+            "Error".to_string(),
+            "Server failed — see panel".to_string(),
+            false,
+        ),
+        ServerStatus::Stopped => (
+            Palette::ZINC_500,
+            "Off Air".to_string(),
+            "Server stopped".to_string(),
+            false,
+        ),
+    };
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(headline.to_uppercase())
+                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                        .color(color)
+                        .extra_letter_spacing(1.0)
+                        .strong(),
+                );
+                signal_dot(ui, color, 7.0, pulse);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(micro_label(subline).size(9.0).extra_letter_spacing(0.8));
+            });
+        });
+    });
+}
+
+/// 1px vertical hairline between bar groups.
+fn vertical_divider(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 32.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::ZERO, Palette::BORDER);
+}
+
+/// Bottom status strip (28px): version left, format right.
+pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, Rounding::ZERO, Palette::APP);
+    let line = Rect::from_min_size(
+        egui::pos2(rect.left(), rect.top()),
+        Vec2::new(rect.width(), 1.0),
+    );
+    ui.painter()
+        .rect_filled(line, Rounding::ZERO, Palette::BORDER);
+
+    ui.allocate_ui_with_layout(
+        ui.available_size(),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add_space(Metrics::PANEL_PAD);
+            ui.label(
+                egui::RichText::new(format!("SoundShared v{}", crate::VERSION))
+                    .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                    .color(Palette::ZINC_600)
+                    .extra_letter_spacing(1.0),
+            );
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(Metrics::PANEL_PAD);
+                let tracks = state.get_sounds().len();
+                let label = format!(
+                    "{} kHz / 16-bit / stereo  ·  {} tracks  ·  {} groups",
+                    crate::audio::decoder::TARGET_SAMPLE_RATE / 1000,
+                    tracks,
+                    state.group_count()
+                );
+                ui.label(
+                    egui::RichText::new(label)
+                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                        .color(Palette::ZINC_600)
+                        .extra_letter_spacing(1.0),
+                );
+            });
+        },
+    );
+}
+
+/// Compact master readout reused elsewhere (kept for API stability).
+pub fn master_meter(ui: &mut Ui, value: f32) {
+    ui.horizontal(|ui| {
+        ui.label(micro_label("Out"));
+        level_bar(ui, value, 60.0);
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", value * 100.0))
+                .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                .color(Palette::ZINC_400),
+        );
+    });
+}
+
+/// Hairline divider helper mirrored from the theme for convenience.
+pub fn divider(ui: &mut Ui) {
+    hairline(ui);
+}
+
+/// Frame used by the bar (exported so the shell can keep identical styling).
+pub fn bar_frame() -> egui::Frame {
+    card_panel_frame()
+}
+
+fn card_panel_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(Palette::APP)
+        .stroke(Stroke::new(1.0_f32, alpha(Palette::BORDER, 255)))
+        .rounding(Rounding::ZERO)
 }

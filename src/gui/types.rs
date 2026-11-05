@@ -16,6 +16,8 @@ pub enum AudioCommand {
     StopSound { id: SoundId, response: Sender<anyhow::Result<()>> },
     /// Set per-sound volume (track volume)
     SetVolume { id: SoundId, volume: f32, response: Sender<anyhow::Result<()>> },
+    /// Turn repeating on or off for a sound
+    SetLoop { id: SoundId, looped: bool, response: Sender<anyhow::Result<()>> },
     /// Set master volume
     SetMasterVolume { volume: f32, response: Sender<anyhow::Result<()>> },
     /// Remove a sound from the library

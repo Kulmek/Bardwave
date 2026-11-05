@@ -422,6 +422,30 @@ impl AudioMixer {
             .ok_or(MixerError::TrackNotFound(track_id))
     }
 
+    /// Enable or disable looping for a specific track.
+    ///
+    /// Takes effect immediately: the mix loop checks the flag when it reaches
+    /// the end of the buffer, so toggling it mid-playback either wraps around
+    /// from the start or lets the track finish and stop.
+    pub fn set_track_looped(&self, track_id: Uuid, looped: bool) -> Result<(), MixerError> {
+        let mut tracks = self.tracks.write();
+        if let Some(track) = tracks.get_mut(&track_id) {
+            track.looped = looped;
+            Ok(())
+        } else {
+            Err(MixerError::TrackNotFound(track_id))
+        }
+    }
+
+    /// Whether a specific track is set to loop.
+    pub fn is_track_looped(&self, track_id: Uuid) -> Result<bool, MixerError> {
+        let tracks = self.tracks.read();
+        tracks
+            .get(&track_id)
+            .map(|t| t.looped)
+            .ok_or(MixerError::TrackNotFound(track_id))
+    }
+
     /// Start playback for a track (resets position to 0)
     pub fn play_track(&self, track_id: Uuid) -> Result<(), MixerError> {
         let mut tracks = self.tracks.write();
@@ -623,5 +647,50 @@ mod tests {
         assert!(out[..200].iter().all(|s| (*s - 0.5).abs() < 1e-6));
         assert!(out[200..].iter().all(|s| *s == 0.0));
         assert!(!mixer.is_track_playing(id).unwrap());
+    }
+
+    /// Turning "repeat" on for a track that is already running keeps it going
+    /// past the end of its buffer instead of letting it stop.
+    #[test]
+    fn test_set_track_looped_takes_effect_mid_playback() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.25; 100 * 2], 48000, 2));
+        let id = mixer.add_track(audio, false);
+        mixer.play_track(id).unwrap();
+
+        assert!(!mixer.is_track_looped(id).unwrap());
+        mixer.set_track_looped(id, true).unwrap();
+        assert!(mixer.is_track_looped(id).unwrap());
+
+        // One buffer longer than the sound: with repeat on it wraps and keeps
+        // producing audio instead of falling silent.
+        let mut out = vec![0.0f32; 480 * 2];
+        assert!(mixer.mix_into(&mut out));
+        assert!(out.iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(mixer.is_track_playing(id).unwrap());
+    }
+
+    /// Turning "repeat" off mid-playback lets the current pass finish and stop.
+    #[test]
+    fn test_clearing_track_loop_stops_at_end_of_buffer() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.5; 100 * 2], 48000, 2));
+        let id = mixer.add_track(audio, true);
+        mixer.play_track(id).unwrap();
+
+        mixer.set_track_looped(id, false).unwrap();
+        assert!(!mixer.is_track_looped(id).unwrap());
+
+        let mut out = vec![0.0f32; 480 * 2];
+        assert!(mixer.mix_into(&mut out));
+        assert!(!mixer.is_track_playing(id).unwrap());
+    }
+
+    #[test]
+    fn test_set_track_looped_rejects_unknown_track() {
+        let mixer = AudioMixer::new();
+        let unknown = uuid::Uuid::new_v4();
+        assert!(mixer.set_track_looped(unknown, true).is_err());
+        assert!(mixer.is_track_looped(unknown).is_err());
     }
 }

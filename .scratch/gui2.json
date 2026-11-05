@@ -1,0 +1,555 @@
+{
+  "image": "C:\\Users\\SumalyFly\\RustroverProjects\\SoundShared\\.scratch\\gui2.png",
+  "provider": "openai",
+  "result": {
+    "summary": "A dark-themed SoundShared broadcast console is shown in a 1378×790 screenshot. The left panel contains a sound library, a group and category rail, four sound rows, and master output controls. The right panel shows a stopped network server, listener information, and configuration. Most controls align cleanly, but a button beside START SERVER extends beyond the right panel and is clipped by the image edge. Faint content is also cut off along the bottom edge.",
+    "ocr": {
+      "full_text": "SOUNDSHARED\nBROADCAST CONSOLE\nMASTER\n80%\nPANIC\nOFF AIR\nSERVER STOPPED\n01 / LIBRARY\nSOUND LIBRARY\n4 TRACKS\n+ ADD SOUND\nGROUPS\n+\nAll Sounds\n04\nUngrouped\n01\nCATEGORIES\nCombat\n02\nAmbience\n01\nintro-theme\n48 KHZ / 00:42 / WAV\nNO GROUP\n100%\nrain-ambience\n48 KHZ / 01:00 / WAV\nAMBIENCE\n100%\napplause\n48 KHZ / 00:08 / WAV\nCOMBAT\n100%\nsword-hit\n48 KHZ / 00:02 / WAV\nCOMBAT\n100%\nMASTER OUTPUT\n80%\nMUTE\n02 / NETWORK\nNETWORK SERVER\nOFF AIR\nSERVER STOPPED\nLISTEN URL\n—\nLISTENERS\n00\nPEAK 0\nSTART SERVER\nCOPY LI\nCONFIGURATION\nPORT\nBIND ADDRESS\n8080\n0.0.0.0\nEDITABLE WHILE STOPPED\nWS / 48 KHZ / STEREO\nSoundShared v0.1.0\n48 kHz / 16 bit / stereo · 4 tracks · 2 groups",
+      "lines": [
+        {
+          "text": "SOUNDSHARED",
+          "language": "en"
+        },
+        {
+          "text": "BROADCAST CONSOLE",
+          "language": "en"
+        },
+        {
+          "text": "MASTER 80%",
+          "language": "en"
+        },
+        {
+          "text": "PANIC",
+          "language": "en"
+        },
+        {
+          "text": "OFF AIR",
+          "language": "en"
+        },
+        {
+          "text": "SERVER STOPPED",
+          "language": "en"
+        },
+        {
+          "text": "01 / LIBRARY",
+          "language": "en"
+        },
+        {
+          "text": "SOUND LIBRARY 4 TRACKS",
+          "language": "en"
+        },
+        {
+          "text": "+ ADD SOUND",
+          "language": "en"
+        },
+        {
+          "text": "GROUPS +",
+          "language": "en"
+        },
+        {
+          "text": "All Sounds 04",
+          "language": "en"
+        },
+        {
+          "text": "Ungrouped 01",
+          "language": "en"
+        },
+        {
+          "text": "CATEGORIES",
+          "language": "en"
+        },
+        {
+          "text": "Combat 02",
+          "language": "en"
+        },
+        {
+          "text": "Ambience 01",
+          "language": "en"
+        },
+        {
+          "text": "intro-theme",
+          "language": "en"
+        },
+        {
+          "text": "48 KHZ / 00:42 / WAV",
+          "language": "en"
+        },
+        {
+          "text": "NO GROUP 100%",
+          "language": "en"
+        },
+        {
+          "text": "rain-ambience",
+          "language": "en"
+        },
+        {
+          "text": "48 KHZ / 01:00 / WAV",
+          "language": "en"
+        },
+        {
+          "text": "AMBIENCE 100%",
+          "language": "en"
+        },
+        {
+          "text": "applause",
+          "language": "en"
+        },
+        {
+          "text": "48 KHZ / 00:08 / WAV",
+          "language": "en"
+        },
+        {
+          "text": "COMBAT 100%",
+          "language": "en"
+        },
+        {
+          "text": "sword-hit",
+          "language": "en"
+        },
+        {
+          "text": "48 KHZ / 00:02 / WAV",
+          "language": "en"
+        },
+        {
+          "text": "COMBAT 100%",
+          "language": "en"
+        },
+        {
+          "text": "MASTER OUTPUT 80% MUTE",
+          "language": "en"
+        },
+        {
+          "text": "02 / NETWORK",
+          "language": "en"
+        },
+        {
+          "text": "NETWORK SERVER",
+          "language": "en"
+        },
+        {
+          "text": "OFF AIR",
+          "language": "en"
+        },
+        {
+          "text": "SERVER STOPPED",
+          "language": "en"
+        },
+        {
+          "text": "LISTEN URL",
+          "language": "en"
+        },
+        {
+          "text": "—",
+          "language": "en"
+        },
+        {
+          "text": "LISTENERS 00 PEAK 0",
+          "language": "en"
+        },
+        {
+          "text": "START SERVER",
+          "language": "en"
+        },
+        {
+          "text": "COPY LI",
+          "language": "en"
+        },
+        {
+          "text": "CONFIGURATION",
+          "language": "en"
+        },
+        {
+          "text": "PORT BIND ADDRESS",
+          "language": "en"
+        },
+        {
+          "text": "8080 0.0.0.0",
+          "language": "en"
+        },
+        {
+          "text": "EDITABLE WHILE STOPPED",
+          "language": "en"
+        },
+        {
+          "text": "WS / 48 KHZ / STEREO",
+          "language": "en"
+        },
+        {
+          "text": "SoundShared v0.1.0",
+          "language": "en"
+        },
+        {
+          "text": "48 kHz / 16 bit / stereo · 4 tracks · 2 groups",
+          "language": "en"
+        }
+      ]
+    },
+    "layout": {
+      "regions": [
+        {
+          "type": "toolbar",
+          "reading_order": 1,
+          "text": "SOUNDSHARED; BROADCAST CONSOLE; MASTER 80%; PANIC; OFF AIR; SERVER STOPPED",
+          "bbox": [
+            0,
+            0,
+            1378,
+            55
+          ],
+          "widgets": [
+            "red square logo",
+            "brand and subtitle",
+            "master slider",
+            "PANIC control",
+            "off-air status indicator"
+          ],
+          "issues": [
+            "The toolbar spans the image width; its main elements are aligned horizontally."
+          ]
+        },
+        {
+          "type": "library panel",
+          "reading_order": 2,
+          "text": "01 / LIBRARY; SOUND LIBRARY; 4 TRACKS; + ADD SOUND",
+          "bbox": [
+            0,
+            55,
+            967,
+            707
+          ],
+          "widgets": [
+            "section heading",
+            "track count",
+            "wide red ADD SOUND button",
+            "group rail",
+            "four track cards",
+            "master output controls"
+          ],
+          "issues": [
+            "The heading and add button occupy a consistent top row; a divider separates them from the library content."
+          ]
+        },
+        {
+          "type": "nav",
+          "reading_order": 3,
+          "text": "GROUPS +; All Sounds 04; Ungrouped 01; CATEGORIES; Combat 02; Ambience 01",
+          "bbox": [
+            24,
+            158,
+            168,
+            334
+          ],
+          "widgets": [
+            "add-group plus control",
+            "selected All Sounds row",
+            "Ungrouped row",
+            "Combat category",
+            "Ambience category",
+            "right-aligned item counts"
+          ],
+          "issues": [
+            "The left group rail is visibly rendered and aligned: labels occupy the left side, counts the right, and a red vertical marker identifies All Sounds as selected.",
+            "The rail ends above the remaining track-list space; it is not visibly clipped."
+          ]
+        },
+        {
+          "type": "track list",
+          "reading_order": 4,
+          "text": "intro-theme; rain-ambience; applause; sword-hit",
+          "bbox": [
+            191,
+            158,
+            943,
+            446
+          ],
+          "widgets": [
+            "four stacked track cards",
+            "red play button on each card",
+            "filename and audio metadata",
+            "group/category tag",
+            "per-track volume slider and 100% label",
+            "small square control at each row's right edge"
+          ],
+          "issues": [
+            "Cards have consistent widths and vertical spacing.",
+            "The cards begin to the right of the group rail without overlapping it."
+          ]
+        },
+        {
+          "type": "form",
+          "reading_order": 5,
+          "text": "MASTER OUTPUT; 80%; MUTE",
+          "bbox": [
+            24,
+            634,
+            943,
+            707
+          ],
+          "widgets": [
+            "master output label",
+            "horizontal slider",
+            "segmented level meter",
+            "percentage",
+            "MUTE button"
+          ],
+          "issues": [
+            "Controls are spread across a wide footer row with substantial empty space between the label and slider."
+          ]
+        },
+        {
+          "type": "network panel",
+          "reading_order": 6,
+          "text": "02 / NETWORK; NETWORK SERVER; OFF AIR; SERVER STOPPED",
+          "bbox": [
+            997,
+            55,
+            1339,
+            707
+          ],
+          "widgets": [
+            "section heading",
+            "status dot",
+            "off-air state",
+            "server-status subtitle"
+          ],
+          "issues": [
+            "The panel itself fits within the image, but a control in its action row extends beyond its right boundary."
+          ]
+        },
+        {
+          "type": "form",
+          "reading_order": 7,
+          "text": "LISTEN URL; —",
+          "bbox": [
+            1021,
+            223,
+            1323,
+            317
+          ],
+          "widgets": [
+            "listen URL field showing a dash",
+            "small square button beside the field"
+          ],
+          "issues": [
+            "The field and adjacent button fit within the network panel."
+          ]
+        },
+        {
+          "type": "status",
+          "reading_order": 8,
+          "text": "LISTENERS; 00; PEAK 0",
+          "bbox": [
+            1021,
+            339,
+            1323,
+            428
+          ],
+          "widgets": [
+            "two-digit listener count",
+            "short segmented indicator",
+            "peak count"
+          ],
+          "issues": [
+            "The count, indicator, and peak label share one horizontal row."
+          ]
+        },
+        {
+          "type": "button group",
+          "reading_order": 9,
+          "text": "START SERVER; COPY LI",
+          "bbox": [
+            1021,
+            451,
+            1378,
+            494
+          ],
+          "widgets": [
+            "wide red START SERVER button",
+            "partially visible outlined button to its right"
+          ],
+          "issues": [
+            "The outlined button starts around x=1338, at the network panel's right edge, and continues beyond the screenshot; its label and border are clipped."
+          ]
+        },
+        {
+          "type": "configuration",
+          "reading_order": 10,
+          "text": "CONFIGURATION; PORT; BIND ADDRESS; 8080; 0.0.0.0; EDITABLE WHILE STOPPED; WS / 48 KHZ / STEREO",
+          "bbox": [
+            1021,
+            516,
+            1323,
+            683
+          ],
+          "widgets": [
+            "port input",
+            "bind-address input",
+            "editability note",
+            "protocol/audio-format footer"
+          ],
+          "issues": [
+            "The editability note sits very close to the horizontal divider beneath it."
+          ]
+        },
+        {
+          "type": "status bar",
+          "reading_order": 11,
+          "text": "SoundShared v0.1.0; 48 kHz / 16 bit / stereo · 4 tracks · 2 groups",
+          "bbox": [
+            0,
+            754,
+            1378,
+            782
+          ],
+          "widgets": [
+            "application-version text",
+            "audio-format and library-count summary"
+          ],
+          "issues": [
+            "Additional faint content begins below the bar at the bottom edge and is cut off by the image."
+          ]
+        }
+      ]
+    },
+    "semantics": {
+      "scene": "A screenshot of a dark-themed egui desktop audio-broadcast application.",
+      "intent": "Manage sound clips and their playback levels, configure a network server, and monitor broadcast and listener status.",
+      "entities": [
+        {
+          "name": "SoundShared",
+          "type": "application",
+          "evidence": "Toolbar brand and bottom-left version text"
+        },
+        {
+          "name": "Sound Library",
+          "type": "panel",
+          "evidence": "Left panel heading and four track cards"
+        },
+        {
+          "name": "group rail",
+          "type": "navigation",
+          "evidence": "GROUPS and CATEGORIES lists on the left side of the library"
+        },
+        {
+          "name": "intro-theme",
+          "type": "audio track",
+          "evidence": "First track card"
+        },
+        {
+          "name": "rain-ambience",
+          "type": "audio track",
+          "evidence": "Second track card"
+        },
+        {
+          "name": "applause",
+          "type": "audio track",
+          "evidence": "Third track card"
+        },
+        {
+          "name": "sword-hit",
+          "type": "audio track",
+          "evidence": "Fourth track card"
+        },
+        {
+          "name": "Network Server",
+          "type": "panel",
+          "evidence": "Right panel heading and OFF AIR status"
+        },
+        {
+          "name": "START SERVER",
+          "type": "action",
+          "evidence": "Red button in the network panel"
+        }
+      ],
+      "relations": [
+        {
+          "subject": "Sound Library",
+          "predicate": "contains",
+          "object": "four audio tracks"
+        },
+        {
+          "subject": "All Sounds",
+          "predicate": "is selected in",
+          "object": "group rail"
+        },
+        {
+          "subject": "rain-ambience",
+          "predicate": "has category",
+          "object": "AMBIENCE"
+        },
+        {
+          "subject": "applause",
+          "predicate": "has category",
+          "object": "COMBAT"
+        },
+        {
+          "subject": "sword-hit",
+          "predicate": "has category",
+          "object": "COMBAT"
+        },
+        {
+          "subject": "Network Server",
+          "predicate": "has status",
+          "object": "OFF AIR / SERVER STOPPED"
+        },
+        {
+          "subject": "Network Server",
+          "predicate": "shows listener count",
+          "object": "00"
+        }
+      ]
+    },
+    "visual": {
+      "dominant_colors": [
+        "near-black",
+        "charcoal gray",
+        "bright crimson red",
+        "off-white",
+        "muted gray"
+      ],
+      "style": "Compact dark desktop dashboard with thin borders, monospaced uppercase metadata, red accent buttons and selection markers, and horizontally arranged audio controls.",
+      "notes": [
+        "Image dimensions are approximately 1378×790 pixels.",
+        "The library occupies approximately x=0–967; the network panel occupies x=997–1339, leaving a dark gap between them.",
+        "The selected All Sounds row has a red left border; the group rail appears correctly rendered.",
+        "Four uniform sound cards occupy the central area of the library panel.",
+        "The secondary button beside START SERVER overflows the network panel and is visibly clipped at the right image boundary.",
+        "Faint, partially cut-off content is visible at the very bottom."
+      ]
+    },
+    "uncertainty": [
+      "Only “COPY LI” is legible on the clipped button; its full label cannot be confirmed.",
+      "The tiny square icons at the ends of track rows and beside LISTEN URL are visible, but their functions cannot be determined from the image.",
+      "The faint content below the bottom status bar is too clipped and low-contrast to transcribe reliably.",
+      "The dash inside the LISTEN URL field may be a short hyphen rather than an em dash."
+    ]
+  },
+  "meta": {
+    "generatedAt": "2026-11-05T20:35:02.522Z",
+    "model": "cl/openai/gpt-6-sol",
+    "conversationId": null,
+    "durationSeconds": 32.48,
+    "usage": {
+      "prompt_tokens": 3722,
+      "completion_tokens": 3534,
+      "total_tokens": 7256,
+      "prompt_tokens_details": {
+        "audio_tokens": 0,
+        "cached_tokens": 0,
+        "video_tokens": 0
+      },
+      "completion_tokens_details": {
+        "image_tokens": 0,
+        "reasoning_tokens": 726
+      }
+    },
+    "attempts": [
+      {
+        "provider": "openai",
+        "ok": true,
+        "durationSeconds": 32.481
+      }
+    ],
+    "warnings": []
+  }
+}
