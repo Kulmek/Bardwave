@@ -21,15 +21,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 /// Whether an address is one another machine on the network could open.
 pub fn is_advertisable(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => !(v4.is_unspecified()
-            || v4.is_loopback()
-            || v4.is_broadcast()
-            || v4.is_multicast()
-            || v4.is_documentation()
-            || v4.is_link_local()
-            || is_benchmarking(v4)
-            || v4.octets()[0] == 0
-            || v4.octets()[0] >= 240),
+        IpAddr::V4(v4) => {
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || v4.is_link_local()
+                || is_benchmarking(v4)
+                || v4.octets()[0] == 0
+                || v4.octets()[0] >= 240)
+        }
         IpAddr::V6(v6) => {
             !(v6.is_unspecified()
                 || v6.is_loopback()
@@ -322,7 +324,13 @@ mod windows {
         // reports overflow instead of filling anything in.
         let mut size: u32 = 0;
         let probe = unsafe {
-            GetAdaptersAddresses(AF_UNSPEC, flags, ptr::null_mut(), ptr::null_mut(), &mut size)
+            GetAdaptersAddresses(
+                AF_UNSPEC,
+                flags,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut size,
+            )
         };
         if probe != ERROR_BUFFER_OVERFLOW || size == 0 {
             return Vec::new();
@@ -456,8 +464,14 @@ mod tests {
         let ula = v6("fd00::1");
 
         assert!(score(lan) > score(ten), "192.168 should win over 10/8");
-        assert!(score(ten) > score(dockerish), "10/8 should win over 172.16/12");
-        assert!(score(dockerish) > score(global), "a LAN beats a public address");
+        assert!(
+            score(ten) > score(dockerish),
+            "10/8 should win over 172.16/12"
+        );
+        assert!(
+            score(dockerish) > score(global),
+            "a LAN beats a public address"
+        );
         assert!(score(global) > score(tailscale));
         assert!(score(tailscale) > score(ula));
     }

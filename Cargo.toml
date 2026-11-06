@@ -52,6 +52,7 @@ egui = { workspace = true }
 eframe = { workspace = true }
 cpal = { workspace = true }
 symphonia = { workspace = true }
+opus = "0.4"
 tokio = { workspace = true }
 axum = { workspace = true }
 tokio-tungstenite = { workspace = true }

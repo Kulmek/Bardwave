@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
     <title>SoundShared | Red Noir</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23e11d48'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="style.css">
+    <script src="/opus-decoder.min.js" charset="UTF-8" defer></script>
     <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
 </head>
 <body>
@@ -84,6 +86,14 @@
                     <div class="stat-card">
                         <span class="stat-label">Underruns</span>
                         <span class="stat-value stat-mono text-red" id="statsUnderruns">0</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">Overruns</span>
+                        <span class="stat-value stat-mono" id="statsOverruns">0</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">Lost frames</span>
+                        <span class="stat-value stat-mono text-red" id="statsLost">0</span>
                     </div>
                 </section>
             </div>

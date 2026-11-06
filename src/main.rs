@@ -16,11 +16,13 @@ use soundshared::{
     config::{parse_bind_host, Config},
     error::{Result, SoundSharedError},
     gui::{
-        types::{AppState, AudioCommand, ServerCommand, ServerStatus},
         run_gui,
+        types::{AppState, AudioCommand, ServerCommand, ServerStatus},
     },
     network::{
-        broadcast::{AudioBroadcaster, AudioFrame, BroadcasterConfig, BroadcasterHandle, BroadcastError},
+        broadcast::{
+            AudioBroadcaster, AudioFrame, BroadcastError, BroadcasterConfig, BroadcasterHandle,
+        },
         local_ip::detect_for_bind,
         server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
         websocket::WebSocketConfig,
@@ -41,7 +43,11 @@ struct AudioProcessor {
 }
 
 impl AudioProcessor {
-    fn new(audio_rx: Receiver<MixedOutputBuffer>, broadcaster: BroadcasterHandle, shutdown_rx: Receiver<()>) -> Self {
+    fn new(
+        audio_rx: Receiver<MixedOutputBuffer>,
+        broadcaster: BroadcasterHandle,
+        shutdown_rx: Receiver<()>,
+    ) -> Self {
         Self {
             audio_rx,
             broadcaster,
@@ -116,7 +122,10 @@ async fn start_listener(
     let app_clone = app.clone();
     let mut shutdown_rx_for_server = shutdown_tx.subscribe();
     let task = tokio::spawn(async move {
-        info!("🌐 Server task started, beginning to serve on {}", actual_addr);
+        info!(
+            "🌐 Server task started, beginning to serve on {}",
+            actual_addr
+        );
         let _ = axum::serve(listener, app_clone)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx_for_server.recv().await;
@@ -362,20 +371,25 @@ fn main() -> Result<()> {
                 None => "Unknown panic",
             },
         };
-        let location = panic_info.location().map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let location = panic_info
+            .location()
+            .map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
         error!("PANIC: {}{}", msg, location);
-        
-        if let Ok(bt) = std::panic::catch_unwind(|| {
-            backtrace::Backtrace::new()
-        }) {
+
+        if let Ok(bt) = std::panic::catch_unwind(|| backtrace::Backtrace::new()) {
             error!("Backtrace:\n{:?}", bt);
         }
     }));
 
     // Load configuration
     let config = Config::load()?;
-    info!("Configuration loaded: server={}, audio_buffer={}, log_level={}", 
-        config.server_addr(), config.audio.buffer_size, config.logging.level);
+    info!(
+        "Configuration loaded: server={}, audio_buffer={}, log_level={}",
+        config.server_addr(),
+        config.audio.buffer_size,
+        config.logging.level
+    );
 
     // Initialize logging
     init_logging(&config)?;
@@ -395,12 +409,16 @@ fn main() -> Result<()> {
     let server_cmd_tx_for_start = server_cmd_tx.clone();
 
     // Create audio engine
-    let audio_engine = AudioEngine::new()
-        .map_err(|e| SoundSharedError::Audio(soundshared::error::AudioError::Engine(e.to_string())))?;
-    
+    let audio_engine = AudioEngine::new().map_err(|e| {
+        SoundSharedError::Audio(soundshared::error::AudioError::Engine(e.to_string()))
+    })?;
+
     // Set master volume from config
-    audio_engine.set_master_volume(config.audio.master_volume)
-        .map_err(|e| SoundSharedError::Audio(soundshared::error::AudioError::Mixer(e.to_string())))?;
+    audio_engine
+        .set_master_volume(config.audio.master_volume)
+        .map_err(|e| {
+            SoundSharedError::Audio(soundshared::error::AudioError::Mixer(e.to_string()))
+        })?;
 
     // Get the broadcast output receiver for WebSocket streaming
     let broadcast_output_rx = audio_engine.broadcast_output_receiver();
@@ -467,7 +485,11 @@ fn main() -> Result<()> {
         };
 
         let broadcaster = server_handle.broadcaster().clone();
-        let mut processor = AudioProcessor::new(broadcast_output_rx_for_processor, broadcaster, processor_shutdown_rx);
+        let mut processor = AudioProcessor::new(
+            broadcast_output_rx_for_processor,
+            broadcaster,
+            processor_shutdown_rx,
+        );
         processor.run();
     });
 
@@ -497,7 +519,9 @@ fn main() -> Result<()> {
 
         // There is no GUI to press "Start", so start the listener server here.
         let (response_tx, response_rx) = bounded::<anyhow::Result<String>>(1);
-        if let Err(e) = server_cmd_tx_for_start.send(ServerCommand::Start { response: response_tx }) {
+        if let Err(e) = server_cmd_tx_for_start.send(ServerCommand::Start {
+            response: response_tx,
+        }) {
             error!("Failed to request server start: {}", e);
         } else {
             match response_rx.recv_timeout(Duration::from_secs(5)) {
@@ -512,7 +536,8 @@ fn main() -> Result<()> {
         let (ctrlc_tx, ctrlc_rx) = bounded::<()>(1);
         ctrlc::set_handler(move || {
             let _ = ctrlc_tx.send(());
-        }).expect("Error setting Ctrl+C handler");
+        })
+        .expect("Error setting Ctrl+C handler");
 
         let _ = ctrlc_rx.recv();
 
@@ -555,8 +580,8 @@ fn main() -> Result<()> {
 
 /// Initialize logging based on configuration
 fn init_logging(config: &Config) -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter)

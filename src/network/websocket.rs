@@ -1,9 +1,9 @@
 //! WebSocket session handling for audio streaming
 
+use axum::extract::ws::{Message, WebSocket};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-use axum::extract::ws::{Message, WebSocket};
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::network::broadcast::{format_message, BroadcasterHandle};
@@ -216,8 +216,7 @@ impl WebSocketSession {
                         // its info panel guessed at startup.
                         match self.broadcaster.format_info().await {
                             Some(info) => {
-                                let _ =
-                                    self.msg_tx.try_send(Message::Text(format_message(&info)));
+                                let _ = self.msg_tx.try_send(Message::Text(format_message(&info)));
                             }
                             None => {
                                 // No audio has been mixed yet; the format is

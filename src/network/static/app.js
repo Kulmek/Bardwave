@@ -4,14 +4,26 @@
  * Wire format (server -> browser):
  *   [seq_no: u32 LE][pcm: f32 LE, interleaved stereo, 48 kHz]
  *
- * Playback uses an AudioWorklet with a ring buffer and a real jitter buffer:
+ * Playback uses an AudioWorklet with a ring buffer and a drift-correcting
+ * jitter buffer:
  *   - wait for ~200 ms before starting
  *   - rebuffer when the queue drops below ~30 ms
- *   - cap latency at ~1.5 s
+ *   - hold the queue at the target by consuming at 1 +/- a small factor
+ *     (fractional, Catmull-Rom interpolated read), so two independent audio
+ *     clocks never accumulate latency and no PCM is ever hard-dropped in
+ *     steady state
+ *   - catch up at up to +2% when latency creeps above the target
+ *   - clear-and-rebuffer (a clean resync with fade) when the queue exceeds the
+ *     hard cap, instead of skipping every other packet
  *   - fade in/out over ~8 ms to avoid clicks
  *
  * The worklet runs on the audio rendering thread and reports buffer/underrun
  * statistics back to the main thread. No per-callback allocation or slicing.
+ *
+ * The browser's AudioContext is created at the stream rate (48 kHz) when the
+ * browser supports it; if it ends up at a different rate (see initAudio), the
+ * worklet resamples the stream to the context rate on the fly through the same
+ * fractional reader, so a 48 -> 44.1 kHz context no longer floods the queue.
  */
 
 (function () {
@@ -27,10 +39,20 @@
         targetBufferMs: 200,
         // If the queue falls below this, pause and rebuffer.
         lowWaterMs: 30,
-        // Hard latency cap; older audio is discarded above this.
-        maxBufferMs: 1500,
-        // Ring buffer capacity.
-        capacityMs: 2000,
+        // Hard latency cap. Above this the queue is cleared and rebuffers on
+        // fresh audio (a clean resync) instead of hard-dropping every push,
+        // which is what produced continuous crackle before.
+        maxBufferMs: 1200,
+        // Ring buffer capacity, in stream time.
+        capacityMs: 2500,
+        // Frames this much older than the freshest arrival are dropped at
+        // ingress (burst backlog from the server must not flood the queue).
+        staleMs: 1200,
+        // Limits for the drift-correcting consumption step: up to ±2% while
+        // catching up (a short transient at the edge of perception), and
+        // effectively ~0 in steady state because the factor is proportional
+        // to how far the queue is from its target.
+        catchupLimit: 0.02,
         // UI refresh interval for fallback stats (ms).
         uiUpdateInterval: 100,
         reconnect: {
@@ -56,12 +78,22 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
             ? sampleRate
             : (opts.sampleRate || 48000);
 
-        this.capacityFrames = Math.ceil(this.sampleRate * (opts.capacitySeconds || 2));
+        // The wire stream rate. When the context rate differs the consumer
+        // resamples on the fly; the ring is always measured in *stream* frames.
+        this.streamRate = opts.streamRate || 48000;
+        this.rateRatio = this.sampleRate > 0
+            ? this.streamRate / this.sampleRate
+            : 1;
+
+        this.capacityFrames = Math.ceil(this.streamRate * (opts.capacitySeconds || 2.5));
         this.capacity = this.capacityFrames * this.channels;
         this.ring = new Float32Array(this.capacity);
 
-        this.writePos = 0;
-        this.readPos = 0;
+        // Write head (integer stream frames) and read head (fractional stream
+        // frames). Keeping the read fractional is what allows the consumption
+        // speed to be corrected without ever mutating the buffered PCM.
+        this.writeFrame = 0;
+        this.readFrame = 0;
         this.available = 0;
 
         this.started = false;
@@ -69,16 +101,23 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.fadeFrames = Math.max(1, Math.floor(this.sampleRate * 0.008));
         this.fadeStep = 1 / this.fadeFrames;
 
-        this.targetFrames = Math.floor(this.sampleRate * (opts.targetMs || 200) / 1000);
-        this.lowWaterFrames = Math.floor(this.sampleRate * (opts.lowWaterMs || 30) / 1000);
-        this.maxFrames = Math.floor(this.sampleRate * (opts.maxMs || 1500) / 1000);
+        this.targetFrames = Math.floor(this.streamRate * (opts.targetMs || 200) / 1000);
+        this.lowWaterFrames = Math.floor(this.streamRate * (opts.lowWaterMs || 30) / 1000);
+        this.maxFrames = Math.floor(this.streamRate * (opts.maxMs || 1200) / 1000);
+        this.catchupLimit = opts.catchupLimit || 0.02;
+        // Smoothed consumption-speed correction (see step()).
+        this.smoothedSpeed = 1;
+        this.rebuildFrames = Math.floor(this.streamRate * 0.04);
 
         this.underruns = 0;
         this.overruns = 0;
+        this.resyncs = 0;
         this.playedFrames = 0;
         this.receivedFrames = 0;
         this.lastReportPlayed = 0;
         this.lastReportReceived = 0;
+        // Reused per-sample readout (no allocation on the audio thread).
+        this.readOut = [0, 0];
 
         this.port.onmessage = (event) => this.onMessage(event.data);
     }
@@ -89,7 +128,53 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
             this.push(msg.samples);
         } else if (msg.type === 'reset') {
             this.reset();
+        } else if (msg.type === 'target' && typeof msg.targetMs === 'number') {
+            // Adaptive target (the main thread tracks arrival jitter).
+            const frames = Math.floor(this.streamRate * msg.targetMs / 1000);
+            this.targetFrames = Math.max(
+                this.lowWaterFrames * 2,
+                Math.min(this.maxFrames / 2, frames)
+            );
         }
+    }
+
+    // Consumption speed correction, in stream frames per context frame.
+    //
+    // The base ratio resamples the stream to the context rate. On top of that
+    // a small extra factor nudges the queue back towards the target, so clock
+    // drift and burst aftermath never accumulate: the factor is proportional
+    // to the queue's distance from the target, so in steady state it is
+    // exactly 1 and the correction a few clocks apart is tiny.
+    step() {
+        const excess = this.available - this.targetFrames;
+        // Deadband: inside +/-12 ms of the target the consumer runs at
+        // exactly 1.0. A proportional factor alone oscillates around the
+        // target (speed up -> overshoot -> slow down -> undershoot), which
+        // is audible as a slow pitch wobble; the deadband kills that cycle.
+        if (Math.abs(excess) < this.streamRate * 0.012) {
+            this.smoothedSpeed = 1;
+            return this.rateRatio;
+        }
+        let speed = 1;
+        if (excess > 0) {
+            // Above target: consume slightly faster to drain back down.
+            speed = 1 + Math.min(
+                this.catchupLimit,
+                excess / Math.max(1, this.targetFrames * 2)
+            );
+        } else if (-excess > this.rebuildFrames) {
+            // Materially below target: consume slightly slower to rebuild
+            // before the queue falls into an underrun rebuffer.
+            speed = 1 - Math.min(
+                this.catchupLimit,
+                -excess / Math.max(1, this.targetFrames * 4)
+            );
+        }
+        // Smooth the correction over ~100 ms so step changes between
+        // consecutive callbacks never become an audible ramp.
+        const alpha = 1 - Math.exp(-(this.sampleRate * 0.05) / 128);
+        this.smoothedSpeed += (speed - this.smoothedSpeed) * alpha;
+        return Math.max(0.5, this.rateRatio * this.smoothedSpeed);
     }
 
     push(samples) {
@@ -97,65 +182,80 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         if (frames <= 0) return;
 
         this.receivedFrames += frames;
-        let incoming = frames * this.channels;
 
+        // Jumbo packet guard: one packet larger than the whole ring would
+        // wrap the write past its own head. Drop the oldest part of it.
         if (frames > this.capacityFrames) {
-            const skipFrames = frames - this.capacityFrames;
-            samples = samples.subarray(skipFrames * this.channels);
-            incoming = this.capacityFrames * this.channels;
-            this.writePos = 0;
-            this.readPos = 0;
+            const skip = frames - this.capacityFrames;
+            samples = samples.subarray(skip * this.channels);
+            frames = this.capacityFrames;
+            this.readFrame = this.writeFrame;
             this.available = 0;
             this.overruns++;
-        }
-
-        if (this.available + incoming > this.capacity) {
-            const excessFrames = Math.ceil(
-                (this.available + incoming - this.capacity) / this.channels
-            );
-            this.discard(excessFrames);
+        } else if (this.available + frames > this.maxFrames) {
+            // Hard cap: the queue is hopelessly stale. Clear it and rebuffer
+            // on the fresh audio (the fade handles the transition, so it
+            // stays silent) instead of peeling one packet off the head of
+            // every push, which played every other packet for as long as the
+            // queue sat at the cap.
+            this.clear();
+            this.resyncs++;
+        } else if (this.available + frames > this.capacityFrames) {
+            this.discard(Math.ceil(this.available + frames - this.capacityFrames));
             this.overruns++;
         }
 
-        if (this.available + incoming > this.maxFrames * this.channels) {
-            const excessFrames = Math.ceil(
-                (this.available + incoming - this.maxFrames * this.channels) / this.channels
+        const first = Math.min(frames, this.capacityFrames - this.writeFrame);
+        this.ring.set(
+            samples.subarray(0, first * this.channels),
+            this.writeFrame * this.channels
+        );
+        if (first < frames) {
+            this.ring.set(
+                samples.subarray(first * this.channels, frames * this.channels),
+                0
             );
-            this.discard(excessFrames);
-            this.overruns++;
         }
+        this.writeFrame = (this.writeFrame + frames) % this.capacityFrames;
+        this.available += frames;
 
-        const first = Math.min(incoming, this.capacity - this.writePos);
-        this.ring.set(samples.subarray(0, first), this.writePos);
-        if (first < incoming) {
-            this.ring.set(samples.subarray(first, incoming), 0);
+        if (!this.started && this.available >= this.targetFrames) {
+            this.started = true;
+            this.report();
         }
-        this.writePos = (this.writePos + incoming) % this.capacity;
-        this.available += incoming;
 
         // Report while the buffer is filling so the UI shows progress even
         // though the audio thread is not consuming frames yet.
-        if (this.receivedFrames - this.lastReportReceived >= Math.floor(this.sampleRate / 10)) {
+        if (this.receivedFrames - this.lastReportReceived >= Math.floor(this.streamRate / 10)) {
             this.lastReportReceived = this.receivedFrames;
             this.report();
         }
     }
 
+    // Remove whole frames from the head of the queue (capacity overrun path).
     discard(frames) {
-        let samples = Math.min(frames * this.channels, this.available);
-        samples -= samples % this.channels;
-        this.readPos = (this.readPos + samples) % this.capacity;
-        this.available -= samples;
+        frames = Math.min(frames, Math.max(0, this.available));
+        this.readFrame = (this.readFrame + frames) % this.capacityFrames;
+        this.available -= frames;
+    }
+
+    // Clean resync: drop everything and rebuffer on fresh audio.
+    clear() {
+        this.available = 0;
+        this.readFrame = this.writeFrame;
+        this.started = false;
+        this.fadeGain = 0;
     }
 
     reset() {
-        this.writePos = 0;
-        this.readPos = 0;
+        this.writeFrame = 0;
+        this.readFrame = 0;
         this.available = 0;
         this.started = false;
         this.fadeGain = 0;
         this.underruns = 0;
         this.overruns = 0;
+        this.resyncs = 0;
         this.playedFrames = 0;
         this.receivedFrames = 0;
         this.lastReportPlayed = 0;
@@ -166,14 +266,38 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
     report() {
         this.port.postMessage({
             type: 'stats',
-            availableFrames: Math.floor(this.available / this.channels),
+            availableFrames: Math.floor(Math.max(0, this.available)),
             playedFrames: this.playedFrames,
             receivedFrames: this.receivedFrames,
             underruns: this.underruns,
             overruns: this.overruns,
+            resyncs: this.resyncs,
             started: this.started,
-            sampleRate: this.sampleRate
+            sampleRate: this.streamRate,
+            targetMs: this.targetFrames * 1000 / this.streamRate
         });
+    }
+
+    // Catmull-Rom interpolation of one interleaved frame at a fractional
+    // stream-frame position. Requires at least ~4 frames of queue. Results
+    // land in a preallocated buffer: no per-sample allocation on the audio
+    // rendering thread.
+    readCubicPos(pos, out) {
+        const c = this.capacityFrames;
+        const f = Math.floor(pos);
+        const t = pos - f;
+        for (let ch = 0; ch < this.channels; ch++) {
+            const y0 = this.ring[(((f - 1) % c + c) % c) * this.channels + ch];
+            const y1 = this.ring[(f % c) * this.channels + ch];
+            const y2 = this.ring[((f + 1) % c) * this.channels + ch];
+            const y3 = this.ring[((f + 2) % c) * this.channels + ch];
+            out[ch] = y1 + 0.5 * t * (
+                y2 - y0 +
+                t * (2 * y0 - 5 * y1 + 4 * y2 - y3 +
+                t * (3 * (y1 - y2) + y3 - y0))
+            );
+        }
+        return out;
     }
 
     process(inputs, outputs) {
@@ -182,25 +306,31 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         const right = output.length > 1 ? output[1] : null;
         const frames = left.length;
 
-        const targetSamples = this.targetFrames * this.channels;
-        const lowSamples = this.lowWaterFrames * this.channels;
-
-        if (!this.started && this.available >= targetSamples) {
-            this.started = true;
-            this.report();
-        }
-
         for (let i = 0; i < frames; i++) {
             let l = 0;
             let r = 0;
             const consuming = this.started || this.fadeGain > 0;
 
-            if (consuming && this.available >= this.channels) {
-                l = this.ring[this.readPos];
-                r = this.ring[this.readPos + 1];
-                this.readPos = (this.readPos + this.channels) % this.capacity;
-                this.available -= this.channels;
+            if (consuming && this.available >= 6) {
+                const step = this.step();
+                const out = this.readCubicPos(this.readFrame, this.readOut);
+                l = out[0];
+                r = this.channels > 1 ? out[1] : out[0];
+                this.readFrame += step;
+                if (this.readFrame >= this.capacityFrames) {
+                    this.readFrame -= this.capacityFrames;
+                }
+                this.available = Math.max(0, this.available - step);
                 this.playedFrames++;
+            } else if (consuming && this.available <= 0) {
+                // The queue is completely empty. Park the read head exactly
+                // at the write frontier so the next packet resumes at fresh
+                // audio instead of straddling a gap of stale ring memory.
+                // A queue that is merely *small* (1-5 frames) must be left
+                // alone: the read head already points at its start.
+                this.readFrame = this.writeFrame;
+                this.available = 0;
+                this.fadeGain = Math.min(this.fadeGain, 0.5);
             }
 
             if (this.started) {
@@ -215,7 +345,7 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
             }
         }
 
-        if (this.started && this.available < lowSamples) {
+        if (this.started && this.available < this.lowWaterFrames) {
             this.started = false;
             this.underruns++;
             this.report();
@@ -233,73 +363,137 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     // =========================================================================
     // Main-thread ring buffer (ScriptProcessor fallback only)
+    //
+    // Mirrors the worklet's semantics: stream-time capacity, a hard cap that
+    // clears and rebuffers instead of hard-dropping, and a fractional read
+    // head so a context rate other than the stream rate still resamples.
     // =========================================================================
     class RingBuffer {
-        constructor(capacityFrames, channels, maxFrames) {
+        constructor(capacityFrames, channels, maxFrames, streamRate, contextRate, targetMs, catchupLimit) {
             this.channels = channels;
             this.capacityFrames = capacityFrames;
             this.capacity = capacityFrames * channels;
             this.maxFrames = maxFrames;
+            this.streamRate = streamRate;
+            this.rateRatio = contextRate > 0 ? streamRate / contextRate : 1;
+            this.targetFrames = Math.floor(streamRate * ((targetMs == null ? 200 : targetMs) / 1000));
+            this.catchupLimit = catchupLimit || 0.02;
+            // Drift control (mirrors the worklet): the consumption speed is
+            // nudged by how far the queue sits from its target, so two
+            // independent audio clocks never drag latency up to the hard cap.
+            this.rebuildFrames = Math.floor(streamRate * 0.04);
             this.buffer = new Float32Array(this.capacity);
-            this.writePos = 0;
-            this.readPos = 0;
+            this.writeFrame = 0;
+            this.readFrame = 0;
             this.available = 0;
             this.overruns = 0;
+            this.resyncs = 0;
+            // Smoothed consumption-speed correction (see speed()).
+            this.smoothedSpeed = 1;
+            // Reused per-sample readout (no allocation in the render loop).
+            this.takeOut = [0, 0];
+        }
+
+        setTargetMs(targetMs) {
+            if (typeof targetMs === 'number' && targetMs > 30) {
+                this.targetFrames = Math.max(
+                    this.rebuildFrames * 2,
+                    Math.min(Math.floor(this.maxFrames / 2), Math.floor(this.streamRate * targetMs / 1000))
+                );
+            }
         }
 
         push(samples) {
             let frames = Math.floor(samples.length / this.channels);
             if (frames <= 0) return;
 
-            let incoming = frames * this.channels;
-
+            // Jumbo packet guard: a packet larger than the ring would wrap
+            // the write past its own head. Drop the oldest part of it.
             if (frames > this.capacityFrames) {
-                const skipFrames = frames - this.capacityFrames;
-                samples = samples.subarray(skipFrames * this.channels);
-                incoming = this.capacityFrames * this.channels;
-                this.writePos = 0;
-                this.readPos = 0;
+                const skip = frames - this.capacityFrames;
+                samples = samples.subarray(skip * this.channels);
+                frames = this.capacityFrames;
                 this.available = 0;
+                this.readFrame = this.writeFrame;
                 this.overruns++;
+                return;
             }
 
-            if (this.available + incoming > this.capacity) {
-                const excessFrames = Math.ceil(
-                    (this.available + incoming - this.capacity) / this.channels
+            // Same hard-cap resync as the worklet: clear and rebuffer on
+            // fresh audio instead of dropping one packet per push.
+            if (this.available + frames > this.maxFrames) {
+                this.available = 0;
+                this.readFrame = this.writeFrame;
+                this.resyncs++;
+            }
+
+            const first = Math.min(frames, this.capacityFrames - this.writeFrame);
+            this.buffer.set(
+                samples.subarray(0, first * this.channels),
+                this.writeFrame * this.channels
+            );
+            if (first < frames) {
+                this.buffer.set(
+                    samples.subarray(first * this.channels, frames * this.channels),
+                    0
                 );
-                this.discard(excessFrames);
-                this.overruns++;
             }
-
-            if (this.available + incoming > this.maxFrames * this.channels) {
-                const excessFrames = Math.ceil(
-                    (this.available + incoming - this.maxFrames * this.channels) / this.channels
-                );
-                this.discard(excessFrames);
-                this.overruns++;
-            }
-
-            const first = Math.min(incoming, this.capacity - this.writePos);
-            this.buffer.set(samples.subarray(0, first), this.writePos);
-            if (first < incoming) {
-                this.buffer.set(samples.subarray(first, incoming), 0);
-            }
-            this.writePos = (this.writePos + incoming) % this.capacity;
-            this.available += incoming;
+            this.writeFrame = (this.writeFrame + frames) % this.capacityFrames;
+            this.available += frames;
         }
 
-        discard(frames) {
-            let samples = Math.min(frames * this.channels, this.available);
-            samples -= samples % this.channels;
-            this.readPos = (this.readPos + samples) % this.capacity;
-            this.available -= samples;
+        // Consumption-speed correction, mirroring the worklet's step(): the
+        // base ratio resamples the stream to the context rate, the extra
+        // factor nudges the queue back towards the target.
+        speed() {
+            const excess = this.available - this.targetFrames;
+            // Same deadband + smoothing as the worklet's step(): a bare
+            // proportional factor oscillates around the target, which is
+            // audible as a slow pitch wobble.
+            if (Math.abs(excess) < this.streamRate * 0.012) {
+                this.smoothedSpeed = 1;
+                return this.rateRatio;
+            }
+            let s = 1;
+            if (excess > 0) {
+                s = 1 + Math.min(
+                    this.catchupLimit,
+                    excess / Math.max(1, this.targetFrames * 2)
+                );
+            } else if (-excess > this.rebuildFrames) {
+                s = 1 - Math.min(
+                    this.catchupLimit,
+                    -excess / Math.max(1, this.targetFrames * 4)
+                );
+            }
+            this.smoothedSpeed += (s - this.smoothedSpeed) * 0.02;
+            return Math.max(0.5, this.rateRatio * this.smoothedSpeed);
+        }
+
+        // Take one output frame (interleaved) via linear interpolation
+        // relative to the stream rate. Returns null when the queue is empty.
+        take(step) {
+            if (this.available < 2) return null;
+            const c = this.capacityFrames;
+            const f = Math.floor(this.readFrame);
+            const t = this.readFrame - f;
+            for (let ch = 0; ch < this.channels; ch++) {
+                const y1 = this.buffer[(f % c) * this.channels + ch];
+                const y2 = this.buffer[((f + 1) % c) * this.channels + ch];
+                this.takeOut[ch] = y1 + t * (y2 - y1);
+            }
+            this.readFrame += step;
+            if (this.readFrame >= c) this.readFrame -= c;
+            this.available = Math.max(0, this.available - step);
+            return this.takeOut;
         }
 
         reset() {
-            this.writePos = 0;
-            this.readPos = 0;
+            this.writeFrame = 0;
+            this.readFrame = 0;
             this.available = 0;
             this.overruns = 0;
+            this.resyncs = 0;
             this.buffer.fill(0);
         }
     }
@@ -334,12 +528,38 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         bufferFrames: 0,
         bufferSampleRate: CONFIG.sampleRate,
         workletStarted: false,
+        workletTargetMs: CONFIG.targetBufferMs,
         packetsReceived: 0,
         framesReceived: 0,
         framesPlayed: 0,
         underruns: 0,
         overruns: 0,
+        resyncs: 0,
+        staleDropped: 0,
         missedFrames: 0,
+
+        // Arrival-clock sync (level 3). Anchored on the first packet of a
+        // connection; `minResidualMs` is the lowest observed local-vs-server
+        // offset (the network's lower bound), so `ageMs` estimates how far
+        // behind the freshest arrival a packet is. Grossly stale packets from
+        // a server backlog burst are dropped at ingress instead of flooding
+        // the jitter queue and blowing past its hard cap.
+        anchorLocal: null,
+        anchorRemote: null,
+        minResidualMs: null,
+
+        // Wire codec and its WASM decoder ('pcm' keeps the legacy f32 path).
+        streamCodec: 'opus',
+        opusDecoder: null,
+        opusDecoderPromise: null,
+        // Decoding happens on microtasks, so packets ride a promise chain to
+        // stay in arrival order.
+        decodeChain: null,
+
+        // Adaptive target (arrival jitter EMA drives the jitter-buffer target).
+        lastPacketMs: null,
+        jitterMs: 0,
+        lastTargetEval: 0,
 
         // Sequence tracking
         lastSeqNo: null,
@@ -396,6 +616,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         els.statsReceived = document.getElementById('statsReceived');
         els.statsPlayed = document.getElementById('statsPlayed');
         els.statsUnderruns = document.getElementById('statsUnderruns');
+        els.statsOverruns = document.getElementById('statsOverruns');
+        els.statsLost = document.getElementById('statsLost');
     }
 
     // =========================================================================
@@ -407,6 +629,19 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     function error() {
         console.error('[SoundShared]', new Date().toISOString(), ...arguments);
+    }
+
+    // Switch the wire codec as announced by the server and prime the decoder
+    // ahead of the first packet (loading the WASM module is ~100 ms).
+    function setStreamCodec(codec) {
+        if (state.streamCodec === codec) return;
+        state.streamCodec = codec;
+        state.opusDecoder = null;
+        state.opusDecoderPromise = null;
+        if (codec === 'opus') {
+            ensureOpusDecoder();
+        }
+        log('Wire codec set to', codec);
     }
 
     function formatNumber(value) {
@@ -492,11 +727,13 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         const sampleRate = (format && format.sample_rate) || CONFIG.sampleRate;
         const channels = (format && format.channels) || CONFIG.channels;
-        const formatName = String((format && format.format) || 'f32').toUpperCase();
+        const codec = String((format && format.format) || 'opus');
 
         els.infoProtocol.textContent =
-            formatName + ' / ' + Math.round(sampleRate / 1000) + 'KHZ';
+            codec.toUpperCase() + ' / ' + Math.round(sampleRate / 1000) + 'KHZ';
+        // Opus is sent at a configured bitrate; PCM would be the raw budget.
         els.infoBitrate.textContent =
+            codec === 'opus' ? '96 KBPS' :
             Math.round((sampleRate * channels * 32) / 1000) + ' KBPS';
     }
 
@@ -506,8 +743,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         const frames = Math.max(0, state.bufferFrames);
         const sampleRate = state.bufferSampleRate || CONFIG.sampleRate;
         const ms = (frames / sampleRate) * 1000;
-        const target = CONFIG.targetBufferMs;
-        const pct = Math.max(0, Math.min(1, ms / target));
+        // The scale runs to the hard cap, not the target: at the healthy
+        // 200 ms prebuffer the bar used to already look "maxed out", which
+        // made real overruns impossible to see. The target is a marker here.
+        const target = Math.round(state.workletTargetMs || CONFIG.targetBufferMs);
+        const pct = Math.max(0, Math.min(1, ms / CONFIG.maxBufferMs));
         const activeCells = Math.round(pct * bufferCells.length);
 
         els.bufferText.textContent = Math.round(ms) + 'ms / ' + target + 'ms';
@@ -517,13 +757,17 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             bufferCells[i].classList.toggle('active', active);
             bufferCells[i].classList.toggle(
                 'warn',
-                active && ms > CONFIG.maxBufferMs * 0.75
+                active && ms > target * 1.5
             );
         }
 
         els.bufferGrid.classList.toggle(
             'is-low',
             state.streamActive && ms < CONFIG.lowWaterMs
+        );
+        els.bufferGrid.classList.toggle(
+            'is-over',
+            state.streamActive && ms > target * 1.5
         );
     }
 
@@ -536,6 +780,14 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         }
         if (els.statsUnderruns) {
             els.statsUnderruns.textContent = formatNumber(state.underruns);
+        }
+        if (els.statsOverruns) {
+            els.statsOverruns.textContent = formatNumber(
+                state.overruns + state.staleDropped
+            );
+        }
+        if (els.statsLost) {
+            els.statsLost.textContent = formatNumber(state.missedFrames);
         }
     }
 
@@ -614,12 +866,15 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         state.audioContext = context;
         if (context.sampleRate !== CONFIG.sampleRate) {
+            // The stream is 48 kHz; the worklet's fractional reader resamples
+            // it to the context rate on the fly, so this mismatch no longer
+            // floods the jitter queue (it used to grow without bound here).
             log(
                 'AudioContext sample rate is',
                 context.sampleRate,
                 'Hz; source stream is',
                 CONFIG.sampleRate,
-                'Hz'
+                'Hz (resampling in the worklet)'
             );
         }
 
@@ -643,11 +898,13 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 outputChannelCount: [CONFIG.channels],
                 processorOptions: {
                     sampleRate: CONFIG.sampleRate,
+                    streamRate: CONFIG.sampleRate,
                     channels: CONFIG.channels,
                     targetMs: CONFIG.targetBufferMs,
                     lowWaterMs: CONFIG.lowWaterMs,
                     maxMs: CONFIG.maxBufferMs,
-                    capacitySeconds: CONFIG.capacityMs / 1000
+                    capacitySeconds: CONFIG.capacityMs / 1000,
+                    catchupLimit: CONFIG.catchupLimit
                 }
             });
 
@@ -660,7 +917,14 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             state.playbackMode = 'worklet';
             log('AudioWorklet ready');
         } catch (workletError) {
-            error('AudioWorklet unavailable; using ScriptProcessor fallback:', workletError);
+            // The usual cause is an insecure context: AudioWorklet (like all
+            // worklets) is a secure-context-only API, so plain http:// LAN
+            // addresses fall back to the deprecated ScriptProcessor path.
+            error(
+                'AudioWorklet unavailable; using ScriptProcessor fallback:',
+                workletError,
+                window.isSecureContext ? '' : '(page is not a secure context)'
+            );
             setupScriptProcessor();
         }
 
@@ -675,7 +939,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.scriptRing = new RingBuffer(
             Math.ceil((CONFIG.sampleRate * CONFIG.capacityMs) / 1000),
             CONFIG.channels,
-            Math.floor((CONFIG.sampleRate * CONFIG.maxBufferMs) / 1000)
+            Math.floor((CONFIG.sampleRate * CONFIG.maxBufferMs) / 1000),
+            CONFIG.sampleRate,
+            context.sampleRate,
+            CONFIG.targetBufferMs,
+            CONFIG.catchupLimit
         );
 
         const processor = context.createScriptProcessor(
@@ -703,7 +971,11 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.framesPlayed = msg.playedFrames;
         state.underruns = msg.underruns;
         state.overruns = msg.overruns;
+        state.resyncs = msg.resyncs || 0;
         state.workletStarted = msg.started;
+        if (typeof msg.targetMs === 'number') {
+            state.workletTargetMs = msg.targetMs;
+        }
 
         updateBufferUI();
         updateStatsUI();
@@ -717,13 +989,15 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         const outR = event.outputBuffer.getChannelData(1);
         const frames = outL.length;
 
-        const targetSamples =
-            Math.floor((CONFIG.sampleRate * CONFIG.targetBufferMs) / 1000) * CONFIG.channels;
-        const lowSamples =
-            Math.floor((CONFIG.sampleRate * CONFIG.lowWaterMs) / 1000) * CONFIG.channels;
+        // Queue levels are measured in stream time (the ring stores stream
+        // frames), thresholds are in context frames, so convert on both sides.
+        const lowFrames =
+            Math.floor((CONFIG.sampleRate * CONFIG.lowWaterMs) / 1000);
         const fadeStep = 1 / Math.max(1, Math.floor(CONFIG.sampleRate * 0.008));
+        // The adaptive target may move; feed it to the ring's drift control.
+        ring.setTargetMs(state.workletTargetMs);
 
-        if (!state.scriptStarted && ring.available >= targetSamples) {
+        if (!state.scriptStarted && ring.available >= ring.targetFrames) {
             state.scriptStarted = true;
         }
 
@@ -732,12 +1006,17 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             let r = 0;
             const consuming = state.scriptStarted || state.scriptFade > 0;
 
-            if (consuming && ring.available >= CONFIG.channels) {
-                l = ring.buffer[ring.readPos];
-                r = ring.buffer[ring.readPos + 1];
-                ring.readPos = (ring.readPos + CONFIG.channels) % ring.capacity;
-                ring.available -= CONFIG.channels;
+            if (consuming && ring.available > 4) {
+                const out = ring.take(ring.speed());
+                l = out[0];
+                r = out[1];
                 state.framesPlayed++;
+            } else if (consuming && ring.available <= 0) {
+                // Queue empty: park the read head at the write frontier so a
+                // refill resumes at fresh audio (mirror of the worklet).
+                ring.readFrame = ring.writeFrame;
+                ring.available = 0;
+                state.scriptFade = Math.min(state.scriptFade, 0.5);
             }
 
             if (state.scriptStarted) {
@@ -750,13 +1029,15 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             outR[i] = r * state.scriptFade;
         }
 
-        if (state.scriptStarted && ring.available < lowSamples) {
+        if (state.scriptStarted && ring.available < lowFrames) {
             state.scriptStarted = false;
             state.underruns++;
         }
 
-        state.bufferFrames = Math.floor(ring.available / CONFIG.channels);
+        state.bufferFrames = Math.floor(ring.available);
+        state.bufferSampleRate = CONFIG.sampleRate;
         state.overruns = ring.overruns;
+        state.resyncs = ring.resyncs;
 
         const now = performance.now();
         if (now - state.lastUiUpdate >= CONFIG.uiUpdateInterval) {
@@ -782,29 +1063,202 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     // =========================================================================
     // Audio frame parsing
+    //
+    // Wire format: [seq_no u32 LE][server_ms u32 LE][payload]
+    // The payload is one Opus packet (see broadcast.rs). `server_ms` counts
+    // stream time on the server and drives both the staleness check and the
+    // adaptive target below. Decoding happens through `opus-decoder` (WASM,
+    // served by the server): its decodeFrame resolves on the microtask queue,
+    // so packets are pushed onto a promise chain that preserves arrival order
+    // even though decoding itself returns a Promise.
     // =========================================================================
-    function handleBinary(arrayBuffer) {
-        if (!arrayBuffer || arrayBuffer.byteLength < 8) return;
 
-        const pcmBytes = arrayBuffer.byteLength - 4;
-        if (pcmBytes % 4 !== 0) {
-            log('Dropping malformed frame: PCM length is not 4-byte aligned', pcmBytes);
-            return;
+    // Lazily create the WASM Opus decoder once per session. The library is a
+    // UMD bundle served from /opus-decoder.min.js (script tag in index.html);
+    // in the browser it registers the global `window['opus-decoder']`.
+    function ensureOpusDecoder() {
+        if (state.opusDecoder) return Promise.resolve(state.opusDecoder);
+        if (state.opusDecoderPromise) return state.opusDecoderPromise;
+
+        const lib = (window && window['opus-decoder']) || null;
+        if (!lib || !lib.OpusDecoder) {
+            const err = new Error('Opus decoder script is not loaded');
+            error('Opus decoder unavailable:', err.message);
+            return Promise.reject(err);
         }
 
-        const sampleCount = pcmBytes / 4;
-        if (sampleCount < CONFIG.channels || sampleCount % CONFIG.channels !== 0) {
-            log('Dropping malformed frame: invalid sample count', sampleCount);
+        try {
+            const decoder = new lib.OpusDecoder({
+                sampleRate: CONFIG.sampleRate,
+                upgradeChannelCount: true,
+                channels: CONFIG.channels
+            });
+            state.opusDecoderPromise = decoder
+                .ready()
+                .then(() => {
+                    state.opusDecoder = decoder;
+                    log('Opus decoder ready (WASM)');
+                    return decoder;
+                })
+                .catch((e) => {
+                    error('Opus decoder failed to initialize:', e);
+                    state.opusDecoderPromise = null;
+                    throw e;
+                });
+        } catch (e) {
+            error('Failed to create the Opus decoder:', e);
+            return Promise.reject(e);
+        }
+        return state.opusDecoderPromise;
+    }
+
+    function handleBinary(arrayBuffer) {
+        if (!arrayBuffer || arrayBuffer.byteLength < 12) return;
+
+        const payloadBytes = arrayBuffer.byteLength - 8;
+        if (payloadBytes <= 0) {
+            log('Dropping malformed frame: missing payload');
             return;
         }
 
         const view = new DataView(arrayBuffer);
         const seq = view.getUint32(0, true);
-        const samples = new Float32Array(arrayBuffer, 4, sampleCount);
-        const frames = sampleCount / CONFIG.channels;
+        const serverMs = view.getUint32(4, true);
+        const now = performance.now();
+        // Opus arrives in fixed 10 ms frames (the server announces frame_size);
+        // the exact count is known per packet after decoding.
+        const framesMs = state.lastPacketFrames
+            ? state.lastPacketFrames * 1000 / CONFIG.sampleRate
+            : 10;
 
-        // Sequence gap detection. Insert silence for short gaps so the
-        // playback timeline stays aligned; ignore huge jumps (reconnect).
+        // ----- Arrival-clock sync (level 3) -----
+        // Anchor every connection on its first packet and keep the lowest
+        // local-vs-server offset ever observed: that is the network's floor,
+        // so `ageMs` approximates how stale a packet is relative to the
+        // freshest arrival without any wall-clock handshake. A long gap in
+        // packets invalidates the anchor (the server pauses publishing when
+        // nothing plays, and its stream clock freezes), so re-anchor instead
+        // of letting every future packet look ancient.
+        if (
+            state.anchorLocal === null ||
+            (state.lastPacketMs !== null && now - state.lastPacketMs > 2000)
+        ) {
+            state.anchorLocal = now;
+            state.anchorRemote = serverMs;
+            state.minResidualMs = null;
+        }
+
+        const residual = now - (state.anchorLocal + (serverMs - state.anchorRemote));
+        if (state.minResidualMs === null || residual < state.minResidualMs) {
+            state.minResidualMs = residual;
+        }
+        const ageMs = residual - state.minResidualMs;
+
+        // ----- Adaptive target (arrival jitter tracking) -----
+        if (state.lastPacketMs !== null) {
+            const delta = now - state.lastPacketMs;
+            if (delta < 2000) {
+                const expected = framesMs || 10;
+                state.jitterMs = state.jitterMs * 0.9 +
+                    Math.abs(delta - expected) * 0.1;
+            } else {
+                // A long pause is not jitter; let the estimate relax.
+                state.jitterMs *= 0.9;
+            }
+        }
+
+        const targetMs = Math.max(
+            CONFIG.targetBufferMs,
+            Math.min(400, Math.round(CONFIG.targetBufferMs + state.jitterMs * 1.5))
+        );
+        if (now - state.lastTargetEval >= 1000) {
+            state.lastTargetEval = now;
+            if (targetMs !== state.workletTargetMs) {
+                state.workletTargetMs = targetMs;
+                if (state.workletNode) {
+                    state.workletNode.port.postMessage(
+                        { type: 'target', targetMs: targetMs }
+                    );
+                }
+            }
+        }
+
+        // Grossly stale backlog (a burst queued server-side) is dropped at
+        // ingress: feeding it to the jitter queue would blow straight past
+        // the hard cap and force a panic resync for audio nobody wants.
+        if (ageMs > CONFIG.staleMs) {
+            state.staleDropped++;
+            state.lastSeqNo = seq;
+            state.lastPacketMs = now;
+            return;
+        }
+
+        const payload = new Uint8Array(arrayBuffer, 8, payloadBytes);
+
+        if (state.streamCodec === 'opus') {            // Push onto the decode chain: order of arrival is preserved, and
+            // decodeFrame resolves on the microtask queue (WASM-synchronous).
+            // The chain is never reset mid-session — each link is tiny, and
+            // clearing the tail could break packet ordering under load.
+            let runDecode = state.decodeChain
+                ? state.decodeChain.then(() => decodeOpusPayload(payload))
+                : decodeOpusPayload(payload);
+            state.decodeChain = runDecode
+                .then((samples) => processAudioFrame(samples, seq, now));
+        } else if (payloadBytes % 4 === 0) {
+            // Legacy f32 PCM path (no longer produced by the server; kept so
+            // mixed-version clients keep playing while testing).
+            processAudioFrame(new Float32Array(arrayBuffer, 8), seq, now);
+        } else {
+            log('Dropping malformed frame: codec unknown', state.streamCodec);
+            state.lastSeqNo = seq;
+            state.lastPacketMs = now;
+        }
+    }
+
+    // Decode one Opus packet through the WASM decoder (loading it on first
+    // use). `opus-decoder` returns `channelData` — per-channel Float32Arrays —
+    // not interleaved `samples`. Interleave to match the ring buffer and
+    // worklet. Returns decoded interleaved f32 samples, or an empty buffer on
+    // failure so the pipeline keeps moving.
+    function decodeOpusPayload(payload) {
+        const decoder = state.opusDecoder;
+        const run = (d) =>
+            d.decodeFrame(payload).then((result) => {
+                if (!result || !result.channelData) {
+                    return new Float32Array(0);
+                }
+                const channels = result.channelData;
+                if (channels.length === 0) {
+                    return new Float32Array(0);
+                }
+                const frames = channels[0].length;
+                const interleaved = new Float32Array(frames * channels.length);
+                for (let f = 0; f < frames; f++) {
+                    for (let c = 0; c < channels.length; c++) {
+                        interleaved[f * channels.length + c] = channels[c][f];
+                    }
+                }
+                return interleaved;
+            });
+        if (decoder) {
+            return run(decoder);
+        }
+        return ensureOpusDecoder().then((d) => run(d));
+    }
+
+    // The shared tail of every frame: sequence-gap silence insertion and
+    // buffering. Called with decoded (interleaved f32) samples.
+    function processAudioFrame(samples, seq, now) {
+        const frames = samples.length / CONFIG.channels;
+
+        // Sequence gap detection.
+        //
+        // Opus sends every 10 ms frame, so a gap means a packet was lost on
+        // the wire. Inserting hard silence here creates a click at every
+        // loss — instead, track the missed frames and let the worklet's
+        // underrun fade handle the gap silently. The legacy PCM path (no
+        // longer produced by the server) keeps silence insertion so
+        // mixed-version clients don't lose timeline alignment.
         if (state.lastSeqNo !== null) {
             const gap = (seq - state.lastSeqNo) >>> 0;
 
@@ -814,13 +1268,20 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
             if (gap > 1) {
                 const missed = gap - 1;
-                if (missed <= 50 && state.lastPacketFrames > 0) {
-                    const silenceSamples =
-                        missed * state.lastPacketFrames * CONFIG.channels;
-                    pushSamples(new Float32Array(silenceSamples));
-                    state.missedFrames += missed;
+                state.missedFrames += missed;
+                if (state.streamCodec !== 'opus') {
+                    // Legacy PCM: fill the gap with silence so the playback
+                    // timeline stays aligned. Opus does not do this — hard
+                    // silence on packet loss is exactly the "пердёж" click.
+                    if (missed <= 50 && state.lastPacketFrames > 0) {
+                        const silenceSamples =
+                            missed * state.lastPacketFrames * CONFIG.channels;
+                        pushSamples(new Float32Array(silenceSamples));
+                    } else {
+                        log('Large sequence gap; skipping silence insertion:', missed);
+                    }
                 } else {
-                    log('Large sequence gap; skipping silence insertion:', missed);
+                    log('Opus sequence gap, skipping silence (worklet fade covers it):', missed);
                 }
             }
         }
@@ -829,13 +1290,18 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.lastPacketFrames = frames;
         state.packetsReceived++;
         state.framesReceived += frames;
-        state.lastPacketAt = performance.now();
+        state.lastPacketAt = now;
+        state.lastPacketMs = now;
         state.streamActive = true;
 
         pushSamples(samples);
 
         if (state.packetsReceived === 1) {
-            setSystemToast('Stream active. Decoding 48 kHz PCM.', true, 'lucide:radio');
+            setSystemToast(
+                'Stream active. ' +
+                (state.streamCodec === 'opus' ? 'Decoding Opus.' : 'PCM 48 kHz.'),
+                true, 'lucide:radio'
+            );
             hideMessage();
         }
 
@@ -848,6 +1314,9 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         switch (msg.type) {
             case 'format':
                 updateInfoUI(msg.data || {});
+                setStreamCodec(
+                    msg.data && msg.data.format === 'pcm' ? 'pcm' : 'opus'
+                );
                 log('Server format:', msg.data);
                 break;
 
@@ -1070,14 +1539,27 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     function resetAudioPipeline() {
         state.bufferFrames = 0;
         state.workletStarted = false;
+        state.workletTargetMs = CONFIG.targetBufferMs;
         state.packetsReceived = 0;
         state.framesReceived = 0;
         state.framesPlayed = 0;
         state.underruns = 0;
         state.overruns = 0;
+        state.resyncs = 0;
+        state.staleDropped = 0;
         state.missedFrames = 0;
         state.lastSeqNo = null;
         state.lastPacketFrames = 0;
+
+        // Re-anchor the arrival clock and the adaptive target: they are only
+        // meaningful for one continuous connection.
+        state.anchorLocal = null;
+        state.anchorRemote = null;
+        state.minResidualMs = null;
+        state.lastPacketMs = null;
+        state.jitterMs = 0;
+        state.lastTargetEval = 0;
+
         state.scriptStarted = false;
         state.scriptFade = 0;
         state.peakLevel = 0;

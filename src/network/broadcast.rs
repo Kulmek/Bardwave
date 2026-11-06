@@ -1,19 +1,55 @@
 //! Audio broadcasting to WebSocket clients
+//!
+//! The wire payload is Opus-encoded: raw f32 PCM at 48 kHz stereo is 3 Mbit/s,
+//! which both floods weak Wi-Fi links (bursty delivery -> jitter-buffer
+//! overruns on the client) and holds the CPU of every listener. The mixed
+//! audio is encoded to 10 ms Opus packets (~100-300 bytes at 96 kbit/s) right
+//! here, before it enters any per-client queue.
+//!
+//! The engine publishes whatever block size the local audio device asked for,
+//! which is usually *not* 480 frames; [`WireEncoder`] reblocks it into fixed
+//! 10 ms frames so every packet on the wire is a valid Opus frame (see
+//! [`crate::network::opus_wire`] for why that matters).
 
+use axum::extract::ws::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, broadcast, oneshot};
-use axum::extract::ws::Message;
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Audio format information sent to clients on connect
+pub use super::opus_wire::wire_encoder;
+use super::opus_wire::{WireEncoder, WIRE_CHANNELS, WIRE_FRAME_FRAMES, WIRE_SAMPLE_RATE};
+
+/// The single codec used on the wire. Declared as a constant so clients and
+/// tests can agree on it; the format announcement carries it as `format`.
+pub const WIRE_CODEC: &str = "opus";
+
+/// A stream that has been silent for longer than this is treated as restarted:
+/// the half-assembled frame from before the pause is discarded instead of being
+/// glued onto the audio that comes next.
+const STREAM_RESTART_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// `AudioFormatInfo` announced to clients on connect / first frame.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioFormatInfo {
     pub sample_rate: u32,
     pub channels: u16,
-    pub format: String, // "f32" for raw f32 PCM
-    pub frame_size: usize, // samples per channel per frame
+    /// "opus" — see `WIRE_CODEC`.
+    pub format: String,
+    /// Stream frames per channel per frame (10 ms at 48 kHz => 480).
+    pub frame_size: usize,
+}
+
+impl AudioFormatInfo {
+    pub fn wire() -> Self {
+        Self {
+            sample_rate: WIRE_SAMPLE_RATE,
+            channels: WIRE_CHANNELS,
+            format: WIRE_CODEC.to_string(),
+            frame_size: WIRE_FRAME_FRAMES,
+        }
+    }
 }
 
 /// Configuration for the broadcaster.
@@ -97,7 +133,10 @@ impl BroadcasterHandle {
     }
 
     /// Register a new WebSocket client
-    pub async fn register_client(&self, ws_tx: mpsc::Sender<Message>) -> Result<Uuid, BroadcastError> {
+    pub async fn register_client(
+        &self,
+        ws_tx: mpsc::Sender<Message>,
+    ) -> Result<Uuid, BroadcastError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.command_tx
             .send(BroadcasterCommand::RegisterClient(ws_tx, resp_tx))
@@ -156,30 +195,91 @@ impl AudioFrame {
         self.frame_count() as f32 / self.sample_rate as f32
     }
 
-    /// Convert to binary WebSocket frame.
+    /// Convert to a binary WebSocket frame from an already-encoded payload.
     ///
-    /// Format: [seq_no: u32 LE][pcm_samples: f32 LE ...]
-    /// The sequence number allows clients to detect missing frames.
+    /// Format: [seq_no: u32 LE][server_ms: u32 LE][payload]
     ///
-    /// `seq_no` is stored as a `u64` internally, but the wire header is a
-    /// 32-bit little-endian integer. Writing all 8 bytes here was the source
-    /// of the browser-side crackle: the player skipped only 4 header bytes,
-    /// so the upper half of the sequence number was interpreted as the first
-    /// PCM sample, shifting every stereo frame by one sample.
-    pub fn to_binary(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(4 + self.samples.len() * 4);
+    /// The sequence number lets clients detect missing frames. `server_ms` is
+    /// stream time on the server (milliseconds since the broadcaster started);
+    /// clients use it both to drop stale backlog at ingress (a burst that was
+    /// queued server-side must not flood the jitter buffer) and to track
+    /// arrival jitter for an adaptive target, without any wall-clock sync.
+    ///
+    /// The payload is one Opus packet. The header stays a fixed 8 bytes: it
+    /// was once 8 bytes of a u64 sequence while the player skipped only 4,
+    /// shifting every stereo frame by one sample and crackling constantly.
+    /// Both halves of this invariant are pinned by tests.
+    pub fn to_binary_header(&self, stream_epoch: &std::time::Instant, payload: &[u8]) -> Vec<u8> {
+        let server_ms = u32::try_from(stream_epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let mut result = Vec::with_capacity(8 + payload.len());
         result.extend_from_slice(&(self.seq_no as u32).to_le_bytes());
-        // `bytemuck::cast_slice` preserves native byte order. All supported
-        // targets are little-endian, which matches the documented wire format.
-        debug_assert!(cfg!(target_endian = "little"));
-        result.extend_from_slice(bytemuck::cast_slice(&self.samples));
+        result.extend_from_slice(&server_ms.to_le_bytes());
+        result.extend_from_slice(payload);
         result
+    }
+
+    /// Encode a *whole* 10 ms block of mixed PCM to one Opus packet.
+    ///
+    /// The engine's published block is not usually 480 frames long (it follows
+    /// the local device's buffer size), so the broadcaster never feeds its own
+    /// `samples` to the encoder through this; [`WireEncoder`] reblocks first and
+    /// then calls this with an exact frame. Anything else is refused rather
+    /// than passed to libopus, which rejects non-standard frame sizes anyway.
+    pub fn opus_payload(encoder: &mut opus::Encoder, frame: &AudioFrame) -> Option<Vec<u8>> {
+        if frame.channels != WIRE_CHANNELS
+            || frame.sample_rate != WIRE_SAMPLE_RATE
+            || frame.samples.len() != WIRE_FRAME_FRAMES * WIRE_CHANNELS as usize
+        {
+            warn!(
+                "Dropping frame: expected {}Hz x{}ch, {} samples; got {}Hz x{}ch, {} samples",
+                WIRE_SAMPLE_RATE,
+                WIRE_CHANNELS,
+                WIRE_FRAME_FRAMES * WIRE_CHANNELS as usize,
+                frame.sample_rate,
+                frame.channels,
+                frame.samples.len()
+            );
+            return None;
+        }
+        // `max_size` is only the upper bound of the packet, not the frame size:
+        // libopus reads the frame size from the input slice and the packet
+        // capacity from the output slice. 4000 B covers any legal packet.
+        let max_size = 4000;
+        match encoder.encode_vec_float(&frame.samples, max_size) {
+            Ok(packet) if !packet.is_empty() => Some(packet),
+            Ok(_) => {
+                warn!("Opus encoder produced an empty packet; frame dropped");
+                None
+            }
+            Err(e) => {
+                warn!("Opus encode failed: {:?}; frame dropped", e);
+                None
+            }
+        }
     }
 
     /// Parse the sequence number from a binary frame (first 4 bytes).
     pub fn seq_no_from_binary(data: &[u8]) -> Option<u32> {
         if data.len() >= 4 {
             Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        } else {
+            None
+        }
+    }
+
+    /// Parse the server stream time from a binary frame (next 4 bytes).
+    pub fn server_ms_from_binary(data: &[u8]) -> Option<u32> {
+        if data.len() >= 8 {
+            Some(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
+        } else {
+            None
+        }
+    }
+
+    /// The Opus payload after the 8-byte header.
+    pub fn payload_from_binary(data: &[u8]) -> Option<&[u8]> {
+        if data.len() > 8 {
+            Some(&data[8..])
         } else {
             None
         }
@@ -221,6 +321,17 @@ pub struct AudioBroadcaster {
     format_info: Arc<Mutex<Option<AudioFormatInfo>>>,
     /// Monotonically increasing sequence number for audio frames
     seq_no: AtomicU64,
+    /// Epoch for the per-frame `server_ms` stream timestamp
+    stream_epoch: std::time::Instant,
+    /// PCM -> fixed 10 ms Opus packets, behind a plain mutex: `opus::Encoder` is
+    /// `!Sync`, so holding it directly would make this whole struct `!Sync` and
+    /// the `run()` future `!Send`. The lock is uncontended in single-task use.
+    wire: std::sync::Mutex<WireEncoder>,
+    /// Completed packets waiting for the next sequence number, filled by the
+    /// reblocker (one input block can complete more than one frame).
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// When the last published block arrived, for gap detection.
+    last_block_at: Option<std::time::Instant>,
 }
 
 impl AudioBroadcaster {
@@ -249,6 +360,10 @@ impl AudioBroadcaster {
             count_tx,
             format_info,
             seq_no: AtomicU64::new(0),
+            stream_epoch: std::time::Instant::now(),
+            wire: std::sync::Mutex::new(WireEncoder::new()),
+            pending: std::collections::VecDeque::new(),
+            last_block_at: None,
         };
 
         (handle, broadcaster)
@@ -285,60 +400,98 @@ impl AudioBroadcaster {
         info!("Client disconnected: {} (total listeners: {})", id, count);
     }
 
-    /// Broadcast audio frame to all connected clients
-    async fn broadcast_frame(&self, frame: AudioFrame) {
-        // The first frame is what establishes the stream format, and every
-        // listener that is already connected has never been told about it: the
-        // format announcement used to be prepared but never actually sent.
+    /// Broadcast audio frame to all connected clients.
+    ///
+    /// The engine hands over mixed PCM in whatever block size the audio device
+    /// produced, so the frame is first rebuffered into whole 10 ms frames and
+    /// encoded. A block that does not complete a frame is not an error — it is
+    /// carried over to the next one — and a block that completes two frames
+    /// emits two numbered packets.
+    async fn broadcast_frame(&mut self, frame: AudioFrame) {
+        if frame.sample_rate != WIRE_SAMPLE_RATE || frame.channels != WIRE_CHANNELS {
+            warn!(
+                "Dropping block: wire stream is {}Hz x{}ch, got {}Hz x{}ch",
+                WIRE_SAMPLE_RATE, WIRE_CHANNELS, frame.sample_rate, frame.channels
+            );
+            return;
+        }
+
+        let now = frame.timestamp;
+        let mut packets = Vec::new();
+        {
+            let mut wire = self.wire.lock().expect("Opus encoder mutex poisoned");
+            // A long silence means nothing was playing: the mixer stops
+            // publishing, so the reblocker still holds a fragment of pre-pause
+            // audio. Gluing it to the next burst would put it inside a packet —
+            // an audible click at every start. Drop it and start on a fresh
+            // frame instead.
+            if let Some(last) = self.last_block_at {
+                if now.saturating_duration_since(last) > STREAM_RESTART_GAP {
+                    debug!(
+                        "Stream resumed after {:?}; dropping the partial frame",
+                        now.saturating_duration_since(last)
+                    );
+                    wire.drop_partial_frame();
+                }
+            }
+            wire.push(&frame.samples, &mut packets);
+        }
+        self.last_block_at = Some(now);
+
+        if packets.is_empty() {
+            return;
+        }
+        self.pending.extend(packets);
+
+        while let Some(payload) = self.pending.pop_front() {
+            let seq = self.seq_no.fetch_add(1, Ordering::Relaxed);
+            let header = AudioFrame {
+                samples: Vec::new(),
+                sample_rate: WIRE_SAMPLE_RATE,
+                channels: WIRE_CHANNELS,
+                timestamp: frame.timestamp,
+                seq_no: seq,
+            };
+            let binary_data = header.to_binary_header(&self.stream_epoch, &payload);
+            self.deliver(Message::Binary(binary_data)).await;
+        }
+
+        // The first packet of the session is what establishes the stream
+        // format. It is announced only once the stream really starts, so a
+        // listener that connects before the first play still gets the format
+        // from its session (see `format_info`) instead of a stale announcement.
         let announcement = {
             let mut format_info = self.format_info.lock().await;
             match format_info.as_ref() {
                 Some(_) => None,
                 None => {
-                    let info = AudioFormatInfo {
-                        sample_rate: frame.sample_rate,
-                        channels: frame.channels,
-                        format: "f32".to_string(),
-                        frame_size: frame.frame_count(),
-                    };
+                    let info = AudioFormatInfo::wire();
                     let message = format_message(&info);
                     *format_info = Some(info);
                     Some(message)
                 }
             }
         };
+        if let Some(text) = announcement {
+            self.deliver(Message::Text(text)).await;
+        }
+    }
 
-        let seq = self.seq_no.fetch_add(1, Ordering::Relaxed);
-        let frame_with_seq = AudioFrame {
-            samples: frame.samples,
-            sample_rate: frame.sample_rate,
-            channels: frame.channels,
-            timestamp: frame.timestamp,
-            seq_no: seq,
-        };
-
-        let binary_data = frame_with_seq.to_binary();
-        let message = Message::Binary(binary_data);
-
+    /// Queue one message for every connected client, pruning dead sessions.
+    async fn deliver(&mut self, message: Message) {
         let mut clients = self.clients.lock().await;
         let mut disconnected = Vec::new();
 
         for client in clients.iter_mut() {
-            if let Some(text) = &announcement {
-                let _ = client.ws_tx.try_send(Message::Text(text.clone()));
-            }
-            // Try to send; if the per-client buffer is full, skip this frame
-            // for that client but keep the connection open. Only a closed
-            // channel means the WebSocket task is really gone. Treating a
-            // full buffer as a disconnect caused reconnect storms whenever
-            // the network hiccuped.
+            // If the per-client buffer is full, skip this frame for that client
+            // but keep the connection open. Only a closed channel means the
+            // WebSocket task is really gone. Treating a full buffer as a
+            // disconnect caused reconnect storms whenever the network
+            // hiccuped; the client's sequence-gap handling covers the hole.
             match client.ws_tx.try_send(message.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!(
-                        "Client {} send buffer full; dropping frame {}",
-                        client.id, seq
-                    );
+                    debug!("Client {} send buffer full; dropping a frame", client.id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     disconnected.push(client.id);
@@ -346,7 +499,6 @@ impl AudioBroadcaster {
             }
         }
 
-        // Remove disconnected clients
         if !disconnected.is_empty() {
             for id in disconnected {
                 clients.retain(|c| c.id != id);
@@ -424,32 +576,80 @@ mod tests {
         let _ = timeout(Duration::from_secs(1), broadcaster_task).await;
     }
 
-    #[tokio::test]
-    async fn test_audio_frame_properties() {
+    /// Encode a test frame the same way the broadcaster's loop does.
+    #[cfg(test)]
+    fn encode_test_frame(frame: &AudioFrame) -> Vec<u8> {
+        let mut encoder = wire_encoder();
+        let payload = AudioFrame::opus_payload(&mut encoder, frame)
+            .expect("encoding a well-formed test frame");
+        frame.to_binary_header(&std::time::Instant::now(), &payload)
+    }
+
+    #[test]
+    fn test_audio_frame_properties() {
         let frame = create_test_frame();
         assert_eq!(frame.sample_rate, 48000);
         assert_eq!(frame.channels, 2);
         assert_eq!(frame.frame_count(), 480);
         assert!((frame.duration() - 0.01).abs() < 0.001);
-        
-        let binary = frame.to_binary();
-        assert_eq!(binary.len(), frame.samples.len() * 4 + 4); // f32 = 4 bytes + 4 byte seq_no header
-        assert_eq!(AudioFrame::seq_no_from_binary(&binary), Some(0));
     }
 
     #[test]
-    fn test_sequence_header_is_exactly_four_bytes() {
+    fn test_opus_binary_format() {
         let mut frame = create_test_frame();
         frame.seq_no = 0x1_0000_0005;
-        let binary = frame.to_binary();
+        let binary = encode_test_frame(&frame);
 
-        // The header must stay 4 bytes even when the internal counter is u64.
-        assert_eq!(binary.len(), frame.samples.len() * 4 + 4);
+        // The header must stay 8 bytes: 4 for the sequence number (even when
+        // the internal counter is u64) and 4 for the server stream time. The
+        // Opus payload starts immediately after it.
         assert_eq!(AudioFrame::seq_no_from_binary(&binary), Some(5));
+        assert!(AudioFrame::server_ms_from_binary(&binary).is_some());
+        let payload = AudioFrame::payload_from_binary(&binary).expect("payload present");
+        assert!(
+            !payload.is_empty() && payload.len() < frame.samples.len(),
+            "Opus payload must be non-empty and far smaller than PCM"
+        );
+    }
 
-        // The first PCM sample must start immediately after the 4-byte header.
-        let first_sample = f32::from_le_bytes([binary[4], binary[5], binary[6], binary[7]]);
-        assert!((first_sample - frame.samples[0]).abs() < f32::EPSILON);
+    #[test]
+    fn test_opus_roundtrip_quality() {
+        let frame = create_test_frame();
+        let binary = encode_test_frame(&frame);
+        let payload = AudioFrame::payload_from_binary(&binary).expect("payload present");
+
+        let mut decoder = opus::Decoder::new(WIRE_SAMPLE_RATE, opus::Channels::Stereo)
+            .expect("Opus decoder initialization");
+        let mut out = vec![0f32; frame.samples.len()];
+        decoder
+            .decode_float(payload, &mut out, false)
+            .expect("decoding a freshly encoded packet");
+
+        // Sine at the wire bitrate must survive: correlated, sane level.
+        // Opus at 64 kbit/s is lossy, so allow a wider band than PCM.
+        let rms_orig: f32 =
+            (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt();
+        let rms_out: f32 = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(
+            rms_out > rms_orig * 0.4 && rms_out < rms_orig * 1.6,
+            "roundtrip RMS drifted: {rms_out} vs {rms_orig}"
+        );
+    }
+
+    #[test]
+    fn test_server_ms_is_monotonic_and_parsable() {
+        let epoch = std::time::Instant::now();
+        let frame = create_test_frame();
+        let mut encoder = wire_encoder();
+        let payload = AudioFrame::opus_payload(&mut encoder, &frame).expect("encode ok");
+        let first = frame.to_binary_header(&epoch, &payload);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = frame.to_binary_header(&epoch, &payload);
+
+        let ms_0 = AudioFrame::server_ms_from_binary(&first).expect("header present");
+        let ms_1 = AudioFrame::server_ms_from_binary(&second).expect("header present");
+        assert!(ms_0 <= ms_1, "server_ms must be monotonic");
+        assert!(ms_0 < 10_000, "fresh epoch must give a small stream time");
     }
 
     #[tokio::test]
@@ -464,7 +664,89 @@ mod tests {
         assert!(handle.send_audio(create_test_frame()).is_ok());
         assert!(handle.send_audio(create_test_frame()).is_ok());
         // Third should fail (backpressure)
-        assert!(matches!(handle.send_audio(create_test_frame()), Err(BroadcastError::ChannelFull)));
+        assert!(matches!(
+            handle.send_audio(create_test_frame()),
+            Err(BroadcastError::ChannelFull)
+        ));
+
+        drop(handle);
+    }
+
+    /// The engine publishes whatever the audio device asked for. A block that
+    /// is not a multiple of 480 frames must still put whole 10 ms packets on
+    /// the wire instead of being dropped (silence) or fed to libopus (which
+    /// rejects the frame size).
+    #[tokio::test]
+    async fn odd_sized_engine_blocks_still_reach_listeners() {
+        let (handle, broadcaster) = AudioBroadcaster::new(BroadcasterConfig::default());
+        let _task = tokio::spawn(broadcaster.run());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        handle.register_client(tx).await.expect("register");
+
+        // 441 frames per block: a 44.1 kHz device buffer, a very common size
+        // that is never a whole 10 ms frame at 48 kHz.
+        for _ in 0..8 {
+            let block = vec![0.25f32; 441 * 2];
+            handle
+                .send_audio(AudioFrame::new(block, WIRE_SAMPLE_RATE, WIRE_CHANNELS, 0))
+                .expect("queue block");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut packets = 0;
+        while let Ok(message) = rx.try_recv() {
+            if let Message::Binary(data) = message {
+                assert!(data.len() > 8, "header plus payload");
+                packets += 1;
+            }
+        }
+        // 8 x 441 = 3528 frames is 7.35 wire frames, so 7 packets, and none of
+        // the boundaries may fall on a dropped block.
+        assert_eq!(packets, 7, "3528 frames must reblock into 7 whole packets");
+
+        drop(handle);
+    }
+
+    /// A pause must not glue a pre-pause fragment onto the next burst.
+    #[tokio::test]
+    async fn pause_between_bursts_drops_the_partial_frame() {
+        let (handle, broadcaster) = AudioBroadcaster::new(BroadcasterConfig::default());
+        let _task = tokio::spawn(broadcaster.run());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        handle.register_client(tx).await.expect("register");
+
+        // Half a frame, then a pause far longer than the restart gap.
+        handle
+            .send_audio(AudioFrame::new(
+                vec![0.5f32; 240 * 2],
+                WIRE_SAMPLE_RATE,
+                WIRE_CHANNELS,
+                0,
+            ))
+            .expect("queue partial block");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // One whole frame after the pause must become exactly one packet: the
+        // 240 carried frames are gone, not prepended.
+        handle
+            .send_audio(AudioFrame::new(
+                vec![0.5f32; WIRE_FRAME_FRAMES * 2],
+                WIRE_SAMPLE_RATE,
+                WIRE_CHANNELS,
+                0,
+            ))
+            .expect("queue whole block");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut binary = 0;
+        while let Ok(message) = rx.try_recv() {
+            if let Message::Binary(_) = message {
+                binary += 1;
+            }
+        }
+        assert_eq!(binary, 1, "the stale half frame must not be sent");
 
         drop(handle);
     }
@@ -477,11 +759,11 @@ mod tests {
 
         // Create a dummy message channel
         let (tx, _rx) = mpsc::channel(10);
-        
+
         // Register client
         let id = handle.register_client(tx).await.unwrap();
         assert_eq!(handle.listener_count().await, 1);
-        
+
         // Unregister client
         handle.unregister_client(id).await.unwrap();
         assert_eq!(handle.listener_count().await, 0);

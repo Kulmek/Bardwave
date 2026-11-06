@@ -1,7 +1,6 @@
 //! HTTP/WebSocket server for SoundShared
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+pub use axum::response::{Html, Response};
 pub use axum::{
     extract::{State, WebSocketUpgrade},
     http::{header, StatusCode},
@@ -9,20 +8,36 @@ pub use axum::{
     routing::get,
     Router,
 };
-pub use axum::response::{Html, Response};
-pub use tower_http::trace::TraceLayer;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+pub use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-use crate::network::broadcast::{AudioBroadcaster, BroadcasterConfig, BroadcasterHandle, BroadcastError};
+use crate::network::broadcast::{
+    AudioBroadcaster, BroadcastError, BroadcasterConfig, BroadcasterHandle,
+};
 use crate::network::local_ip::{detect_for_bind, is_advertisable};
 use crate::network::websocket::{handle_websocket_upgrade, WebSocketConfig};
 
 // Embedded static files (compiled into binary)
-const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/network/static/index.html"));
-const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/network/static/app.js"));
-const STYLE_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/network/static/style.css"));
+const INDEX_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/index.html"
+));
+const APP_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/app.js"
+));
+const STYLE_CSS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/style.css"
+));
+const OPUS_DECODER_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/network/static/opus-decoder.min.js"
+));
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -110,6 +125,7 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/index.html", get(serve_index_html))
         .route("/app.js", get(serve_app_js))
         .route("/style.css", get(serve_style_css))
+        .route("/opus-decoder.min.js", get(serve_opus_decoder_js))
         .route("/api/status", get(api_status))
         .route("/ws/audio", get(websocket_handler))
         .with_state(state)
@@ -236,7 +252,7 @@ pub async fn api_status(State(state): State<ServerState>) -> impl IntoResponse {
         "audio_format": {
             "sample_rate": 48000,
             "channels": 2,
-            "format": "f32"
+            "format": crate::network::broadcast::WIRE_CODEC
         }
     });
 
@@ -271,11 +287,22 @@ pub async fn serve_style_css() -> impl IntoResponse {
     (headers, STYLE_CSS)
 }
 
+/// The Opus WASM decoder module embedded next to app.js. Served as a real
+/// static module so the client can `import()` it: the client does not ship
+/// any bundler, and inlining was too large for the injection approach used
+/// for the worklet blob.
+pub async fn serve_opus_decoder_js() -> impl IntoResponse {
+    info!("📁 Serving opus-decoder.min.js");
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    (headers, OPUS_DECODER_JS)
+}
+
 /// WebSocket handler: GET /ws/audio
-pub async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<ServerState>,
-) -> Response {
+pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
     info!("🔌 WebSocket upgrade requested at /ws/audio");
     // The configured frame limit used to be ignored here, so the library
     // default applied no matter what WebSocketConfig said.
@@ -367,7 +394,10 @@ mod tests {
     fn detection_never_offers_an_unreachable_address() {
         if let Some(ip) = detect_for_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
             assert!(is_advertisable(ip), "detected {ip}");
-            assert!(!ip.is_loopback(), "loopback is the fallback, not a detection");
+            assert!(
+                !ip.is_loopback(),
+                "loopback is the fallback, not a detection"
+            );
         }
     }
 
@@ -492,8 +522,7 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(addr)
             .await
             .expect("connect to the running server");
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut response = String::new();
         stream.read_to_string(&mut response).await.expect("read");

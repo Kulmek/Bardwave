@@ -6,10 +6,10 @@ use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
-use std::collections::VecDeque;
 use egui::Context;
 use rfd::FileDialog;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -307,7 +307,11 @@ impl SoundSharedApp {
             };
             if let Err(e) = self.app_state.audio_cmd_tx.try_send(cmd) {
                 // Still full: put it back and try again on a later frame.
-                debug!("Load channel still full, {} stays queued: {}", path.display(), e);
+                debug!(
+                    "Load channel still full, {} stays queued: {}",
+                    path.display(),
+                    e
+                );
                 self.pending_loads.push_front(path);
                 break;
             }
@@ -333,7 +337,10 @@ impl SoundSharedApp {
             if path.exists() {
                 self.request_load_sound(path);
             } else {
-                debug!("Library sound missing on disk, skipping: {}", path.display());
+                debug!(
+                    "Library sound missing on disk, skipping: {}",
+                    path.display()
+                );
             }
         }
     }
@@ -1405,5 +1412,4 @@ impl SoundSharedApp {
             }
         }
     }
-
 }

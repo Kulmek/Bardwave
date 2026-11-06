@@ -25,18 +25,24 @@ fn headless_engine_publishes_10ms_frames_with_four_byte_header() {
     assert_eq!(mixed.buffer.len(), 960);
     assert!(mixed.buffer.iter().all(|s| (*s - 0.25).abs() < 1e-6));
 
-    let frame = AudioFrame::new(mixed.buffer, 48_000, 2, mixed.seq_no);
-    let binary = frame.to_binary();
+    // Encode the way the broadcaster does: one 8-byte header (seq + server_ms)
+    // followed by one Opus packet, far smaller than the raw PCM was.
+    let mut encoder = soundshared::network::broadcast::wire_encoder();
+    let frame = AudioFrame::new(mixed.buffer.clone(), 48_000, 2, mixed.seq_no);
+    let payload = AudioFrame::opus_payload(&mut encoder, &frame).expect("opus encode");
+    let binary = frame.to_binary_header(&std::time::Instant::now(), &payload);
 
-    // Exactly one u32 sequence header, then the PCM payload.
-    assert_eq!(binary.len(), 960 * 4 + 4);
     assert_eq!(
         AudioFrame::seq_no_from_binary(&binary),
         Some(mixed.seq_no as u32)
     );
-    // The first PCM sample must begin at byte 4.
-    let first = f32::from_le_bytes([binary[4], binary[5], binary[6], binary[7]]);
-    assert!((first - 0.25).abs() < 1e-6);
+    assert!(AudioFrame::server_ms_from_binary(&binary).is_some());
+    let wire_payload = AudioFrame::payload_from_binary(&binary).expect("opus payload present");
+    assert!(!wire_payload.is_empty());
+    assert!(
+        wire_payload.len() < mixed.buffer.len() * 4 / 8,
+        "Opus must beat PCM to a fraction of its size"
+    );
 
     drop(track);
     engine.stop_output().expect("stop");

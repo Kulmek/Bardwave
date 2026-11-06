@@ -75,7 +75,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - Rust, one binary, one config file
 - 127 tests (`cargo test --all-targets`), including end-to-end broadcast and WebSocket wire-format tests
 - Typed commands between GUI, audio engine and network — no shared mutable soup
-- Streaming resampled to 48 kHz / stereo f32 in the mix pipeline
+- Streaming resampled to 48 kHz / stereo f32 in the mix pipeline, encoded to **Opus** (~64 kbit/s VBR) for the network wire
 
 </td></tr>
 </table>
@@ -86,6 +86,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 
 - **Windows 10/11** (the audio and network code is portable Rust; only the local-IP detection is Windows-specific today — see [Roadmap](#roadmap)).
 - [Rust toolchain](https://rustup.rs) 1.80 or newer.
+- **CMake 3.16+** — required to build the [Opus](https://opus-codec.org) codec dependency (`opusic-sys`) used for network audio compression. On Windows, install from https://cmake.org/download and ensure `cmake.exe` is on your `PATH` before building.
 - A sound card. No, really — this is the point of the app.
 
 ### Build & run
@@ -183,6 +184,28 @@ Because players hear the **mix** and not the files, you can edit, replace or re-
 - `src/network` — axum server, WebSocket sessions, broadcaster, embedded listener page, local-IP detection.
 - `src/gui` — the console: theme, widgets, sound list, groups, server panel, dialogs.
 - `src/config.rs` — `config.toml` schema and persistence.
+
+### Opus wire format
+
+The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it over WebSocket. This reduces the wire payload from ~3,840 bytes per 10 ms frame (raw f32 PCM) to ~100–300 bytes at 64–96 kbit/s VBR, which prevents jitter-buffer overruns on weak Wi-Fi links.
+
+**Wire frame (binary WebSocket message):**
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 bytes | `seq_no` — u32 little-endian, monotonically increasing per frame |
+| 4 | 4 bytes | `server_ms` — u32 little-endian, stream time since broadcaster start |
+| 8 | variable | Opus packet (one 10 ms frame, 480 samples per channel) |
+
+**Format announcement (text WebSocket message, sent on first frame):**
+
+```json
+{"type":"data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
+```
+
+**Client decode:** The browser listener decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s (`channelData`). The listener interleaves them into a single stereo buffer before pushing to the Web Audio ring buffer.
+
+**Build requirement:** Opus is implemented in C (`libopus` 1.6.1) via the `opusic-sys` crate, so **CMake must be installed** for `cargo build` and `cargo build --release` to succeed. Debug and release builds have both been verified with CMake on `PATH`.
 
 ## Building & testing
 

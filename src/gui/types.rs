@@ -9,21 +9,46 @@ use std::fmt::Debug;
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
     /// Load a sound file and return its SoundInfo
-    LoadSound { path: String, response: Sender<anyhow::Result<SoundInfo>> },
+    LoadSound {
+        path: String,
+        response: Sender<anyhow::Result<SoundInfo>>,
+    },
     /// Play a sound by ID
-    PlaySound { id: SoundId, response: Sender<anyhow::Result<()>> },
+    PlaySound {
+        id: SoundId,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Stop a sound by ID
-    StopSound { id: SoundId, response: Sender<anyhow::Result<()>> },
+    StopSound {
+        id: SoundId,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Set per-sound volume (track volume)
-    SetVolume { id: SoundId, volume: f32, response: Sender<anyhow::Result<()>> },
+    SetVolume {
+        id: SoundId,
+        volume: f32,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Turn repeating on or off for a sound
-    SetLoop { id: SoundId, looped: bool, response: Sender<anyhow::Result<()>> },
+    SetLoop {
+        id: SoundId,
+        looped: bool,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Set master volume
-    SetMasterVolume { volume: f32, response: Sender<anyhow::Result<()>> },
+    SetMasterVolume {
+        volume: f32,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Remove a sound from the library
-    RemoveSound { id: SoundId, response: Sender<anyhow::Result<()>> },
+    RemoveSound {
+        id: SoundId,
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Stop all playback
-    StopAll { response: Sender<anyhow::Result<()>> },
+    StopAll {
+        response: Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Sound information for GUI display
@@ -41,9 +66,13 @@ pub struct SoundInfo {
 #[derive(Debug, Clone)]
 pub enum ServerCommand {
     /// Start the network server
-    Start { response: Sender<anyhow::Result<String>> },
+    Start {
+        response: Sender<anyhow::Result<String>>,
+    },
     /// Stop the network server
-    Stop { response: Sender<anyhow::Result<()>> },
+    Stop {
+        response: Sender<anyhow::Result<()>>,
+    },
     /// Point the server at a new bind address / port for the next start.
     ///
     /// Editing the CONFIGURATION fields must take effect without restarting the

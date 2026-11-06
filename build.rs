@@ -111,7 +111,10 @@ fn find_on_path(exe: &str) -> Option<PathBuf> {
 
 /// `%ProgramFiles(x86)%\Windows Kits\10\bin\<version>\<arch>\rc.exe`.
 fn windows_kits_resource_compiler() -> Option<PathBuf> {
-    let kits_root = program_files_x86()?.join("Windows Kits").join("10").join("bin");
+    let kits_root = program_files_x86()?
+        .join("Windows Kits")
+        .join("10")
+        .join("bin");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits_root)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -138,7 +141,9 @@ fn windows_kits_resource_compiler() -> Option<PathBuf> {
 fn has_version_like_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.chars().next().is_some_and(|c| c.is_ascii_digit()) && name.contains('.'))
+        .is_some_and(|name| {
+            name.chars().next().is_some_and(|c| c.is_ascii_digit()) && name.contains('.')
+        })
 }
 
 fn version_key(path: &Path) -> Vec<u32> {

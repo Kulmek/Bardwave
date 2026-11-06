@@ -1,7 +1,8 @@
 //! End-to-end WebSocket wire-format check.
 //!
 //! Guards against the regression that caused browser crackle: the server must
-//! send exactly one 4-byte little-endian sequence header before the f32 PCM.
+//! send exactly one 8-byte header (4-byte sequence + 4-byte server stream
+//! time) followed by one Opus packet per frame.
 
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use soundshared::network::websocket::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
-async fn websocket_audio_frame_has_four_byte_header_and_aligned_pcm() {
+async fn websocket_audio_frame_has_eight_byte_header_and_opus_payload() {
     let (broadcaster, broadcaster_task) = AudioBroadcaster::new(BroadcasterConfig::default());
     tokio::spawn(broadcaster_task.run());
 
@@ -65,15 +66,27 @@ async fn websocket_audio_frame_has_four_byte_header_and_aligned_pcm() {
     }
 
     let data = binary.expect("expected an audio frame");
-    assert_eq!(data.len(), 4 + 960 * 4, "4-byte header + 960 f32 samples");
+    assert!(data.len() > 8, "8-byte header + Opus payload");
+    // A 10 ms stereo frame at 96 kbit/s is a couple hundred bytes; any
+    // regression back to raw PCM would be ~3840 bytes right away.
+    assert!(
+        data.len() < 600,
+        "wire frame must be Opus-compressed, got {} bytes",
+        data.len()
+    );
 
     let seq = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     assert_eq!(seq, 0);
 
-    let first = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let second = f32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    assert!((first - 0.5).abs() < 1e-6, "left sample shifted");
-    assert!((second + 0.5).abs() < 1e-6, "right sample shifted");
+    // The server stream time must be present in the header (any value; the
+    // epoch is created moments before, so it is a small count of milliseconds).
+    let _server_ms = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+    // The Opus TOC byte: a CELT-mode stereo frame does not have to decode in
+    // the test, but the payload must look like an Opus packet (its TOC byte
+    // has config=15 as its top bits for full-band VBR music... we stay softer:
+    // nonzero TOC, and decodeability checked by the roundtrip unit test).
+    assert_ne!(data[8], 0, "opus payload must be present");
 
     let _ = ws.close(None).await;
 }
@@ -132,7 +145,7 @@ async fn late_listener_receives_the_stream_format() {
     let format = format.expect("a late listener must be sent the stream format");
     assert_eq!(format["data"]["sample_rate"], 48_000);
     assert_eq!(format["data"]["channels"], 2);
-    assert_eq!(format["data"]["format"], "f32");
+    assert_eq!(format["data"]["format"], "opus");
 
     let _ = ws.close(None).await;
 }

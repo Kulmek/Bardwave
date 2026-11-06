@@ -519,6 +519,11 @@ button {
     animation: buffer-warning 0.9s ease-in-out infinite;
 }
 
+/* Above 1.5x the (adaptive) target: latency is creeping up. */
+.buffer-grid.is-over .buffer-cell.active {
+    background: var(--amber-400);
+}
+
 @keyframes buffer-warning {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.55; }

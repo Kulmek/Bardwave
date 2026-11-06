@@ -398,4 +398,3 @@ fn config_input(
         })
         .inner
 }
-

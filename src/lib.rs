@@ -14,10 +14,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Re-export commonly used types
 pub use config::Config;
-pub use error::{SoundSharedError, Result};
+pub use error::{Result, SoundSharedError};
+pub use gui::app::ServerStatus as GuiServerStatus;
 pub use gui::app::SoundSharedApp;
 pub use gui::types::{AppState, AudioCommand, ServerCommand, SoundInfo};
-pub use gui::app::ServerStatus as GuiServerStatus;
-pub use network::broadcast::{AudioBroadcaster, AudioFrame, BroadcasterConfig, BroadcasterHandle, BroadcastError};
-pub use network::server::{NetworkServer, ServerConfig, ServerHandle, ServerError};
+pub use network::broadcast::{
+    AudioBroadcaster, AudioFrame, BroadcastError, BroadcasterConfig, BroadcasterHandle,
+};
+pub use network::server::{NetworkServer, ServerConfig, ServerError, ServerHandle};
 pub use network::websocket::WebSocketConfig;
