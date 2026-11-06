@@ -1,9 +1,8 @@
-name: CI & Release
+name: CI / Release
 
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
@@ -12,57 +11,46 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # ---------------------------------------------------------------
-  # CI: build + test on every push/PR
-  # ---------------------------------------------------------------
   ci:
-    runs-on: ubuntu-latest
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies (egui/eframe needs glib, atk, pkg-config, X11 libs)
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libglib2.0-dev \
-            libatk1.0-dev \
-            libatk-bridge2.0-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libxcb-composite0-dev \
-            libxcb-icccm4-dev \
-            libxcb-image0-dev \
-            libxcb-keysyms1-dev \
-            libxcb-randr0-dev \
-            libxcb-render-util0-dev \
-            libxcb-shape0-dev \
-            libxcb-shm0-dev \
-            libxcb-util-dev \
-            libxcb-xfixes0-dev \
-            libxcb-xinerama0-dev \
-            libxcb-xkb-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libcurl4-openssl-dev \
-            libssl-dev
+          sudo apt-get install -y pkg-config libglib2.0-dev libatk1.0-dev libatk-bridge2.0-dev \
+            libfontconfig1-dev libfreetype6-dev libxcb-composite0-dev libxcb-icccm4-dev \
+            libxcb-image0-dev libxcb-keysyms1-dev libxcb-randr0-dev libxcb-render-util0-dev \
+            libxcb-shape0-dev libxcb-shm0-dev libxcb-util-dev libxcb-xfixes0-dev \
+            libxcb-xinerama0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libcurl4-openssl-dev libssl-dev
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          components: rustfmt, clippy
 
-      - name: Cache cargo registry/target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -73,131 +61,70 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
-      - name: Build release binary (Opus included — rusty-opus, pure Rust, no CMake needed)
+      - name: Build release
         run: cargo build --release
 
-      - name: Show build artifacts
-        run: ls -lh target/release/soundshared*
+      - name: Show binary path
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "BINARY_PATH=target/release/soundshared.exe" >> $GITHUB_ENV
+          else
+            echo "BINARY_PATH=target/release/soundshared" >> $GITHUB_ENV
+          fi
 
-  # ---------------------------------------------------------------
-  # Release: create GitHub release with binary assets + changelog
-  # Runs only on push to main or on version tags
-  # ---------------------------------------------------------------
   release:
+    name: Create Release
     needs: ci
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install system dependencies (egui/eframe needs glib, atk, pkg-config, X11 libs)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libglib2.0-dev \
-            libatk1.0-dev \
-            libatk-bridge2.0-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libxcb-composite0-dev \
-            libxcb-icccm4-dev \
-            libxcb-image0-dev \
-            libxcb-keysyms1-dev \
-            libxcb-randr0-dev \
-            libxcb-render-util0-dev \
-            libxcb-shape0-dev \
-            libxcb-shm0-dev \
-            libxcb-util-dev \
-            libxcb-xfixes0-dev \
-            libxcb-xinerama0-dev \
-            libxcb-xkb-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libcurl4-openssl-dev \
-            libssl-dev
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
 
-      - name: Cache cargo registry/target
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary (Opus included — rusty-opus, pure Rust, no CMake needed)
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: windows-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
         run: cargo build --release
 
-      - name: Strip binary (optional, reduces size)
+      - name: Get version
+        id: version
         run: |
-          if [ -f target/release/soundshared ]; then
-            strip target/release/soundshared || true
-          fi
-
-      - name: Determine release tag and name
-        id: release_vars
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="nightly-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
-          fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "name=Bardwave $TAG" >> $GITHUB_OUTPUT
-
-      - name: Generate changelog from commits since last release
-        id: changelog
-        run: |
-          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-            PREV_TAG=$(git describe --tags --abbrev=0)
-            LOG=$(git log --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD")
-          else
-            LOG=$(git log --pretty=format:'- %s (%h)' -n 20)
-          fi
-          echo "log<<EOF" >> $GITHUB_OUTPUT
-          echo "${LOG}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          $v = (Get-Content Cargo.toml -Raw) -match 'version = "([^"]+)"'
+          $version = $matches[1]
+          echo "VERSION=$version" >> $GITHUB_OUTPUT
 
       - name: Create GitHub release
-        id: create_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_vars.outputs.tag }}
-          release_name: ${{ steps.release_vars.outputs.name }}
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: Bardwave v${{ steps.version.outputs.VERSION }}
           body: |
-            ## Bardwave ${{ steps.release_vars.outputs.tag }}
+            ## Bardwave v${{ steps.version.outputs.VERSION }}
 
-            ### Изменения:
-            ${{ steps.changelog.outputs.log }}
+            Open-source TTRPG soundboard: desktop ambience console streamed to players' browsers over LAN.
 
-            ### Сборка:
-            - Rust stable
-            - Opus включён по умолчанию (rusty-opus, чистый Rust, CMake не требуется)
-            - Запущено: `cargo build --release`
-            - Проверки: `cargo fmt --check`, `cargo clippy`, `cargo test --all-targets`
+            ### Assets
+            - `soundshared.exe` — Windows release binary (x86_64-pc-windows-msvc)
 
-            ### Файлы:
-            - `soundshared` — релизный бинарник (Linux x86_64)
+            ### Changes
+            See commit history for details.
+          files: target/release/soundshared.exe
           draft: false
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          files: |
-            target/release/soundshared
-
-      - name: Upload release asset (binary)
-        uses: softprops/action-gh-release@v2
-        if: steps.create_release.outputs.id != ''
-        with:
-          tag_name: ${{ steps.release_vars.outputs.tag }}
-          files: |
-            target/release/soundshared
+          prerelease: false
