@@ -927,12 +927,18 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 log('AudioWorklet ready');
             } else {
                 // AudioWorklet is not available in this context (usually insecure context)
-                throw new Error('AudioWorklet not available in this context');
+                // Instead of throwing, gracefully fall back to ScriptProcessorNode
+                URL.revokeObjectURL(blobUrl);
+                setupScriptProcessor();
+                log('AudioWorklet not available; using ScriptProcessor fallback (page is not a secure context)');
+                return; // Exit initAudio successfully with fallback
             }
         } catch (workletError) {
             // The usual cause is an insecure context: AudioWorklet (like all
             // worklets) is a secure-context-only API, so plain http:// LAN
             // addresses fall back to the deprecated ScriptProcessor path.
+            // This catch block handles actual errors from addModule() calls, not
+            // the deliberate fallback when audioWorklet is not available.
             const message = workletError instanceof Error 
                 ? workletError.message 
                 : String(workletError);
@@ -945,8 +951,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             setupScriptProcessor();
         }
 
-        if (context.state === 'suspended') {
-            await context.resume();
+        if (state.audioContext && state.audioContext.state === 'suspended') {
+            await state.audioContext.resume();
         }
     }
 
@@ -958,7 +964,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             CONFIG.channels,
             Math.floor((CONFIG.sampleRate * CONFIG.maxBufferMs) / 1000),
             CONFIG.sampleRate,
-            context.sampleRate,
+            state.audioContext.sampleRate,
             CONFIG.targetBufferMs,
             CONFIG.catchupLimit
         );
