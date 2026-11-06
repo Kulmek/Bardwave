@@ -893,41 +893,54 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         try {
             const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
             const blobUrl = URL.createObjectURL(blob);
-            await context.audioWorklet.addModule(blobUrl);
-            URL.revokeObjectURL(blobUrl);
+            
+            // Check if AudioWorklet is available before attempting to use it
+            // This prevents TypeError: Cannot read properties of undefined (reading 'addModule')
+            // when the page is not in a secure context
+            if (context.audioWorklet) {
+                await context.audioWorklet.addModule(blobUrl);
+                URL.revokeObjectURL(blobUrl);
 
-            const node = new AudioWorkletNode(context, 'soundshared-stream-processor', {
-                numberOfInputs: 0,
-                numberOfOutputs: 1,
-                outputChannelCount: [CONFIG.channels],
-                processorOptions: {
-                    sampleRate: CONFIG.sampleRate,
-                    streamRate: CONFIG.sampleRate,
-                    channels: CONFIG.channels,
-                    targetMs: CONFIG.targetBufferMs,
-                    lowWaterMs: CONFIG.lowWaterMs,
-                    maxMs: CONFIG.maxBufferMs,
-                    capacitySeconds: CONFIG.capacityMs / 1000,
-                    catchupLimit: CONFIG.catchupLimit
-                }
-            });
+                const node = new AudioWorkletNode(context, 'soundshared-stream-processor', {
+                    numberOfInputs: 0,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [CONFIG.channels],
+                    processorOptions: {
+                        sampleRate: CONFIG.sampleRate,
+                        streamRate: CONFIG.sampleRate,
+                        channels: CONFIG.channels,
+                        targetMs: CONFIG.targetBufferMs,
+                        lowWaterMs: CONFIG.lowWaterMs,
+                        maxMs: CONFIG.maxBufferMs,
+                        capacitySeconds: CONFIG.capacityMs / 1000,
+                        catchupLimit: CONFIG.catchupLimit
+                    }
+                });
 
-            node.port.onmessage = onWorkletMessage;
-            node.connect(state.analyserNode);
-            state.analyserNode.connect(state.gainNode);
-            state.gainNode.connect(context.destination);
+                node.port.onmessage = onWorkletMessage;
+                node.connect(state.analyserNode);
+                state.analyserNode.connect(state.gainNode);
+                state.gainNode.connect(context.destination);
 
-            state.workletNode = node;
-            state.playbackMode = 'worklet';
-            log('AudioWorklet ready');
+                state.workletNode = node;
+                state.playbackMode = 'worklet';
+                log('AudioWorklet ready');
+            } else {
+                // AudioWorklet is not available in this context (usually insecure context)
+                throw new Error('AudioWorklet not available in this context');
+            }
         } catch (workletError) {
             // The usual cause is an insecure context: AudioWorklet (like all
             // worklets) is a secure-context-only API, so plain http:// LAN
             // addresses fall back to the deprecated ScriptProcessor path.
+            const message = workletError instanceof Error 
+                ? workletError.message 
+                : String(workletError);
+                
             error(
                 'AudioWorklet unavailable; using ScriptProcessor fallback:',
                 workletError,
-                window.isSecureContext ? '' : '(page is not a secure context)'
+                !window.isSecureContext ? '(page is not a secure context)' : ''
             );
             setupScriptProcessor();
         }
