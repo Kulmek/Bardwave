@@ -4,10 +4,8 @@ use std::time::Duration;
 
 use soundshared::audio::{AudioEngine, DecodedAudio};
 
-#[cfg(feature = "opus-codec")]
 use soundshared::network::broadcast::AudioFrame;
 
-#[cfg(feature = "opus-codec")]
 #[test]
 fn headless_engine_publishes_10ms_frames_with_four_byte_header() {
     let engine = AudioEngine::new().expect("engine");

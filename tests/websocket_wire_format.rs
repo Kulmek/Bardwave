@@ -7,15 +7,11 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use soundshared::network::broadcast::{AudioBroadcaster, BroadcasterConfig};
-
-#[cfg(feature = "opus-codec")]
-use soundshared::network::broadcast::AudioFrame;
+use soundshared::network::broadcast::{AudioBroadcaster, AudioFrame, BroadcasterConfig};
 use soundshared::network::server::{build_router, ServerState};
 use soundshared::network::websocket::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
-#[cfg(feature = "opus-codec")]
 #[tokio::test]
 async fn websocket_audio_frame_has_eight_byte_header_and_opus_payload() {
     let (broadcaster, broadcaster_task) = AudioBroadcaster::new(BroadcasterConfig::default());
@@ -98,7 +94,6 @@ async fn websocket_audio_frame_has_eight_byte_header_and_opus_payload() {
 /// A listener that connects *after* audio started must still be told the stream
 /// format: the announcement is replayed from the broadcaster's remembered
 /// format instead of being prepared and quietly dropped.
-#[cfg(feature = "opus-codec")]
 #[tokio::test]
 async fn late_listener_receives_the_stream_format() {
     let (broadcaster, broadcaster_task) = AudioBroadcaster::new(BroadcasterConfig::default());

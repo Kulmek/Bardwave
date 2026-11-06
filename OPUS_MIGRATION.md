@@ -35,9 +35,7 @@ SoundShared streams the 48 kHz stereo f32 mix to browser listeners over WebSocke
 
 ## Build requirements
 
-`rusty-opus` 1.0 — a complete pure-Rust implementation of the Opus codec (RFC 6716 / RFC 8251). No C code, no FFI, no build-time toolchain, no CMake. Builds with `cargo` alone on any host where the Rust toolchain works.
-
-Enable with `cargo build --features opus-codec`.
+`rusty-opus` 1.0 — a complete pure-Rust implementation of the Opus codec (RFC 6716 / RFC 8251). No C code, no FFI, no build-time toolchain, no CMake. Builds with `cargo` alone on any host where the Rust toolchain works. Opus is compiled in by default; no feature flag is needed.
 
 ## Pending (not part of this change)
 

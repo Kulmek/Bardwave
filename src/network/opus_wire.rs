@@ -28,11 +28,7 @@
 
 use tracing::warn;
 
-#[cfg(feature = "opus-codec")]
 use rusty_opus::{Application, OpusEncoder, SignalType};
-
-#[cfg(not(feature = "opus-codec"))]
-use crate::network::opus_stub::{Application, Encoder as OpusEncoder, SignalType};
 
 use super::broadcast::AudioFormatInfo;
 
@@ -229,7 +225,6 @@ impl Default for WireEncoder {
     }
 }
 
-#[cfg(feature = "opus-codec")]
 #[cfg(test)]
 mod tests {
     use super::*;

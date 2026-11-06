@@ -1098,36 +1098,48 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     // Lazily create the WASM Opus decoder once per session. The library is a
     // UMD bundle served from /opus-decoder.min.js (script tag in index.html);
-    // in the browser it registers the global `window['opus-decoder']`.
+    // depending on the version it registers as `window['opus-decoder']`,
+    // `window.OpusDecoder`, `window.opusDecoder` or similar. We try several
+    // names so an incompatible build doesn't silently kill all audio.
     function ensureOpusDecoder() {
         if (state.opusDecoder) return Promise.resolve(state.opusDecoder);
         if (state.opusDecoderPromise) return state.opusDecoderPromise;
 
-        const lib = (window && window['opus-decoder']) || null;
-        if (!lib || !lib.OpusDecoder) {
+        // Try multiple possible global names the library might register under.
+        const candidates = [
+            window && window['opus-decoder'],
+            window && window.OpusDecoder,
+            window && window.opusDecoder,
+            window && window['OpusDecoder'],
+        ].filter(Boolean);
+
+        const lib = candidates[0] || null;
+        if (!lib) {
+            const tried = candidates.map((c) => (c ? c.name || c.toString().slice(0, 40) : 'undefined')).join(', ');
             const err = new Error('Opus decoder script is not loaded');
-            error('Opus decoder unavailable:', err.message);
+            error('Opus decoder unavailable. Tried globals:', tried);
             return Promise.reject(err);
         }
 
+        // The library might export the class directly or under an OpusDecoder property.
+        const DecoderClass = lib.OpusDecoder || lib;
+
         try {
-            const decoder = new lib.OpusDecoder({
+            const decoder = new DecoderClass({
                 sampleRate: CONFIG.sampleRate,
                 upgradeChannelCount: true,
-                channels: CONFIG.channels
+                channels: CONFIG.channels,
             });
-            state.opusDecoderPromise = decoder
-                .ready                                  // ready is a Promise property, not a method
-                .then(() => {
-                    state.opusDecoder = decoder;
-                    log('Opus decoder ready (WASM)');
-                    return decoder;
-                })
-                .catch((e) => {
-                    error('Opus decoder failed to initialize:', e);
-                    state.opusDecoderPromise = null;
-                    throw e;
-                });
+            const ready = decoder.ready;
+            state.opusDecoderPromise = Promise.resolve(ready).then(() => {
+                state.opusDecoder = decoder;
+                log('Opus decoder ready (WASM)');
+                return decoder;
+            }).catch((e) => {
+                error('Opus decoder failed to initialize:', e);
+                state.opusDecoderPromise = null;
+                throw e;
+            });
         } catch (e) {
             error('Failed to create the Opus decoder:', e);
             return Promise.reject(e);

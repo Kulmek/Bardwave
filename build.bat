@@ -3,14 +3,12 @@
 :: SoundShared — Windows build script (build.bat)
 ::==============================================================================
 :: Usage:
-::   build.bat                : debug build (Opus codec disabled)
-::   build.bat release        : release build (Opus codec disabled)
-::   build.bat opus           : debug build WITH Opus codec (pure Rust, no CMake/C compiler needed)
-::   build.bat opus-release   : release build WITH Opus codec (pure Rust, no CMake/C compiler needed)
-::   build.bat test           : run all tests
-::   build.bat clean          : cargo clean
-::   build.bat fmt            : cargo fmt --check
-::   build.bat clippy         : cargo clippy --all-targets
+::   build.bat        : debug build (Opus codec enabled, pure Rust — no CMake/C compiler needed)
+::   build.bat release: release build (Opus codec enabled, pure Rust — no CMake/C compiler needed)
+::   build.bat test   : run all tests
+::   build.bat clean  : cargo clean
+::   build.bat fmt    : cargo fmt --check
+::   build.bat clippy : cargo clippy --all-targets
 ::==============================================================================
 
 setlocal enabledelayedexpansion
@@ -19,14 +17,10 @@ setlocal enabledelayedexpansion
 set "PROJECT_ROOT=%~dp0"
 if not defined PROJECT_ROOT set "PROJECT_ROOT=."
 
-:: Default mode: debug, Opus disabled
+:: Default mode: debug, Opus always enabled (pure Rust, no CMake needed)
 set "BUILD_MODE=debug"
-set "OPUS_FEATURE="
 if "%~1"=="release" set "BUILD_MODE=release"
 if "%~1"=="rel" set "BUILD_MODE=release"
-if "%~1"=="opus" set "BUILD_MODE=debug"&set "OPUS_FEATURE=--features opus-codec"
-if "%~1"=="opus-release" set "BUILD_MODE=release"&set "OPUS_FEATURE=--features opus-codec"
-if "%~1"=="opus-rel" set "BUILD_MODE=release"&set "OPUS_FEATURE=--features opus-codec"
 
 ::----------------------------------------------------------------------
 :: 0. Prerequisites
@@ -51,13 +45,13 @@ if "%~1"=="test" goto :do_test
 :: Default: build
 ::----------------------------------------------------------------------
 :do_build
-echo [INFO] Building SoundShared %BUILD_MODE%...
+echo [INFO] Building SoundShared %BUILD_MODE% (Opus codec enabled)...
 cd /d "%PROJECT_ROOT%"
 
 if "%BUILD_MODE%"=="release" (
-    cargo build --release %OPUS_FEATURE%
+    cargo build --release
 ) else (
-    cargo build %OPUS_FEATURE%
+    cargo build
 )
 
 if errorlevel 1 (

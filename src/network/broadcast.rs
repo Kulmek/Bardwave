@@ -12,17 +12,12 @@
 //! [`crate::network::opus_wire`] for why that matters).
 
 use axum::extract::ws::Message;
+use rusty_opus::OpusEncoder;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-
-#[cfg(feature = "opus-codec")]
-use rusty_opus::OpusEncoder;
-
-#[cfg(not(feature = "opus-codec"))]
-use crate::network::opus_stub::Encoder as OpusEncoder;
 
 pub use super::opus_wire::wire_encoder;
 use super::opus_wire::{WireEncoder, WIRE_CHANNELS, WIRE_FRAME_FRAMES, WIRE_SAMPLE_RATE};
@@ -584,7 +579,6 @@ mod tests {
     }
 
     /// Encode a test frame the same way the broadcaster's loop does.
-    #[cfg(feature = "opus-codec")]
     #[cfg(test)]
     fn encode_test_frame(frame: &AudioFrame) -> Vec<u8> {
         let mut encoder = wire_encoder();
@@ -602,7 +596,6 @@ mod tests {
         assert!((frame.duration() - 0.01).abs() < 0.001);
     }
 
-    #[cfg(feature = "opus-codec")]
     #[test]
     fn test_opus_binary_format() {
         let mut frame = create_test_frame();
@@ -621,7 +614,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "opus-codec")]
     #[test]
     fn test_opus_roundtrip_quality() {
         let frame = create_test_frame();
@@ -647,7 +639,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "opus-codec")]
     #[test]
     fn test_server_ms_is_monotonic_and_parsable() {
         let epoch = std::time::Instant::now();
@@ -688,7 +679,7 @@ mod tests {
     /// is not a multiple of 480 frames must still put whole 10 ms packets on
     /// the wire instead of being dropped (silence) or fed to libopus (which
     /// rejects the frame size).
-    #[cfg(feature = "opus-codec")]
+
     #[tokio::test]
     async fn odd_sized_engine_blocks_still_reach_listeners() {
         let (handle, broadcaster) = AudioBroadcaster::new(BroadcasterConfig::default());
@@ -722,7 +713,7 @@ mod tests {
     }
 
     /// A pause must not glue a pre-pause fragment onto the next burst.
-    #[cfg(feature = "opus-codec")]
+
     #[tokio::test]
     async fn pause_between_bursts_drops_the_partial_frame() {
         let (handle, broadcaster) = AudioBroadcaster::new(BroadcasterConfig::default());

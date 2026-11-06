@@ -204,7 +204,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 
 **Client decode:** The browser listener decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s (`channelData`). The listener interleaves them into a single stereo buffer before pushing to the Web Audio ring buffer.
 
-**Build requirement:** Opus is a pure-Rust implementation (`rusty-opus`, RFC 6716) with no C code, no FFI, and no build-time toolchain. `cargo build` and `cargo build --release` work without CMake. Enable Opus with `cargo build --features opus-codec`.
+**Build requirement:** Opus is a pure-Rust implementation (`rusty-opus`, RFC 6716) with no C code, no FFI, and no build-time toolchain. `cargo build` and `cargo build --release` work without CMake; Opus is always compiled in.
 
 ## Building & testing
 
