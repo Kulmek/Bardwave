@@ -17,6 +17,9 @@ tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 
+# UPnP port forwarding (open router port for global-IP access)
+port-control-client = { version = "0.2", features = ["upnp"] }
+
 # Utilities
 anyhow = "1.0"
 thiserror = "1.0"
@@ -72,3 +75,4 @@ rfd = { workspace = true }
 tower-http = { workspace = true }
 backtrace = { workspace = true }
 ctrlc = { workspace = true }
+port-control-client = { workspace = true }

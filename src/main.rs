@@ -25,6 +25,7 @@ use soundshared::{
         },
         local_ip::detect_for_bind,
         server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
+        upnp::{add_port_mapping, remove_port_mapping, PortMapping},
         websocket::WebSocketConfig,
     },
 };
@@ -184,6 +185,8 @@ fn run_server_and_get_handle(
         let mut bind_port = config.port;
         // URL of the running server; `None` while the socket is down.
         let mut server_url: Option<String> = None;
+        // UPnP port-mapping handle, kept alive while the server runs.
+        let mut upnp_mapping: Option<PortMapping> = None;
 
         // One router definition, shared with NetworkServer: the app used to
         // hand-build a second copy of this exact route table.
@@ -258,11 +261,45 @@ fn run_server_and_get_handle(
                                         server_running = true;
                                         listener_count = 0;
                                         server_task = Some(task);
-                                        server_url = Some(url.clone());
 
-                                        *handle.url.lock().await = Some(url.clone());
-                                        let _ = response.send(Ok(url.clone()));
-                                        info!("Server started at {}", url);
+                                        // Try UPnP port mapping so the port is
+                                        // reachable from the global IP.
+                                        let mut advertised = url.clone();
+                                        if config.upnp {
+                                            match add_port_mapping(bind_addr, bind_port).await {
+                                                Ok((upnp, mapping)) => {
+                                                    upnp_mapping = Some(mapping);
+                                                    if let Some(external_ip) = upnp.external_ip {
+                                                        // Replace the LAN host in the URL with the
+                                                        // router's global IP so players outside
+                                                        // the LAN can connect.
+                                                        if let Some((_, rest)) = url.split_once("://") {
+                                                            if let Some((_host, path_port)) = rest.rsplit_once(':') {
+                                                                advertised = format!(
+                                                                    "http://{external_ip}:{path_port}"
+                                                                );
+                                                            }
+                                                        }
+                                                        info!(
+                                                            "UPnP mapped port {bind_port}; advertising global URL {advertised}"
+                                                        );
+                                                    } else {
+                                                        info!(
+                                                            "UPnP mapped port {bind_port}; no external IP readable"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("UPnP setup failed: {e}");
+                                                }
+                                            }
+                                        }
+
+                                        server_url = Some(advertised.clone());
+
+                                        *handle.url.lock().await = Some(advertised.clone());
+                                        let _ = response.send(Ok(advertised.clone()));
+                                        info!("Server started at {advertised}");
                                     }
                                     Err(message) => {
                                         error!("Failed to start listener: {}", message);
@@ -274,6 +311,11 @@ fn run_server_and_get_handle(
                         Some(ServerCommand::Stop { response }) => {
                             if server_running {
                                 server_running = false;
+
+                                // Remove UPnP port mapping before shutting down the listener.
+                                if let Some(mapping) = upnp_mapping.take() {
+                                    remove_port_mapping(mapping).await;
+                                }
 
                                 // Tell the listener (and every session it holds
                                 // open) to stop, then wait for it with a deadline.
@@ -350,6 +392,9 @@ fn run_server_and_get_handle(
         // Cleanup on shutdown. The broadcaster is detached instead of awaited:
         // it lives as long as the audio engine holds its handle, so waiting for
         // it here would block this thread for the rest of the run.
+        if let Some(mapping) = upnp_mapping.take() {
+            remove_port_mapping(mapping).await;
+        }
         if let Some(task) = server_task.take() {
             stop_listener(&shutdown_tx, task).await;
         }
@@ -432,6 +477,7 @@ fn main() -> Result<()> {
         port: config.server.port,
         bind_addr: parse_bind_host(&config.server.host)
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))),
+        upnp: config.server.upnp,
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
     };

@@ -72,6 +72,9 @@ pub enum NetworkError {
 
     #[error("Invalid address: {0}")]
     InvalidAddress(String),
+
+    #[error("UPnP error: {0}")]
+    Upnp(String),
 }
 
 #[derive(Error, Debug)]

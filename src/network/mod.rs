@@ -1,10 +1,11 @@
 //! Network module for SoundShared.
-//! Handles HTTP server, WebSocket connections, and audio broadcasting.
+//! Handles HTTP server, WebSocket connections, audio broadcasting, and UPnP port forwarding.
 
 pub mod broadcast;
 pub mod local_ip;
 pub mod opus_wire;
 pub mod server;
+pub mod upnp;
 pub mod websocket;
 
 pub use broadcast::{

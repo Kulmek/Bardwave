@@ -36,6 +36,11 @@ pub struct ServerConfig {
     /// Host to bind to (0.0.0.0 for all interfaces)
     #[serde(default = "default_host")]
     pub host: String,
+
+    /// Try to open this port on the local router via UPnP IGD so it is
+    /// reachable from the global IP. Disabled by default.
+    #[serde(default)]
+    pub upnp: bool,
 }
 
 /// Audio engine configuration
@@ -186,6 +191,7 @@ impl Default for ServerConfig {
         Self {
             port: default_port(),
             host: default_host(),
+            upnp: false,
         }
     }
 }
