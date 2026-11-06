@@ -1,5 +1,5 @@
 /**
- * SoundShared Listener — WebSocket audio player
+ * SoundShared Listener вЂ” WebSocket audio player
  *
  * Wire format (server -> browser):
  *   [seq_no: u32 LE][pcm: f32 LE, interleaved stereo, 48 kHz]
@@ -48,7 +48,7 @@
         // Frames this much older than the freshest arrival are dropped at
         // ingress (burst backlog from the server must not flood the queue).
         staleMs: 1200,
-        // Limits for the drift-correcting consumption step: up to ±2% while
+        // Limits for the drift-correcting consumption step: up to В±2% while
         // catching up (a short transient at the edge of perception), and
         // effectively ~0 in steady state because the factor is proportional
         // to how far the queue is from its target.
@@ -631,6 +631,10 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         console.error('[SoundShared]', new Date().toISOString(), ...arguments);
     }
 
+    function warn() {
+        console.warn('[SoundShared]', new Date().toISOString(), ...arguments);
+    }
+
     // Switch the wire codec as announced by the server and prime the decoder
     // ahead of the first packet (loading the WASM module is ~100 ms).
     function setStreamCodec(codec) {
@@ -1068,9 +1072,9 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     // The payload is one Opus packet (see broadcast.rs). `server_ms` counts
     // stream time on the server and drives both the staleness check and the
     // adaptive target below. Decoding happens through `opus-decoder` (WASM,
-    // served by the server): its decodeFrame resolves on the microtask queue,
-    // so packets are pushed onto a promise chain that preserves arrival order
-    // even though decoding itself returns a Promise.
+    // served by the server): `decodeFrame` is synchronous, and the result is
+    // wrapped in `Promise.resolve()` so packets are pushed onto a promise chain
+    // that preserves arrival order.
     // =========================================================================
 
     // Lazily create the WASM Opus decoder once per session. The library is a
@@ -1094,7 +1098,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 channels: CONFIG.channels
             });
             state.opusDecoderPromise = decoder
-                .ready()
+                .ready                                  // ready is a Promise property, not a method
                 .then(() => {
                     state.opusDecoder = decoder;
                     log('Opus decoder ready (WASM)');
@@ -1195,15 +1199,20 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         const payload = new Uint8Array(arrayBuffer, 8, payloadBytes);
 
-        if (state.streamCodec === 'opus') {            // Push onto the decode chain: order of arrival is preserved, and
-            // decodeFrame resolves on the microtask queue (WASM-synchronous).
-            // The chain is never reset mid-session — each link is tiny, and
-            // clearing the tail could break packet ordering under load.
+        if (state.streamCodec === 'opus') {            // Push onto the decode chain: order of arrival is preserved.
+            // decodeFrame is synchronous but its result is wrapped in a Promise,
+            // so the chain preserves arrival order even under load. The chain is
+            // never reset mid-session вЂ” each link is tiny, and clearing the tail
+            // could break packet ordering under load.
             let runDecode = state.decodeChain
                 ? state.decodeChain.then(() => decodeOpusPayload(payload))
                 : decodeOpusPayload(payload);
             state.decodeChain = runDecode
-                .then((samples) => processAudioFrame(samples, seq, now));
+                .then((samples) => processAudioFrame(samples, seq, now))
+                .catch((e) => {
+                    error('Opus decode pipeline error, resetting chain:', e);
+                    state.decodeChain = null;
+                });
         } else if (payloadBytes % 4 === 0) {
             // Legacy f32 PCM path (no longer produced by the server; kept so
             // mixed-version clients keep playing while testing).
@@ -1216,30 +1225,108 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     }
 
     // Decode one Opus packet through the WASM decoder (loading it on first
-    // use). `opus-decoder` returns `channelData` — per-channel Float32Arrays —
-    // not interleaved `samples`. Interleave to match the ring buffer and
-    // worklet. Returns decoded interleaved f32 samples, or an empty buffer on
-    // failure so the pipeline keeps moving.
-    function decodeOpusPayload(payload) {
-        const decoder = state.opusDecoder;
-        const run = (d) =>
-            d.decodeFrame(payload).then((result) => {
-                if (!result || !result.channelData) {
-                    return new Float32Array(0);
-                }
-                const channels = result.channelData;
-                if (channels.length === 0) {
-                    return new Float32Array(0);
-                }
-                const frames = channels[0].length;
-                const interleaved = new Float32Array(frames * channels.length);
+    // use). `opus-decoder.decodeFrame` is synchronous вЂ” it returns
+    // `{errors, channelData, samplesDecoded, sampleRate, bitDepth}` directly,
+    // not a Promise. `channelData` is per-channel Float32Arrays (e.g.
+    // [left, right]); we interleave them into one Float32Array for the ring
+    // buffer and ScriptProcessorNode. We wrap the result in `Promise.resolve()`
+    // so the caller's `.then()` chain keeps working. Returns decoded interleaved
+    // f32 samples, or an empty buffer on failure so the pipeline keeps moving.
+    //
+    // The opus-decoder WASM library has shipped multiple incompatible
+    // decodeFrame return shapes across versions:
+    //   вЂў old:   just a number (samplesDecoded) вЂ” no PCM extractable
+    //   вЂў mid:   { channelData: Float32Array[], samplesDecoded, sampleRate }
+    //   вЂў new:   { errors, channelData, samplesDecoded, sampleRate, bitDepth }
+    //   вЂў alt:   { outputBuffer: Float32Array, ... }  (interleaved)
+    // We handle every shape we can recognise and log the rest so an
+    // incompatible library version is visible in the console instead of
+    // producing silent silence.
+    // Extract interleaved f32 PCM from a decodeFrame result object, or empty
+    // buffer on failure. Also logs the result shape once so an incompatible
+    // opus-decoder version is visible in the console.
+    function extractOpusPcm(result) {
+        // Old API: decodeFrame returns just a sample count вЂ” no PCM extractable.
+        if (typeof result === 'number') {
+            if (!state._opusWarnedOldApi) {
+                state._opusWarnedOldApi = true;
+                warn('opus-decoder: decodeFrame returned a number (old API), no PCM extractable');
+            }
+            return new Float32Array(0);
+        }
+
+        if (!result || typeof result !== 'object') {
+            if (!state._opusWarnedNoResult) {
+                state._opusWarnedNoResult = true;
+                warn('opus-decoder: decodeFrame returned no usable result:', result);
+            }
+            return new Float32Array(0);
+        }
+
+        // Newer API surfaces errors explicitly. Check if errors array has content.
+        if (Array.isArray(result.errors) && result.errors.length > 0) {
+            if (!state._opusWarnedErrors) {
+                state._opusWarnedErrors = true;
+                warn('opus-decoder: decodeFrame reported errors:', result.errors);
+            }
+            return new Float32Array(0);
+        }
+
+        // Prefer the interleaved outputBuffer if the library provides it.
+        if (result.outputBuffer instanceof Float32Array && result.outputBuffer.length > 0) {
+            return result.outputBuffer;
+        }
+
+        // Otherwise interleave per-channel channelData into one buffer.
+        if (Array.isArray(result.channelData) && result.channelData.length >= CONFIG.channels) {
+            const channels = result.channelData;
+            const frames = channels[0] instanceof Float32Array ? channels[0].length : 0;
+            if (frames > 0) {
+                const interleaved = new Float32Array(frames * CONFIG.channels);
                 for (let f = 0; f < frames; f++) {
-                    for (let c = 0; c < channels.length; c++) {
-                        interleaved[f * channels.length + c] = channels[c][f];
+                    for (let c = 0; c < CONFIG.channels; c++) {
+                        interleaved[f * CONFIG.channels + c] = channels[c][f];
                     }
                 }
                 return interleaved;
-            });
+            }
+        }
+
+        // Some versions expose a single interleaved buffer under 'data'.
+        if (result.data instanceof Float32Array && result.data.length > 0) {
+            return result.data;
+        }
+
+        if (!state._opusWarnedUnknownShape) {
+            state._opusWarnedUnknownShape = true;
+            const keys = Object.keys(result);
+            warn('opus-decoder: unknown decodeFrame result shape, keys:', keys);
+        }
+        return new Float32Array(0);
+    }
+
+    function decodeOpusPayload(payload) {
+        const decoder = state.opusDecoder;
+        const run = (d) => {
+            let result;
+            try {
+                const raw = d.decodeFrame(payload); // synchronous in most versions
+                if (raw && typeof raw.then === 'function') {
+                    // Newer async API: decodeFrame returns a Promise.
+                    return raw.then(extractOpusPcm)
+                        .catch((e) => {
+                            error('Opus decodeFrame (async) rejected:', e);
+                            return new Float32Array(0);
+                        });
+                }
+                result = raw;
+            } catch (e) {
+                error('Opus decodeFrame threw:', e);
+                return Promise.resolve(new Float32Array(0));
+            }
+
+            return Promise.resolve(extractOpusPcm(result));
+        };
         if (decoder) {
             return run(decoder);
         }
@@ -1255,7 +1342,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         //
         // Opus sends every 10 ms frame, so a gap means a packet was lost on
         // the wire. Inserting hard silence here creates a click at every
-        // loss — instead, track the missed frames and let the worklet's
+        // loss вЂ” instead, track the missed frames and let the worklet's
         // underrun fade handle the gap silently. The legacy PCM path (no
         // longer produced by the server) keeps silence insertion so
         // mixed-version clients don't lose timeline alignment.
@@ -1271,8 +1358,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 state.missedFrames += missed;
                 if (state.streamCodec !== 'opus') {
                     // Legacy PCM: fill the gap with silence so the playback
-                    // timeline stays aligned. Opus does not do this — hard
-                    // silence on packet loss is exactly the "пердёж" click.
+                    // timeline stays aligned. Opus does not do this вЂ” hard
+                    // silence on packet loss is exactly the "РїРµСЂРґС‘Р¶" click.
                     if (missed <= 50 && state.lastPacketFrames > 0) {
                         const silenceSamples =
                             missed * state.lastPacketFrames * CONFIG.channels;
