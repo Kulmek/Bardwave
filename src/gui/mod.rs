@@ -61,10 +61,37 @@ impl GuiApp {
             viewport: ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
                 .with_min_inner_size([960.0, 620.0])
-                .with_title("SoundShared — Broadcast Console"),
+                .with_title("SoundShared — Broadcast Console")
+                .with_icon(window_icon()),
             centered: true,
             ..Default::default()
         }
+    }
+}
+
+/// Window / taskbar mark for the running app.
+///
+/// The executable itself carries the multi-resolution icon through
+/// `assets/icon.rc` (see `build.rs`); this is the same mark handed to the window
+/// manager so the title bar and taskbar button match even when the window class
+/// icon is not taken from the binary.
+///
+/// Stored as straight-alpha RGBA rather than PNG so no image decoder is needed
+/// at runtime. Regenerate with `node assets/tools/gen-icon.mjs`.
+const WINDOW_ICON_SIZE: u32 = 64;
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../../assets/icon-64.rgba");
+/// A stale or truncated asset would silently produce a blank icon, so the size
+/// contract with the generator is enforced when the crate is compiled.
+const _: () = assert!(
+    WINDOW_ICON_RGBA.len() == WINDOW_ICON_SIZE as usize * WINDOW_ICON_SIZE as usize * 4,
+    "assets/icon-64.rgba is out of date: re-run `node assets/tools/gen-icon.mjs`"
+);
+
+fn window_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: WINDOW_ICON_RGBA.to_vec(),
+        width: WINDOW_ICON_SIZE,
+        height: WINDOW_ICON_SIZE,
     }
 }
 
