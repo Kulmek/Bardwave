@@ -59,7 +59,7 @@ impl Default for ServerConfig {
         Self {
             bind_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             port: 8080,
-            upnp: false,
+            upnp: true,
             broadcaster_config: BroadcasterConfig::default(),
             websocket_config: WebSocketConfig::default(),
         }

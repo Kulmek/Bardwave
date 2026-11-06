@@ -38,8 +38,8 @@ pub struct ServerConfig {
     pub host: String,
 
     /// Try to open this port on the local router via UPnP IGD so it is
-    /// reachable from the global IP. Disabled by default.
-    #[serde(default)]
+    /// reachable from the global IP. Enabled by default.
+    #[serde(default = "default_upnp")]
     pub upnp: bool,
 }
 
@@ -147,6 +147,10 @@ fn default_port() -> u16 {
 
 fn default_host() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_upnp() -> bool {
+    true
 }
 
 fn default_buffer_size() -> usize {

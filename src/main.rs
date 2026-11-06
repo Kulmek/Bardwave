@@ -272,16 +272,18 @@ fn run_server_and_get_handle(
                                                     if let Some(external_ip) = upnp.external_ip {
                                                         // Replace the LAN host in the URL with the
                                                         // router's global IP so players outside
-                                                        // the LAN can connect.
-                                                        if let Some((_, rest)) = url.split_once("://") {
-                                                            if let Some((_host, path_port)) = rest.rsplit_once(':') {
-                                                                advertised = format!(
-                                                                    "http://{external_ip}:{path_port}"
-                                                                );
-                                                            }
+                                                        // the LAN can connect. Use the UPnP
+                                                        // external port in case the router
+                                                        // remapped it.
+                                                        if let Some((_, _rest)) = url.split_once("://") {
+                                                            advertised = format!(
+                                                                "http://{external_ip}:{}",
+                                                                upnp.external_port
+                                                            );
                                                         }
                                                         info!(
-                                                            "UPnP mapped port {bind_port}; advertising global URL {advertised}"
+                                                            "UPnP mapped port {bind_port} -> external {}; advertising global URL {advertised}",
+                                                            upnp.external_port
                                                         );
                                                     } else {
                                                         info!(
