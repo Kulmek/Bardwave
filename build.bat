@@ -35,7 +35,7 @@ if errorlevel 1 (
 
 where cmake >nul 2>&1
 if errorlevel 1 (
-    echo [WARN] cmake not found in PATH. opusic-sys (libopus) needs CMake to build.
+    echo [WARN] cmake not found in PATH. opusic-sys libopus needs CMake to build.
     echo        Trying scoop...
     where scoop >nul 2>&1
     if errorlevel 1 (
@@ -52,6 +52,29 @@ if errorlevel 1 (
     )
 )
 
+where ninja >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] ninja not found in PATH. CMake needs Ninja to avoid MSBuild temp-file sandbox blocks.
+    echo        Trying scoop...
+    where scoop >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] ninja is required but neither ninja nor scoop is available.
+        echo        Install ninja manually or run: scoop install ninja
+        exit /b 1
+    ) else (
+        echo [INFO] Installing ninja via scoop...
+        scoop install ninja
+        if errorlevel 1 (
+            echo [ERROR] scoop install ninja failed.
+            exit /b 1
+        )
+    )
+)
+
+:: Use Ninja generator so opusic-sys does not spawn MSBuild/cmd.exe,
+:: which is blocked in restricted Windows sandboxes.
+set "CMAKE_GENERATOR=Ninja"
+
 ::----------------------------------------------------------------------
 :: 1. Commands
 ::----------------------------------------------------------------------
@@ -64,14 +87,8 @@ if "%~1"=="test" goto :do_test
 :: Default: build
 ::----------------------------------------------------------------------
 :do_build
-echo [INFO] Building SoundShared (%BUILD_MODE%)...
+echo [INFO] Building SoundShared %BUILD_MODE%...
 cd /d "%PROJECT_ROOT%"
-
-:: Set a writable temp dir to avoid MSBuild/rc.exe temp-file access denials
-:: on locked-down Windows environments.
-if not exist "%TEMP%\soundshared-build" mkdir "%TEMP%\soundshared-build"
-set "TEMP=%TEMP%\soundshared-build"
-set "TMP=%TEMP%"
 
 if "%BUILD_MODE%"=="release" (
     cargo build --release
@@ -128,7 +145,7 @@ exit /b 0
 echo [INFO] Running tests...
 cd /d "%PROJECT_ROOT%"
 cargo test --all-targets
-if errorlevel 1 (
+if errorlevel  1 (
     echo [ERROR] Tests failed.
     exit /b 1
 )
