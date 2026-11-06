@@ -21,6 +21,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install CMake (required by opusic-sys / libopus build)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,6 +68,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install CMake (required by opusic-sys / libopus build)
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
