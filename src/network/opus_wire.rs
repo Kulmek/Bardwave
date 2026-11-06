@@ -28,6 +28,18 @@
 
 use tracing::warn;
 
+#[cfg(feature = "opus-codec")]
+use opus::Decoder as OpusDecoder;
+#[cfg(feature = "opus-codec")]
+use opus::Encoder as OpusEncoder;
+#[cfg(feature = "opus-codec")]
+use opus::{Application, Bitrate, Channels, Signal};
+
+#[cfg(not(feature = "opus-codec"))]
+use crate::network::opus_stub::Encoder as OpusEncoder;
+#[cfg(not(feature = "opus-codec"))]
+use crate::network::opus_stub::{Application, Bitrate, Channels, Signal};
+
 use super::broadcast::AudioFormatInfo;
 
 /// Sample rate of the wire stream.
@@ -54,25 +66,21 @@ pub const WIRE_BITRATE: i32 = 64_000;
 /// Kept as a free function (not just an `impl`) because several call sites —
 /// the broadcaster, the tests, and integrations — must produce byte-identical
 /// packets.
-pub fn wire_encoder() -> opus::Encoder {
-    let mut encoder = opus::Encoder::new(
-        WIRE_SAMPLE_RATE,
-        opus::Channels::Stereo,
-        opus::Application::Audio,
-    )
-    .expect("Opus encoder initialization");
+pub fn wire_encoder() -> OpusEncoder {
+    let mut encoder = OpusEncoder::new(WIRE_SAMPLE_RATE, Channels::Stereo, Application::Audio)
+        .expect("Opus encoder initialization");
 
     // These are all best-effort in libopus: a rejected CTL leaves the default
     // in place, which is still a working encoder, so failures are logged
     // rather than fatal.
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(WIRE_BITRATE));
+    let _ = encoder.set_bitrate(Bitrate::Bits(WIRE_BITRATE));
     // VBR gives quiet passages fewer bits for free; constrained VBR keeps a
     // full-packet ceiling so a single packet cannot stall a weak link.
     let _ = encoder.set_vbr(true);
     let _ = encoder.set_vbr_constraint(true);
     // Music hint: biases mode selection towards the music-oriented path
     // instead of the speech one. Ambience and soundtracks are the use case.
-    let _ = encoder.set_signal(opus::Signal::Music);
+    let _ = encoder.set_signal(Signal::Music);
     let _ = encoder.set_complexity(10);
     encoder
 }
@@ -82,7 +90,7 @@ pub fn wire_encoder() -> opus::Encoder {
 /// Holds the encoder plus the interleaved f32 remainder between calls. Feeding
 /// it any block size is safe; it emits zero or more whole 10 ms packets.
 pub struct WireEncoder {
-    encoder: opus::Encoder,
+    encoder: OpusEncoder,
     /// Leftover interleaved samples that did not fill a whole frame.
     remainder: Vec<f32>,
     /// Scratch packet buffer, reused so steady-state encoding does not
@@ -222,6 +230,7 @@ impl Default for WireEncoder {
     }
 }
 
+#[cfg(feature = "opus-codec")]
 #[cfg(test)]
 mod tests {
     use super::*;

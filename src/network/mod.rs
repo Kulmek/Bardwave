@@ -3,6 +3,8 @@
 
 pub mod broadcast;
 pub mod local_ip;
+#[cfg(not(feature = "opus-codec"))]
+pub mod opus_stub;
 pub mod opus_wire;
 pub mod server;
 pub mod websocket;

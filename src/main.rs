@@ -173,7 +173,7 @@ fn run_server_and_get_handle(
         // Kept for the whole run: every listener session subscribes to this
         // signal, so a Stop reaches the browsers as well as the accept loop.
         let (shutdown_tx, _) = broadcast::channel(1);
-        
+
         // Create broadcaster
         let (broadcaster_handle, broadcaster) = AudioBroadcaster::new(config.broadcaster_config.clone());
 

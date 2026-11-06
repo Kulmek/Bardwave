@@ -46,13 +46,17 @@ readme = "README.md"
 keywords = ["ttrpg", "soundboard", "audio", "streaming", "egui"]
 categories = ["multimedia::audio", "games"]
 
+[features]
+default = []
+opus-codec = ["dep:opus"]
+
 [dependencies]
 # Workspace deps
 egui = { workspace = true }
 eframe = { workspace = true }
 cpal = { workspace = true }
 symphonia = { workspace = true }
-opus = "0.4"
+opus = { version = "0.4", optional = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tokio-tungstenite = { workspace = true }
