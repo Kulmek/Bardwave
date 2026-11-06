@@ -35,10 +35,9 @@ SoundShared streams the 48 kHz stereo f32 mix to browser listeners over WebSocke
 
 ## Build requirements
 
-`opus` 0.4.0 → `opusic-sys` 0.7.7 compiles libopus 1.6.1 from C source via CMake.
+`rusty-opus` 1.0 — a complete pure-Rust implementation of the Opus codec (RFC 6716 / RFC 8251). No C code, no FFI, no build-time toolchain, no CMake. Builds with `cargo` alone on any host where the Rust toolchain works.
 
-- **CMake required** (`C:\Program Files\CMake\bin\cmake.exe` on this machine).
-- **MSBuild/Visual Studio C++ toolchain** required for the C build script. In the DSH sandbox MSBuild fails writing its temp exec batch to `AppData\Local\Temp\MSBuildTemp\...` (`System.UnauthorizedAccessException`) — debug build and all tests pass; release builds need a normal Windows temp dir (workaround: `set TEMP=<workspace>\target\msbuild-temp && set TMP=%TEMP%`).
+Enable with `cargo build --features opus-codec`.
 
 ## Pending (not part of this change)
 

@@ -41,9 +41,9 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 | `src/config` | `config.toml` schema and persistence |
 | `src/error` | Typed error types (`SoundSharedError`) |
 
-**Key dependencies:** egui, eframe, cpal, symphonia, tokio, axum, tokio-tungstenite, opus, serde, tracing, anyhow, thiserror, uuid, crossbeam-channel.
+**Key dependencies:** egui, eframe, cpal, symphonia, tokio, axum, tokio-tungstenite, rusty-opus, serde, tracing, anyhow, thiserror, uuid, crossbeam-channel.
 
-**Build requirements:** Rust 1.80+, CMake 3.16+ (for `opusic-sys` Opus codec), Windows 10/11 (primary target; local-IP detection is Windows-specific today).
+**Build requirements:** Rust 1.80+, Windows 10/11 (primary target; local-IP detection is Windows-specific today).
 
 ---
 

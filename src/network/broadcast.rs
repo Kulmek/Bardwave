@@ -19,9 +19,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[cfg(feature = "opus-codec")]
-use opus::Decoder as OpusDecoder;
-#[cfg(feature = "opus-codec")]
-use opus::Encoder as OpusEncoder;
+use rusty_opus::OpusEncoder;
 
 #[cfg(not(feature = "opus-codec"))]
 use crate::network::opus_stub::Encoder as OpusEncoder;
@@ -253,8 +251,9 @@ impl AudioFrame {
         // libopus reads the frame size from the input slice and the packet
         // capacity from the output slice. 4000 B covers any legal packet.
         let max_size = 4000;
-        match encoder.encode_vec_float(&frame.samples, max_size) {
-            Ok(packet) if !packet.is_empty() => Some(packet),
+        let mut packet = vec![0u8; max_size];
+        match encoder.encode(&frame.samples, WIRE_FRAME_FRAMES, &mut packet) {
+            Ok(len) if len > 0 => Some(packet[..len].to_vec()),
             Ok(_) => {
                 warn!("Opus encoder produced an empty packet; frame dropped");
                 None
@@ -331,7 +330,7 @@ pub struct AudioBroadcaster {
     seq_no: AtomicU64,
     /// Epoch for the per-frame `server_ms` stream timestamp
     stream_epoch: std::time::Instant,
-    /// PCM -> fixed 10 ms Opus packets, behind a plain mutex: `opus::Encoder` is
+    /// PCM -> fixed 10 ms Opus packets, behind a plain mutex: `rusty_opus::OpusEncoder` is
     /// `!Sync`, so holding it directly would make this whole struct `!Sync` and
     /// the `run()` future `!Send`. The lock is uncontended in single-task use.
     wire: std::sync::Mutex<WireEncoder>,
@@ -629,11 +628,12 @@ mod tests {
         let binary = encode_test_frame(&frame);
         let payload = AudioFrame::payload_from_binary(&binary).expect("payload present");
 
-        let mut decoder = opus::Decoder::new(WIRE_SAMPLE_RATE, opus::Channels::Stereo)
-            .expect("Opus decoder initialization");
+        let mut decoder =
+            rusty_opus::OpusDecoder::new(WIRE_SAMPLE_RATE as i32, WIRE_CHANNELS as usize)
+                .expect("Opus decoder initialization");
         let mut out = vec![0f32; frame.samples.len()];
         decoder
-            .decode_float(payload, &mut out, false)
+            .decode(payload, WIRE_FRAME_FRAMES, &mut out)
             .expect("decoding a freshly encoded packet");
 
         // Sine at the wire bitrate must survive: correlated, sane level.

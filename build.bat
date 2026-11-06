@@ -5,8 +5,8 @@
 :: Usage:
 ::   build.bat                : debug build (Opus codec disabled)
 ::   build.bat release        : release build (Opus codec disabled)
-::   build.bat opus           : debug build WITH Opus codec (requires cl.exe + C compiler)
-::   build.bat opus-release   : release build WITH Opus codec
+::   build.bat opus           : debug build WITH Opus codec (pure Rust, no CMake/C compiler needed)
+::   build.bat opus-release   : release build WITH Opus codec (pure Rust, no CMake/C compiler needed)
 ::   build.bat test           : run all tests
 ::   build.bat clean          : cargo clean
 ::   build.bat fmt            : cargo fmt --check
@@ -38,48 +38,6 @@ if errorlevel 1 (
     echo         then re-run this script.
     exit /b 1
 )
-
-where cmake >nul 2>&1
-if errorlevel 1 (
-    echo [WARN] cmake not found in PATH. opusic-sys libopus needs CMake to build.
-    echo        Trying scoop...
-    where scoop >nul 2>&1
-    if errorlevel 1 (
-        echo [ERROR] cmake is required but neither cmake nor scoop is available.
-        echo        Install cmake manually or run: scoop install cmake
-        exit /b 1
-    ) else (
-        echo [INFO] Installing cmake via scoop...
-        scoop install cmake
-        if errorlevel 1 (
-            echo [ERROR] scoop install cmake failed.
-            exit /b 1
-        )
-    )
-)
-
-where ninja >nul 2>&1
-if errorlevel 1 (
-    echo [WARN] ninja not found in PATH. CMake needs Ninja to avoid MSBuild temp-file sandbox blocks.
-    echo        Trying scoop...
-    where scoop >nul 2>&1
-    if errorlevel 1 (
-        echo [ERROR] ninja is required but neither ninja nor scoop is available.
-        echo        Install ninja manually or run: scoop install ninja
-        exit /b 1
-    ) else (
-        echo [INFO] Installing ninja via scoop...
-        scoop install ninja
-        if errorlevel 1 (
-            echo [ERROR] scoop install ninja failed.
-            exit /b 1
-        )
-    )
-)
-
-:: Use Ninja generator so opusic-sys does not spawn MSBuild/cmd.exe,
-:: which is blocked in restricted Windows sandboxes.
-set "CMAKE_GENERATOR=Ninja"
 
 ::----------------------------------------------------------------------
 :: 1. Commands

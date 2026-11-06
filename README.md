@@ -86,7 +86,6 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 
 - **Windows 10/11** (the audio and network code is portable Rust; only the local-IP detection is Windows-specific today — see [Roadmap](#roadmap)).
 - [Rust toolchain](https://rustup.rs) 1.80 or newer.
-- **CMake 3.16+** — required to build the [Opus](https://opus-codec.org) codec dependency (`opusic-sys`) used for network audio compression. On Windows, install from https://cmake.org/download and ensure `cmake.exe` is on your `PATH` before building.
 - A sound card. No, really — this is the point of the app.
 
 ### Build & run
@@ -205,7 +204,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 
 **Client decode:** The browser listener decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s (`channelData`). The listener interleaves them into a single stereo buffer before pushing to the Web Audio ring buffer.
 
-**Build requirement:** Opus is implemented in C (`libopus` 1.6.1) via the `opusic-sys` crate, so **CMake must be installed** for `cargo build` and `cargo build --release` to succeed. Debug and release builds have both been verified with CMake on `PATH`.
+**Build requirement:** Opus is a pure-Rust implementation (`rusty-opus`, RFC 6716) with no C code, no FFI, and no build-time toolchain. `cargo build` and `cargo build --release` work without CMake. Enable Opus with `cargo build --features opus-codec`.
 
 ## Building & testing
 

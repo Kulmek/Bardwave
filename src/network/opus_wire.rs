@@ -6,7 +6,7 @@
 //! ms. It is *not* a streaming encoder that swallows arbitrary block lengths.
 //! The hardware callback, however, hands us whatever block size the device
 //! negotiated — 441, 512, 1024 frames … — while the headless mixer publishes
-//! 480. Feeding those blocks to [`opus::Encoder::encode_float`] does not fail
+//! 480. Feeding those blocks to [`rusty_opus::OpusEncoder::encode`] does not fail
 //! loudly: `opus_encode` itself only rejects the call and returns an error,
 //! which used to drop every frame on devices whose buffer was not exactly
 //! 480 frames (silence on the wire), and silently desynchronized the encoder
@@ -29,16 +29,10 @@
 use tracing::warn;
 
 #[cfg(feature = "opus-codec")]
-use opus::Decoder as OpusDecoder;
-#[cfg(feature = "opus-codec")]
-use opus::Encoder as OpusEncoder;
-#[cfg(feature = "opus-codec")]
-use opus::{Application, Bitrate, Channels, Signal};
+use rusty_opus::{Application, OpusEncoder, SignalType};
 
 #[cfg(not(feature = "opus-codec"))]
-use crate::network::opus_stub::Encoder as OpusEncoder;
-#[cfg(not(feature = "opus-codec"))]
-use crate::network::opus_stub::{Application, Bitrate, Channels, Signal};
+use crate::network::opus_stub::{Application, Encoder as OpusEncoder, SignalType};
 
 use super::broadcast::AudioFormatInfo;
 
@@ -67,21 +61,23 @@ pub const WIRE_BITRATE: i32 = 64_000;
 /// the broadcaster, the tests, and integrations — must produce byte-identical
 /// packets.
 pub fn wire_encoder() -> OpusEncoder {
-    let mut encoder = OpusEncoder::new(WIRE_SAMPLE_RATE, Channels::Stereo, Application::Audio)
-        .expect("Opus encoder initialization");
+    let mut encoder = OpusEncoder::new(
+        WIRE_SAMPLE_RATE as i32,
+        WIRE_CHANNELS as usize,
+        Application::Audio,
+    )
+    .expect("Opus encoder initialization");
 
-    // These are all best-effort in libopus: a rejected CTL leaves the default
-    // in place, which is still a working encoder, so failures are logged
-    // rather than fatal.
-    let _ = encoder.set_bitrate(Bitrate::Bits(WIRE_BITRATE));
+    // These are all best-effort: a rejected setting leaves the default in place,
+    // which is still a working encoder, so failures are logged rather than fatal.
+    encoder.bitrate_bps = WIRE_BITRATE;
     // VBR gives quiet passages fewer bits for free; constrained VBR keeps a
     // full-packet ceiling so a single packet cannot stall a weak link.
-    let _ = encoder.set_vbr(true);
-    let _ = encoder.set_vbr_constraint(true);
+    encoder.use_cbr = false;
     // Music hint: biases mode selection towards the music-oriented path
     // instead of the speech one. Ambience and soundtracks are the use case.
-    let _ = encoder.set_signal(Signal::Music);
-    let _ = encoder.set_complexity(10);
+    encoder.signal_type = Some(SignalType::Music);
+    encoder.complexity = 10;
     encoder
 }
 
@@ -172,7 +168,10 @@ impl WireEncoder {
 
     /// Encode one whole frame into an owned packet.
     fn encode_block(&mut self, block: &[f32]) -> Option<Vec<u8>> {
-        match self.encoder.encode_float(block, &mut self.packet[..]) {
+        match self
+            .encoder
+            .encode(block, WIRE_FRAME_FRAMES, &mut self.packet[..])
+        {
             Ok(len) if len > 0 => Some(self.packet[..len].to_vec()),
             Ok(_) => {
                 warn!("Opus encoder produced an empty packet; frame dropped");
@@ -251,10 +250,11 @@ mod tests {
 
     fn decode(packet: &[u8]) -> Vec<f32> {
         let mut decoder =
-            opus::Decoder::new(WIRE_SAMPLE_RATE, opus::Channels::Stereo).expect("decoder");
+            rusty_opus::OpusDecoder::new(WIRE_SAMPLE_RATE as i32, WIRE_CHANNELS as usize)
+                .expect("decoder");
         let mut out = vec![0f32; WIRE_FRAME_SAMPLES];
         let n = decoder
-            .decode_float(packet, &mut out, false)
+            .decode(packet, WIRE_FRAME_FRAMES, &mut out)
             .expect("decode");
         out.truncate(n * WIRE_CHANNELS as usize);
         out
