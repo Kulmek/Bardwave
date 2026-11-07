@@ -230,11 +230,10 @@ cargo build --release
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` picks up the new version, and commit both. The **Release** workflow checks the version on every push and pull request:
+Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` picks up the new version, and commit both. The **Release** workflow checks the version on every push to `main` (including merged pull requests; open pull requests only run CI):
 
 - tag `v<version>` already exists: nothing to do;
-- new version in a pull request: tests and builds Windows and Linux, without publishing;
-- new version pushed to `main` (e.g. after merging): tests, builds, creates tag `v<version>` and publishes a GitHub release with `Bardwave-v<version>-windows-x86_64.zip` and `Bardwave-v<version>-linux-x86_64.tar.gz`. Versions with a suffix (`1.2.0-beta.1`) are marked as pre-releases.
+- new version: tests, builds Windows and Linux, creates tag `v<version>` and publishes a GitHub release with `Bardwave-v<version>-windows-x86_64.zip` and `Bardwave-v<version>-linux-x86_64.tar.gz`. Versions with a suffix (`1.2.0-beta.1`) are marked as pre-releases.
 
 To retry a failed release, run it by hand: Actions → **Release** → **Run workflow** with the same version. The Linux binary needs GTK 3 and ALSA (`libgtk-3-0`, `libasound2`) installed.
 
