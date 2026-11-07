@@ -3,6 +3,7 @@
 
 pub mod access;
 pub mod broadcast;
+pub mod control;
 pub mod local_ip;
 pub mod opus_wire;
 pub mod server;
