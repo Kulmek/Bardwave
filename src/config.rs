@@ -44,6 +44,13 @@ pub struct ServerConfig {
     /// reachable from the global IP. Enabled by default.
     #[serde(default = "default_upnp")]
     pub upnp: bool,
+
+    /// Key players need in the link (`/?k=…`) to hear the stream.
+    ///
+    /// Generated on first start when missing. Set it to `""` to let anyone
+    /// who can reach the port listen (not recommended with UPnP on).
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 /// Audio engine configuration
@@ -187,6 +194,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             upnp: default_upnp(),
+            access_token: None,
         }
     }
 }

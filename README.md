@@ -124,6 +124,10 @@ On **Start** the console asks your router to forward the port to this PC (UPnP I
 
 The LISTEN URL is click-to-copy. Players open it, hit **Establish Link**, and the stream starts.
 
+#### Access key
+
+Every link the console copies ends with `/?k=<key>`: the stream (and `/api/status`) refuse connections without it, so an open port does not mean anyone on the internet can listen. The key is generated on first start and kept in `config.toml` (`[server] access_token`). The ⟳ button next to **Access key** in the SERVER panel issues a new one: the old link stops working at once and everyone who joined with it is disconnected — share the new link afterwards. `access_token = ""` turns the check off.
+
 ### Headless
 
 ```bash
@@ -141,6 +145,7 @@ soundshared.exe --server-only
 host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
 port = 8080
 upnp = true        # ask the router to forward the port for players outside the LAN
+access_token = "…" # key players need in the link (/?k=…); generated on first start, "" = open
 
 [audio]
 buffer_size = 1024 # samples per channel
