@@ -207,6 +207,7 @@ fn run_server_and_get_handle(
             broadcaster: broadcaster_handle.clone(),
             websocket_config: config.websocket_config.clone(),
             shutdown_tx: shutdown_tx.clone(),
+            access: config.access.clone(),
         };
 
         let app = build_router(state);
@@ -474,7 +475,7 @@ fn main() -> Result<()> {
     // silently (there is no console to print to), which looked like the app
     // simply refusing to start. Say what is wrong instead; never fall back to
     // defaults here, because the next save would overwrite the library.
-    let config = match Config::load() {
+    let mut config = match Config::load() {
         Ok(config) => config,
         Err(e) => {
             if !server_only {
@@ -500,6 +501,20 @@ fn main() -> Result<()> {
 
     // Initialize logging
     init_logging(&config)?;
+
+    // The stream is guarded by an access key carried in the shared link. A
+    // config without one gets a fresh key (and keeps it); `access_token = ""`
+    // explicitly opens the stream to anyone who can reach the port.
+    if config.server.access_token.is_none() {
+        config.server.access_token = Some(soundshared::network::generate_key());
+        if let Err(e) = config.save() {
+            warn!("Could not save the new access key to config.toml: {}", e);
+        }
+    }
+    let access = soundshared::network::AccessGuard::new(config.server.access_token.clone());
+    if access.current().is_none() {
+        warn!("Listener stream is open: access_token is empty in config.toml");
+    }
 
     info!("Starting SoundShared v{}", soundshared::VERSION);
 
@@ -539,6 +554,7 @@ fn main() -> Result<()> {
         upnp: config.server.upnp,
         broadcaster_config: BroadcasterConfig::default(),
         websocket_config: WebSocketConfig::default(),
+        access: access.clone(),
     };
 
     // Create shared app state (for GUI)
@@ -547,7 +563,8 @@ fn main() -> Result<()> {
         server_cmd_tx,
         Arc::new(Mutex::new(0)),
         Arc::new(Mutex::new(config.clone())),
-    );
+    )
+    .with_access(access.clone());
 
     // Spawn server thread (does NOT auto-start - waits for Start command from GUI).
     // The thread learns about process shutdown from its own Stop command / the
@@ -634,7 +651,7 @@ fn main() -> Result<()> {
             error!("Failed to request server start: {}", e);
         } else {
             match response_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(url)) => info!("Listener server available at {}", url),
+                Ok(Ok(url)) => info!("Listener server available at {}", access.share_url(&url)),
                 Ok(Err(e)) => error!("Failed to start listener server: {}", e),
                 Err(e) => error!("Timed out waiting for listener server to start: {}", e),
             }

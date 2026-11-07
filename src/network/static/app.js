@@ -784,7 +784,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
     function updateWsUrlUI() {
         if (!els.wsUrl) return;
-        const url = state.wsUrl || buildWsUrl();
+        // Never print the access key on the page.
+        const url = (state.wsUrl || buildWsUrl()).split('?')[0];
         els.wsUrl.textContent = url;
         els.wsUrl.title = url;
     }
@@ -1538,10 +1539,46 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     // =========================================================================
     // WebSocket
     // =========================================================================
+    // Access key from the shared link (`/?k=...`). The GM's console puts it
+    // into every link it copies; the audio stream refuses connections
+    // without it.
+    const ACCESS_KEY = (function () {
+        try {
+            return new URLSearchParams(location.search).get('k') || '';
+        } catch (e) {
+            return '';
+        }
+    })();
+
+    function keyQuery() {
+        return ACCESS_KEY ? '?k=' + encodeURIComponent(ACCESS_KEY) : '';
+    }
+
     function buildWsUrl() {
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = location.host || 'localhost:8080';
-        return protocol + '//' + host + '/ws/audio';
+        return protocol + '//' + host + '/ws/audio' + keyQuery();
+    }
+
+    // The link has no valid key (missing, mistyped, or replaced by the GM):
+    // say so and stop, instead of retrying forever.
+    function accessDenied() {
+        state.shouldReconnect = false;
+        state.isConnecting = false;
+        if (state.reconnectTimer) {
+            clearTimeout(state.reconnectTimer);
+            state.reconnectTimer = null;
+        }
+        setStatus('error', 'Access Denied');
+        setButtonState('idle');
+        setSystemToast('Access key rejected.', false, 'lucide:alert-triangle');
+        showMessage(
+            ACCESS_KEY
+                ? 'This link is no longer valid: the GM issued a new access key. Ask for the current link.'
+                : 'This link has no access key. Open the full link from the GM (it ends with ?k=...).',
+            'error',
+            true
+        );
     }
 
     function connect() {
@@ -1569,8 +1606,24 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         setSystemToast('Negotiating WebSocket handshake...', false, 'lucide:radio-tower');
         hideMessage();
 
-        log('Connecting to', state.wsUrl);
+        log('Connecting to', state.wsUrl.split('?')[0]);
 
+        // A browser WebSocket cannot see the HTTP status of a refused
+        // upgrade, so the key is checked against the status API first: a 401
+        // there means the link is wrong, not that the server is down.
+        fetch('/api/status' + keyQuery(), { cache: 'no-store' })
+            .then((res) => {
+                if (res.status === 401) {
+                    accessDenied();
+                    return;
+                }
+                openSocket();
+            })
+            .catch(() => openSocket());
+    }
+
+    function openSocket() {
+        if (!state.shouldReconnect) return;
         try {
             const ws = new WebSocket(state.wsUrl);
             ws.binaryType = 'arraybuffer';
@@ -1620,6 +1673,12 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         resetAudioPipeline();
         updateBufferUI();
         updateStatsUI();
+
+        if (event.code === 4001) {
+            // The GM issued a new access key; this link is revoked.
+            accessDenied();
+            return;
+        }
 
         if (state.shouldReconnect) {
             if (event.code === 1000) {
