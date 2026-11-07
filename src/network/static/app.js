@@ -154,6 +154,17 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.lastL = 0;
         this.lastR = 0;
 
+        // End-of-stream detection. The server sends nothing while nothing
+        // plays, so a short one-shot (shorter than the target pre-buffer)
+        // never filled the queue far enough to start: it sat silent until
+        // the *next* sound pushed the queue over the target, and then both
+        // played back to back. Once no packet has arrived for idleFrames the
+        // stream has paused: whatever is queued is played out right away and
+        // to the very end ("draining"), instead of waiting or rebuffering.
+        this.idleFrames = Math.floor(this.sampleRate * 0.12);
+        this.sincePush = 0;
+        this.draining = false;
+
         this.underruns = 0;
         this.overruns = 0;
         this.resyncs = 0;
@@ -207,6 +218,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         if (frames <= 0) return;
 
         this.receivedFrames += frames;
+        this.sincePush = 0;
+        this.draining = false;
 
         // Jumbo packet guard: one packet larger than the whole ring would
         // wrap the write past its own head. Drop the oldest part of it.
@@ -284,6 +297,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.speed = 1;
         this.lastL = 0;
         this.lastR = 0;
+        this.sincePush = 0;
+        this.draining = false;
         this.underruns = 0;
         this.overruns = 0;
         this.resyncs = 0;
@@ -338,15 +353,32 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         const frames = left.length;
         const step = this.updateSpeed(frames);
 
+        // The stream went quiet: play out what is queued now.
+        if (this.sincePush >= this.idleFrames && this.available >= 3) {
+            if (!this.started) {
+                this.started = true;
+                this.report();
+            }
+            this.draining = true;
+        }
+
         for (let i = 0; i < frames; i++) {
             // Underrun is detected per sample: as soon as the queue drops
             // to the low-water mark, playback fades out on the audio that is
             // still queued (30 ms is far more than the 8 ms fade), so the
             // stream never stops mid-waveform and never plays zeros at full
-            // gain — both of which are loud clicks.
-            if (this.started && this.available < this.lowWaterFrames) {
+            // gain — both of which are loud clicks. While draining the end of
+            // a sound, the queue is played down to the last sample instead.
+            if (this.started && !this.draining && this.available < this.lowWaterFrames) {
                 this.started = false;
                 this.underruns++;
+                this.report();
+            } else if (this.started && this.draining && this.available < 3) {
+                // End of the sound: fade out from its last sample.
+                this.started = false;
+                this.draining = false;
+                this.readFrame = this.writeFrame;
+                this.available = 0;
                 this.report();
             }
 
@@ -384,6 +416,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
                 this.lastR = 0;
             }
         }
+
+        this.sincePush += frames;
 
         if (this.playedFrames - this.lastReportPlayed >= Math.floor(this.sampleRate / 10)) {
             this.lastReportPlayed = this.playedFrames;
@@ -549,6 +583,9 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         scriptFade: 0,
         scriptLastL: 0,
         scriptLastR: 0,
+        // End-of-stream draining for the fallback (see the worklet).
+        scriptLastPushAt: 0,
+        scriptDraining: false,
 
         // Buffer / playback statistics
         bufferFrames: 0,
@@ -1050,14 +1087,25 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         if (!state.scriptStarted && ring.available >= ring.targetFrames) {
             state.scriptStarted = true;
         }
+        // The stream went quiet: play out a short sound now instead of
+        // holding it until the next one arrives (see the worklet).
+        if (performance.now() - state.scriptLastPushAt > 120 && ring.available >= 2) {
+            state.scriptStarted = true;
+            state.scriptDraining = true;
+        }
         const step = ring.blockSpeed(frames);
 
         for (let i = 0; i < frames; i++) {
             // Same per-sample underrun handling as the worklet: fade out on
             // the audio still queued instead of cutting to zeros.
-            if (state.scriptStarted && ring.available < lowFrames) {
+            if (state.scriptStarted && !state.scriptDraining && ring.available < lowFrames) {
                 state.scriptStarted = false;
                 state.underruns++;
+            } else if (state.scriptStarted && state.scriptDraining && ring.available < 2) {
+                state.scriptStarted = false;
+                state.scriptDraining = false;
+                ring.readFrame = ring.writeFrame;
+                ring.available = 0;
             }
 
             const consuming = state.scriptStarted || state.scriptFade > 0;
@@ -1111,6 +1159,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             );
         } else if (state.playbackMode === 'script' && state.scriptRing) {
             state.scriptRing.push(samples);
+            state.scriptLastPushAt = performance.now();
+            state.scriptDraining = false;
         }
     }
 
