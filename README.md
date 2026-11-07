@@ -13,7 +13,7 @@ Run the mix on your own PC and let every player hear it in their browser over th
 No subscriptions, no accounts, no cloud. A self-hosted alternative to Syrinscape and RPG Sounds.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-a04a4a.svg?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-7a3b3b.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-7a3b3b.svg?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows-3b3b3b.svg?style=flat-square&logo=windows&logoColor=white)](#requirements)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-a04a4a.svg?style=flat-square)](#contributing)
 
@@ -85,7 +85,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 ### Requirements
 
 - **Windows 10/11** (the audio and network code is portable Rust; only the local-IP detection is Windows-specific today — see [Roadmap](#roadmap)).
-- [Rust toolchain](https://rustup.rs) 1.80 or newer.
+- [Rust toolchain](https://rustup.rs) 1.85 or newer.
 - A sound card. No, really — this is the point of the app.
 
 ### Build & run
@@ -108,6 +108,16 @@ The SERVER panel shows two addresses:
 |---|---|
 | `http://192.168.x.x:8080` | **Your players.** Open it on any device in the same network. |
 | `http://127.0.0.1:8080` | **You**, to test the listener page on your own machine. |
+| `http://<global-ip>:8080` | **Remote players**, over the internet. Shown as INTERNET once the router forwards the port. |
+
+#### Players outside your network
+
+On **Start** the console asks your router to forward the port to this PC (UPnP IGD, with PCP / NAT-PMP as fallbacks) and shows the resulting `INTERNET` address (click to copy). The mapping is renewed while the server runs and removed on **Stop**. Requirements and caveats:
+
+- UPnP must be enabled on the router. If no router answers, the panel says *no UPnP router* and the LAN address keeps working; forward the port by hand instead.
+- If the router's external address is private (carrier-grade NAT, or a provider modem in front of your router), the panel says *blocked by a second NAT*: the port is not reachable from the internet until you forward it on the upstream device or get a public IP from your provider.
+- On Windows the app adds an inbound firewall rule for the port when it runs as administrator; otherwise allow it when Windows asks.
+- Set `upnp = false` in `config.toml` to turn this off.
 
 The LISTEN URL is click-to-copy. Players open it, hit **Establish Link**, and the stream starts.
 
@@ -127,6 +137,7 @@ soundshared.exe --server-only
 [server]
 host = "0.0.0.0"   # bind address; "0.0.0.0" = all IPv4 interfaces
 port = 8080
+upnp = true        # ask the router to forward the port for players outside the LAN
 
 [audio]
 buffer_size = 1024 # samples per channel

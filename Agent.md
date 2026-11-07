@@ -43,7 +43,7 @@ Bardwave is a desktop TTRPG soundboard that streams an ambient mix to players' b
 
 **Key dependencies:** egui, eframe, cpal, symphonia, tokio, axum, tokio-tungstenite, rusty-opus, serde, tracing, anyhow, thiserror, uuid, crossbeam-channel.
 
-**Build requirements:** Rust 1.80+, Windows 10/11 (primary target; local-IP detection is Windows-specific today).
+**Build requirements:** Rust 1.85+, Windows 10/11 (primary target; local-IP detection is Windows-specific today).
 
 ---
 
@@ -149,6 +149,7 @@ cargo run --release
 [server]
 host = "0.0.0.0"
 port = 8080
+upnp = true
 
 [audio]
 buffer_size = 1024

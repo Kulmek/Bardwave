@@ -25,7 +25,7 @@ use soundshared::{
         },
         local_ip::detect_for_bind,
         server::{build_router, listen_url, Router, ServerConfig, ServerHandle, ServerState},
-        upnp::{add_port_mapping, remove_port_mapping, PortMapping},
+        upnp::{self, PortMapping, UpnpStatus},
         websocket::WebSocketConfig,
     },
 };
@@ -164,6 +164,7 @@ fn run_server_and_get_handle(
     server_cmd_rx: Receiver<ServerCommand>,
     listener_count_tx: Sender<usize>,
     server_handle_tx: Sender<ServerHandle>,
+    upnp_status: Arc<Mutex<UpnpStatus>>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -185,8 +186,10 @@ fn run_server_and_get_handle(
         let mut bind_port = config.port;
         // URL of the running server; `None` while the socket is down.
         let mut server_url: Option<String> = None;
-        // UPnP port-mapping handle, kept alive while the server runs.
+        // Router port mapping, kept alive while the server runs.
         let mut upnp_mapping: Option<PortMapping> = None;
+        let mut upnp_poll = tokio::time::interval(Duration::from_secs(1));
+        upnp_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // One router definition, shared with NetworkServer: the app used to
         // hand-build a second copy of this exact route table.
@@ -262,46 +265,22 @@ fn run_server_and_get_handle(
                                         listener_count = 0;
                                         server_task = Some(task);
 
-                                        // Try UPnP port mapping so the port is
-                                        // reachable from the global IP.
-                                        let mut advertised = url.clone();
+                                        server_url = Some(url.clone());
+                                        *handle.url.lock().await = Some(url.clone());
+                                        let _ = response.send(Ok(url.clone()));
+                                        info!("Server started at {}", url);
+
+                                        // Port forwarding runs in the background:
+                                        // the LAN URL above is never held up by
+                                        // a slow or absent router.
                                         if config.upnp {
-                                            match add_port_mapping(bind_addr, bind_port).await {
-                                                Ok((upnp, mapping)) => {
-                                                    upnp_mapping = Some(mapping);
-                                                    if let Some(external_ip) = upnp.external_ip {
-                                                        // Replace the LAN host in the URL with the
-                                                        // router's global IP so players outside
-                                                        // the LAN can connect. Use the UPnP
-                                                        // external port in case the router
-                                                        // remapped it.
-                                                        if let Some((_, _rest)) = url.split_once("://") {
-                                                            advertised = format!(
-                                                                "http://{external_ip}:{}",
-                                                                upnp.external_port
-                                                            );
-                                                        }
-                                                        info!(
-                                                            "UPnP mapped port {bind_port} -> external {}; advertising global URL {advertised}",
-                                                            upnp.external_port
-                                                        );
-                                                    } else {
-                                                        info!(
-                                                            "UPnP mapped port {bind_port}; no external IP readable"
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!("UPnP setup failed: {e}");
-                                                }
-                                            }
+                                            upnp_mapping = upnp::start(bind_addr, bind_port);
                                         }
-
-                                        server_url = Some(advertised.clone());
-
-                                        *handle.url.lock().await = Some(advertised.clone());
-                                        let _ = response.send(Ok(advertised.clone()));
-                                        info!("Server started at {advertised}");
+                                        *upnp_status.lock().unwrap() = if upnp_mapping.is_some() {
+                                            UpnpStatus::Searching
+                                        } else {
+                                            UpnpStatus::Off
+                                        };
                                     }
                                     Err(message) => {
                                         error!("Failed to start listener: {}", message);
@@ -314,10 +293,10 @@ fn run_server_and_get_handle(
                             if server_running {
                                 server_running = false;
 
-                                // Remove UPnP port mapping before shutting down the listener.
                                 if let Some(mapping) = upnp_mapping.take() {
-                                    remove_port_mapping(mapping).await;
+                                    upnp::release(mapping).await;
                                 }
+                                *upnp_status.lock().unwrap() = UpnpStatus::Off;
 
                                 // Tell the listener (and every session it holds
                                 // open) to stop, then wait for it with a deadline.
@@ -381,6 +360,33 @@ fn run_server_and_get_handle(
                     }
                 }
 
+                // Follow the router mapping: it can be granted, renewed or lost
+                // at any time while the server runs.
+                _ = upnp_poll.tick(), if upnp_mapping.is_some() => {
+                    if let Some(mapping) = &upnp_mapping {
+                        let next = upnp::describe(&mapping.status());
+                        let mut current = upnp_status.lock().unwrap();
+                        if *current != next {
+                            match &next {
+                                UpnpStatus::Mapped { external, url } => {
+                                    info!("Router forwards {external} -> port {bind_port}; internet URL {url}");
+                                    upnp::allow_through_firewall(bind_port);
+                                }
+                                UpnpStatus::DoubleNat { external } => warn!(
+                                    "Router forwards {external}, but that address is private: \
+                                     another NAT (CGNAT / provider modem) is in front of the router, \
+                                     so the port is not reachable from the internet"
+                                ),
+                                UpnpStatus::Unavailable(reason) => warn!(
+                                    "No router port forwarding yet ({reason}); retrying in the background"
+                                ),
+                                UpnpStatus::Searching | UpnpStatus::Off => {}
+                            }
+                            *current = next;
+                        }
+                    }
+                }
+
                 // Update listener count from broadcaster
                 count = count_rx.recv() => {
                     if let Ok(count) = count {
@@ -395,7 +401,7 @@ fn run_server_and_get_handle(
         // it lives as long as the audio engine holds its handle, so waiting for
         // it here would block this thread for the rest of the run.
         if let Some(mapping) = upnp_mapping.take() {
-            remove_port_mapping(mapping).await;
+            upnp::release(mapping).await;
         }
         if let Some(task) = server_task.take() {
             stop_listener(&shutdown_tx, task).await;
@@ -424,7 +430,7 @@ fn main() -> Result<()> {
             .unwrap_or_default();
         error!("PANIC: {}{}", msg, location);
 
-        if let Ok(bt) = std::panic::catch_unwind(|| backtrace::Backtrace::new()) {
+        if let Ok(bt) = std::panic::catch_unwind(backtrace::Backtrace::new) {
             error!("Backtrace:\n{:?}", bt);
         }
     }));
@@ -471,6 +477,7 @@ fn main() -> Result<()> {
     let broadcast_output_rx = audio_engine.broadcast_output_receiver();
 
     // Wrap audio engine in Arc<Mutex> for sharing with GUI (main thread)
+    #[allow(clippy::arc_with_non_send_sync)]
     let audio_engine_shared = Arc::new(Mutex::new(Some(audio_engine)));
 
     // Create network server config. The listener page is embedded in the binary
@@ -500,12 +507,14 @@ fn main() -> Result<()> {
     let server_cmd_rx_clone = server_cmd_rx.clone();
     let server_config_clone = server_config.clone();
     let server_handle_tx_clone = server_handle_tx.clone();
+    let upnp_status = app_state.upnp_status.clone();
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
             server_cmd_rx_clone,
             listener_count_tx_clone,
             server_handle_tx_clone,
+            upnp_status,
         ) {
             error!("Server error: {}", e);
         }
@@ -590,6 +599,7 @@ fn main() -> Result<()> {
         let _ = ctrlc_rx.recv();
 
         info!("Shutting down...");
+        stop_server_and_wait(&server_cmd_tx_for_start);
         let _ = shutdown_tx.send(());
         thread::sleep(Duration::from_millis(300));
 
@@ -609,6 +619,7 @@ fn main() -> Result<()> {
 
         // Shutdown sequence
         info!("Shutting down...");
+        stop_server_and_wait(&server_cmd_tx_for_start);
         let _ = shutdown_tx.send(());
 
         // Wait a bit for threads to clean up
@@ -623,6 +634,20 @@ fn main() -> Result<()> {
 
         info!("SoundShared stopped");
         gui_result.map_err(|e| SoundSharedError::Other(e.to_string()))
+    }
+}
+
+/// Stops the listener through the server thread, so the router port mapping is
+/// removed before the process exits.
+fn stop_server_and_wait(server_cmd_tx: &Sender<ServerCommand>) {
+    let (response_tx, response_rx) = bounded::<anyhow::Result<()>>(1);
+    if server_cmd_tx
+        .send(ServerCommand::Stop {
+            response: response_tx,
+        })
+        .is_ok()
+    {
+        let _ = response_rx.recv_timeout(Duration::from_secs(5));
     }
 }
 
