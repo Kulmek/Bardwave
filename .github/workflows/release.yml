@@ -56,6 +56,11 @@ jobs:
             echo "::error::Version $version does not match Cargo.toml ($cargo_version). Bump Cargo.toml on main first."
             exit 1
           fi
+          lock_version=$(grep -A1 '^name = "soundshared"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          if [ "$lock_version" != "$cargo_version" ]; then
+            echo "::error::Cargo.lock has soundshared $lock_version, Cargo.toml has $cargo_version. Run 'cargo build' after bumping the version and commit Cargo.lock."
+            exit 1
+          fi
 
           tag="v$version"
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] \

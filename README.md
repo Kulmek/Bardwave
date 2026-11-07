@@ -230,7 +230,7 @@ cargo build --release
 
 ### Releasing
 
-1. Bump `version` in `Cargo.toml` on `main`.
+1. Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` picks up the new version, and commit both to `main`.
 2. Actions → **Release** → **Run workflow**, enter the same version (e.g. `0.1.1`).
 
 The workflow tests and builds Windows and Linux, creates tag `v0.1.1` and publishes a GitHub release with `Bardwave-v0.1.1-windows-x86_64.zip` and `Bardwave-v0.1.1-linux-x86_64.tar.gz`. The Linux binary needs GTK 3 and ALSA (`libgtk-3-0`, `libasound2`) installed.
