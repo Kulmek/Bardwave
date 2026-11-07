@@ -58,6 +58,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 - Low-latency: small mixing buffers, compact binary frames
 - Browser listener page is **embedded in the binary**, so there is no static folder to ship
 - **Live listener counter** in the console
+- **Access key** in the shared link, and a **per-player volume** slider on the listener page
 - Automatic local address detection that ignores VPN/TUN adapters
 - Graceful start/stop that does not leave the server thread hung
 
@@ -191,7 +192,7 @@ Because players hear the **mix** and not the files, you can edit, replace or re-
 │                                          │                  │
 │                              axum HTTP + WebSocket          │
 └──────────────────────────────────────────┼──────────────────┘
-                                           │ ws://<lan-ip>:8080/ws
+                                           │ ws://<lan-ip>:8080/ws/audio?k=<key>
                           ┌────────────────┼────────────────┐
                           ▼                ▼                ▼
                      🧝 browser        🧙 browser       🧟 browser
@@ -218,7 +219,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 **Format announcement (text WebSocket message, sent on first frame):**
 
 ```json
-{"type":"data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
+{"type":"format","data":{"sample_rate":48000,"channels":2,"format":"opus","frame_size":480}}
 ```
 
 **Client decode:** The browser listener decodes each Opus packet with the bundled `opus-decoder` WASM module, which returns per-channel `Float32Array`s (`channelData`). The listener interleaves them into a single stereo buffer before pushing to the Web Audio ring buffer.
@@ -240,7 +241,7 @@ Honest list of what is **not** done yet — this is an early build, not a finish
 - [ ] Apply `[audio]` sample rate / channels / buffer size from the config (only master volume is wired up today)
 - [ ] A working `--server-only` mode that can load a library
 - [ ] Cross-platform local-IP detection (macOS/Linux)
-- [ ] Crossfade between scenes; per-listener volume control
+- [ ] Crossfade between scenes
 - [ ] Packaging: installer, portable build, maybe a Steam/itch release
 
 Ideas, bug reports and pull requests are welcome.

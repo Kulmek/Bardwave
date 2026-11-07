@@ -646,6 +646,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     let bufferCells = [];
 
     function cacheElements() {
+        els.volumeSlider = document.getElementById('volumeSlider');
+        els.volumeValue = document.getElementById('volumeValue');
         els.statusIndicator = document.getElementById('statusIndicator');
         els.statusText = document.getElementById('statusText');
 
@@ -953,7 +955,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         state.timeData = new Float32Array(state.analyserNode.fftSize);
 
         state.gainNode = context.createGain();
-        state.gainNode.gain.value = 1.0;
+        state.gainNode.gain.value = volumeGain();
 
         try {
             const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
@@ -1914,8 +1916,84 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
     // =========================================================================
     // Init
     // =========================================================================
+    // =========================================================================
+    // Per-listener volume
+    //
+    // Only this device: the GM's mix and every other player are unaffected.
+    // Remembered in localStorage. The slider is perceptual (squared), so the
+    // lower half is usable instead of everything below 50 % sounding loud.
+    // =========================================================================
+    const VOLUME_KEY = 'bardwave.volume';
+    const volume = { percent: 100, muted: false };
+
+    function loadVolume() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(VOLUME_KEY) || 'null');
+            if (saved && typeof saved.percent === 'number') {
+                volume.percent = Math.max(0, Math.min(100, Math.round(saved.percent)));
+                volume.muted = !!saved.muted;
+            }
+        } catch (e) {
+            // Private mode / blocked storage: just start at 100 %.
+        }
+    }
+
+    function saveVolume() {
+        try {
+            localStorage.setItem(VOLUME_KEY, JSON.stringify(volume));
+        } catch (e) {
+            // Not fatal: the volume simply is not remembered.
+        }
+    }
+
+    function volumeGain() {
+        if (volume.muted) return 0;
+        const v = volume.percent / 100;
+        return v * v;
+    }
+
+    function applyVolume() {
+        if (els.volumeSlider) {
+            els.volumeSlider.value = String(volume.percent);
+            els.volumeSlider.style.setProperty('--fill', volume.percent + '%');
+        }
+        if (els.volumeValue) {
+            els.volumeValue.textContent = volume.muted ? 'MUTED' : volume.percent + '%';
+            els.volumeValue.classList.toggle('is-muted', volume.muted);
+        }
+        if (state.gainNode && state.audioContext) {
+            // A short ramp instead of a jump: no zipper noise while dragging.
+            state.gainNode.gain.setTargetAtTime(
+                volumeGain(),
+                state.audioContext.currentTime,
+                0.015
+            );
+        }
+    }
+
+    function initVolume() {
+        loadVolume();
+        applyVolume();
+        if (els.volumeSlider) {
+            els.volumeSlider.addEventListener('input', () => {
+                volume.percent = Number(els.volumeSlider.value) || 0;
+                volume.muted = false;
+                applyVolume();
+            });
+            els.volumeSlider.addEventListener('change', saveVolume);
+        }
+        if (els.volumeValue) {
+            els.volumeValue.addEventListener('click', () => {
+                volume.muted = !volume.muted;
+                applyVolume();
+                saveVolume();
+            });
+        }
+    }
+
     function init() {
         cacheElements();
+        initVolume();
 
         updateWsUrlUI();
         updateInfoUI({
