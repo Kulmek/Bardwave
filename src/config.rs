@@ -9,12 +9,15 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Network server configuration
+    #[serde(default)]
     pub server: ServerConfig,
 
     /// Audio engine configuration
+    #[serde(default)]
     pub audio: AudioConfig,
 
     /// Logging configuration
+    #[serde(default)]
     pub logging: LoggingConfig,
 
     /// Persistent sound library and group configuration

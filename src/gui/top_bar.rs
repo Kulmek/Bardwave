@@ -55,11 +55,11 @@ fn brand(ui: &mut Ui) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
         ui.painter()
             .rect_filled(rect, Rounding::same(2.0), Palette::ROSE_600);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
+        crate::gui::widgets::paint_icon(
+            ui.painter(),
             glyph::WAVE,
-            egui::FontId::new(11.0, egui::FontFamily::Monospace),
+            rect.center(),
+            13.8,
             Palette::WHITE,
         );
 
@@ -67,7 +67,7 @@ fn brand(ui: &mut Ui) {
 
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(wordmark("SoundShared"));
+            ui.label(wordmark("Bardwave"));
             ui.label(micro_label("Broadcast Console").size(9.0));
         });
     });
@@ -184,7 +184,7 @@ pub fn status_strip(ui: &mut Ui, state: &SoundSharedApp) {
         |ui| {
             ui.add_space(Metrics::PANEL_PAD);
             ui.label(
-                egui::RichText::new(format!("SoundShared v{}", crate::VERSION))
+                egui::RichText::new(format!("Bardwave v{}", crate::VERSION))
                     .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
                     .color(Palette::ZINC_600)
                     .extra_letter_spacing(1.0),

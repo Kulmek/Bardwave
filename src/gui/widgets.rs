@@ -6,38 +6,223 @@
 
 use std::borrow::Cow;
 
-use egui::{
-    Align2, Color32, CursorIcon, FontId, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2,
-};
+use egui::{Color32, CursorIcon, FontId, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2};
 
 use crate::gui::theme::{alpha, mono_font, Metrics, Palette};
 
-/// An icon glyph drawn with the monospace font (no icon font dependency).
-pub type Glyph = &'static str;
+/// A small vector icon, painted with strokes and shapes.
+///
+/// The console used to draw its icons as Unicode glyphs (⧉ ⟳ ⟲ ✎ ≋ …) in the
+/// monospace font. egui's bundled fonts have none of those code points, so
+/// most buttons showed an empty "tofu" box instead of an icon. Painting them
+/// needs no icon font, scales with the button and always renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    Play,
+    Stop,
+    Cross,
+    Edit,
+    Copy,
+    Plus,
+    Check,
+    Refresh,
+    Loop,
+    Wave,
+    Trash,
+    Volume,
+    Muted,
+    Broadcast,
+    Globe,
+    Folder,
+}
+
+/// Kept as an alias so the call sites read the same as before.
+pub type Glyph = Icon;
 
 pub mod glyph {
-    use super::Glyph;
+    use super::{Glyph, Icon};
 
-    /// ▶ — play.
-    pub const PLAY: Glyph = "\u{25B6}";
-    /// ■ — stop.
-    pub const STOP: Glyph = "\u{25A0}";
-    /// ✕ — remove / close.
-    pub const CROSS: Glyph = "\u{2715}";
-    /// ✎ — edit / rename.
-    pub const EDIT: Glyph = "\u{270E}";
-    /// ⧉ — copy.
-    pub const COPY: Glyph = "\u{29C9}";
-    /// + — add.
-    pub const PLUS: Glyph = "+";
-    /// ✓ — confirmed.
-    pub const CHECK: Glyph = "\u{2713}";
-    /// ⟳ — refresh / restart.
-    pub const REFRESH: Glyph = "\u{27F3}";
-    /// ⟲ — repeat / loop playback.
-    pub const LOOP: Glyph = "\u{27F2}";
-    /// ≈ — waveform-ish mark used in the brand lockup.
-    pub const WAVE: Glyph = "\u{224B}";
+    pub const PLAY: Glyph = Icon::Play;
+    pub const STOP: Glyph = Icon::Stop;
+    pub const CROSS: Glyph = Icon::Cross;
+    pub const EDIT: Glyph = Icon::Edit;
+    pub const COPY: Glyph = Icon::Copy;
+    pub const PLUS: Glyph = Icon::Plus;
+    pub const CHECK: Glyph = Icon::Check;
+    pub const REFRESH: Glyph = Icon::Refresh;
+    pub const LOOP: Glyph = Icon::Loop;
+    pub const WAVE: Glyph = Icon::Wave;
+    pub const TRASH: Glyph = Icon::Trash;
+    pub const VOLUME: Glyph = Icon::Volume;
+    pub const MUTED: Glyph = Icon::Muted;
+    pub const BROADCAST: Glyph = Icon::Broadcast;
+    pub const GLOBE: Glyph = Icon::Globe;
+    pub const FOLDER: Glyph = Icon::Folder;
+}
+
+/// Paint `icon` centred on `center`, `size` pixels tall.
+pub fn paint_icon(
+    painter: &egui::Painter,
+    icon: Icon,
+    center: egui::Pos2,
+    size: f32,
+    color: Color32,
+) {
+    use egui::{pos2, Shape};
+    use std::f32::consts::PI;
+
+    let s = size;
+    let p = |x: f32, y: f32| pos2(center.x + x * s, center.y + y * s);
+    let width = (s * 0.11).max(1.2);
+    let stroke = Stroke::new(width, color);
+    let line = |points: Vec<egui::Pos2>| Shape::line(points, stroke);
+    let arc = |cx: f32, cy: f32, r: f32, from: f32, to: f32| -> Vec<egui::Pos2> {
+        let steps = 20;
+        (0..=steps)
+            .map(|i| {
+                let a = from + (to - from) * i as f32 / steps as f32;
+                p(cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect()
+    };
+    // Open arrowhead at `tip`, pointing along `angle` (radians).
+    let arrow = |tip: egui::Pos2, angle: f32| {
+        let len = s * 0.2;
+        let a1 = angle + PI * 0.8;
+        let a2 = angle - PI * 0.8;
+        Shape::line(
+            vec![
+                pos2(tip.x + len * a1.cos(), tip.y + len * a1.sin()),
+                tip,
+                pos2(tip.x + len * a2.cos(), tip.y + len * a2.sin()),
+            ],
+            stroke,
+        )
+    };
+
+    let shapes: Vec<Shape> = match icon {
+        Icon::Play => vec![Shape::convex_polygon(
+            vec![p(-0.3, -0.4), p(0.4, 0.0), p(-0.3, 0.4)],
+            color,
+            Stroke::NONE,
+        )],
+        Icon::Stop => vec![Shape::rect_filled(
+            Rect::from_center_size(center, Vec2::splat(s * 0.64)),
+            Rounding::same(s * 0.06),
+            color,
+        )],
+        Icon::Cross => vec![
+            line(vec![p(-0.32, -0.32), p(0.32, 0.32)]),
+            line(vec![p(-0.32, 0.32), p(0.32, -0.32)]),
+        ],
+        Icon::Plus => vec![
+            line(vec![p(-0.4, 0.0), p(0.4, 0.0)]),
+            line(vec![p(0.0, -0.4), p(0.0, 0.4)]),
+        ],
+        Icon::Check => vec![line(vec![p(-0.38, 0.02), p(-0.1, 0.3), p(0.4, -0.3)])],
+        Icon::Edit => vec![
+            // Pencil body as an outlined slanted bar, plus the tip.
+            Shape::closed_line(
+                vec![p(0.2, -0.42), p(0.42, -0.2), p(-0.18, 0.4), p(-0.4, 0.18)],
+                stroke,
+            ),
+            line(vec![p(-0.4, 0.18), p(-0.45, 0.45), p(-0.18, 0.4)]),
+        ],
+        Icon::Copy => vec![
+            // Back sheet (only the visible L), front sheet outlined.
+            line(vec![p(-0.42, 0.16), p(-0.42, -0.42), p(0.16, -0.42)]),
+            Shape::rect_stroke(
+                Rect::from_min_max(p(-0.2, -0.2), p(0.42, 0.42)),
+                Rounding::same(s * 0.06),
+                stroke,
+            ),
+        ],
+        Icon::Refresh => {
+            let start = -PI * 0.35;
+            let end = PI * 1.35;
+            let r = 0.36;
+            vec![
+                line(arc(0.0, 0.0, r, start, end)),
+                arrow(p(r * end.cos(), r * end.sin()), end + PI / 2.0),
+            ]
+        }
+        Icon::Loop => vec![
+            line(vec![p(-0.42, 0.12), p(-0.42, -0.22), p(0.36, -0.22)]),
+            arrow(p(0.36, -0.22), 0.0),
+            line(vec![p(0.42, -0.12), p(0.42, 0.22), p(-0.36, 0.22)]),
+            arrow(p(-0.36, 0.22), PI),
+        ],
+        Icon::Wave => {
+            let points = (0..=24)
+                .map(|i| {
+                    let t = i as f32 / 24.0;
+                    p(-0.42 + 0.84 * t, -0.28 * (t * 2.0 * PI * 1.5).sin())
+                })
+                .collect();
+            vec![line(points)]
+        }
+        Icon::Trash => vec![
+            line(vec![p(-0.42, -0.26), p(0.42, -0.26)]),
+            line(vec![
+                p(-0.14, -0.26),
+                p(-0.12, -0.42),
+                p(0.12, -0.42),
+                p(0.14, -0.26),
+            ]),
+            Shape::closed_line(
+                vec![p(-0.3, -0.18), p(0.3, -0.18), p(0.24, 0.42), p(-0.24, 0.42)],
+                stroke,
+            ),
+            line(vec![p(-0.06, -0.04), p(-0.06, 0.28)]),
+            line(vec![p(0.08, -0.04), p(0.08, 0.28)]),
+        ],
+        Icon::Volume | Icon::Muted => {
+            let mut shapes = vec![Shape::convex_polygon(
+                vec![
+                    p(-0.45, -0.14),
+                    p(-0.24, -0.14),
+                    p(0.0, -0.38),
+                    p(0.0, 0.38),
+                    p(-0.24, 0.14),
+                    p(-0.45, 0.14),
+                ],
+                color,
+                Stroke::NONE,
+            )];
+            if icon == Icon::Muted {
+                shapes.push(line(vec![p(0.14, -0.16), p(0.44, 0.16)]));
+                shapes.push(line(vec![p(0.14, 0.16), p(0.44, -0.16)]));
+            } else {
+                shapes.push(line(arc(0.0, 0.0, 0.22, -PI * 0.3, PI * 0.3)));
+                shapes.push(line(arc(0.0, 0.0, 0.4, -PI * 0.3, PI * 0.3)));
+            }
+            shapes
+        }
+        Icon::Broadcast => vec![
+            Shape::circle_filled(center, s * 0.1, color),
+            line(arc(0.0, 0.0, 0.26, -PI * 0.25, PI * 0.25)),
+            line(arc(0.0, 0.0, 0.26, PI * 0.75, PI * 1.25)),
+            line(arc(0.0, 0.0, 0.44, -PI * 0.25, PI * 0.25)),
+            line(arc(0.0, 0.0, 0.44, PI * 0.75, PI * 1.25)),
+        ],
+        Icon::Globe => vec![
+            Shape::circle_stroke(center, s * 0.42, stroke),
+            line(vec![p(-0.42, 0.0), p(0.42, 0.0)]),
+            Shape::ellipse_stroke(center, Vec2::new(s * 0.18, s * 0.42), stroke),
+        ],
+        Icon::Folder => vec![Shape::closed_line(
+            vec![
+                p(-0.45, -0.3),
+                p(-0.12, -0.3),
+                p(-0.02, -0.18),
+                p(0.45, -0.18),
+                p(0.45, 0.36),
+                p(-0.45, 0.36),
+            ],
+            stroke,
+        )],
+    };
+    painter.extend(shapes);
 }
 
 /// Visual weight of a button.
@@ -293,26 +478,37 @@ impl<'a> ConsoleButton<'a> {
         let font = mono_font(self.font_size);
         let label = self.text.to_uppercase();
 
-        // Measure the full label block, then centre it.
-        let glyph_galley = self
-            .glyph
-            .map(|g| painter.layout_no_wrap(g.to_owned(), font.clone(), glyph_color));
+        // Measure the full label block (icon + gap + text), then centre it.
         let text_galley = painter.layout_no_wrap(label.clone(), font.clone(), text_color);
-
-        let glyph_w = glyph_galley
-            .as_ref()
-            .map(|g| g.size().x + 6.0)
-            .unwrap_or(0.0);
-        let total_w = glyph_w + text_galley.size().x;
+        let icon_size = (self.font_size * 1.25).round();
+        let has_text = !label.is_empty();
+        let icon_w = match self.glyph {
+            Some(_) if has_text => icon_size + 8.0,
+            Some(_) => icon_size,
+            None => 0.0,
+        };
+        let total_w = icon_w + if has_text { text_galley.size().x } else { 0.0 };
         let mut cursor_x = rect.center().x - total_w / 2.0;
 
-        if let Some(galley) = glyph_galley {
-            let pos = egui::pos2(cursor_x, rect.center().y - galley.size().y / 2.0);
-            painter.galley(pos, galley, glyph_color);
-            cursor_x += glyph_w;
+        if let Some(icon) = self.glyph {
+            let icon_color = if self.enabled {
+                glyph_color
+            } else {
+                alpha(Palette::ZINC_600, 140)
+            };
+            paint_icon(
+                painter,
+                icon,
+                egui::pos2(cursor_x + icon_size / 2.0, rect.center().y),
+                icon_size,
+                icon_color,
+            );
+            cursor_x += icon_w;
         }
-        let pos = egui::pos2(cursor_x, rect.center().y - text_galley.size().y / 2.0);
-        painter.galley(pos, text_galley, text_color);
+        if has_text {
+            let pos = egui::pos2(cursor_x, rect.center().y - text_galley.size().y / 2.0);
+            painter.galley(pos, text_galley, text_color);
+        }
 
         if let Some(tooltip) = self.tooltip {
             resp = resp.on_hover_text(tooltip.as_ref());
@@ -371,7 +567,7 @@ impl<'a> IconButton<'a> {
     pub fn show(self, ui: &mut Ui) -> Response {
         let salt = match self.id_salt {
             Some(salt) => salt.to_string(),
-            None => self.glyph.to_string(),
+            None => format!("{:?}", self.glyph),
         };
         ui.push_id(("console_icon", salt), |ui| self.show_inner(ui))
             .inner
@@ -464,11 +660,11 @@ impl<'a> IconButton<'a> {
                 Stroke::new(1.0_f32, Palette::ROSE_400),
             );
         }
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
+        paint_icon(
+            painter,
             self.glyph,
-            mono_font(self.font_size),
+            rect.center(),
+            (self.font_size * 1.25).round(),
             fg,
         );
 

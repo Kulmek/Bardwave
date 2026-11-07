@@ -3172,20 +3172,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "port-control-client"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "339f6ce7de3685418b80f358dbf29604263e89bb61ac7402e26d0d7bf9ed72f0"
-dependencies = [
- "getrandom 0.4.3",
- "httparse",
- "libc",
- "roxmltree",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3832,11 +3818,12 @@ dependencies = [
  "egui",
  "futures",
  "parking_lot",
- "port-control-client",
  "rfd",
+ "roxmltree",
  "rusty-opus",
  "serde",
  "serde_json",
+ "socket2",
  "symphonia",
  "thiserror 1.0.69",
  "tokio",

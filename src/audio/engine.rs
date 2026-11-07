@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use self::device_adapter::DeviceAdapter;
+use self::device_adapter::{DeviceAdapter, StreamResampler};
 use crate::audio::decoder::{
     AudioDecoder, DecodedAudio, DecoderError, TARGET_CHANNELS, TARGET_SAMPLE_RATE,
 };
@@ -300,6 +300,89 @@ pub mod device_adapter {
         }
     }
 
+    /// Continuous 48 kHz stereo -> device-rate converter for the output callback.
+    ///
+    /// The old path mixed a fresh staging block for every callback and
+    /// resampled it in isolation: each block restarted its read phase at 0 and
+    /// clamped its last frames to the block's final sample, so the waveform
+    /// tore at every callback boundary — about 100 times a second, which is
+    /// heard as a buzzy, "farting" rasp on any device that is not 48 kHz.
+    ///
+    /// This keeps the read phase and the not-yet-consumed mix frames between
+    /// callbacks, so interpolation always has the real next sample and the
+    /// output is one continuous signal. Mix frames are pulled from `produce`
+    /// only when needed; it mixes (and publishes) exactly the frames asked for.
+    #[derive(Debug, Default)]
+    pub struct StreamResampler {
+        /// Interleaved stereo 48 kHz frames not fully consumed yet.
+        pending: Vec<f32>,
+        /// Read position in `pending`, in frames; always in `[0, 1)` between calls.
+        pos: f64,
+    }
+
+    impl StreamResampler {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Fill `out` (interleaved, `adapter.channels` per frame, at the device
+        /// rate). Returns what `produce` returned for the frames it mixed, or
+        /// `false` when no new frames were needed.
+        pub fn render<T, F>(&mut self, out: &mut [T], adapter: DeviceAdapter, produce: F) -> bool
+        where
+            T: Sample + FromSample<f32>,
+            F: FnOnce(&mut [f32]) -> bool,
+        {
+            let channels = adapter.channels as usize;
+            if channels == 0 || out.is_empty() {
+                return false;
+            }
+            let out_frames = out.len() / channels;
+            let step = if adapter.sample_rate == 0 {
+                1.0
+            } else {
+                super::MIX_RATE as f64 / adapter.sample_rate as f64
+            };
+
+            // Frames needed so the last output frame can interpolate towards
+            // its right-hand neighbour.
+            let last_pos = self.pos + out_frames.saturating_sub(1) as f64 * step;
+            let needed = last_pos.floor() as usize + 2;
+            let have = self.pending.len() / super::MIX_CHANNELS;
+            let mut playing = false;
+            if needed > have {
+                let start = self.pending.len();
+                self.pending.resize(needed * super::MIX_CHANNELS, 0.0);
+                playing = produce(&mut self.pending[start..]);
+            }
+
+            for frame in 0..out_frames {
+                let p = self.pos + frame as f64 * step;
+                let index = p.floor() as usize;
+                let t = (p - index as f64) as f32;
+                let a = index * super::MIX_CHANNELS;
+                let b = a + super::MIX_CHANNELS;
+                let left = self.pending[a] + (self.pending[b] - self.pending[a]) * t;
+                let right = self.pending[a + 1] + (self.pending[b + 1] - self.pending[a + 1]) * t;
+                write_stereo_frame(
+                    &mut out[frame * channels..(frame + 1) * channels],
+                    left,
+                    right,
+                );
+            }
+            for slot in out[out_frames * channels..].iter_mut() {
+                *slot = T::EQUILIBRIUM;
+            }
+
+            // Drop the frames the read head has fully passed.
+            let end = self.pos + out_frames as f64 * step;
+            let consumed = (end.floor() as usize).min(self.pending.len() / super::MIX_CHANNELS);
+            self.pending.drain(..consumed * super::MIX_CHANNELS);
+            self.pos = end - consumed as f64;
+            playing
+        }
+    }
+
     /// Linear interpolation between the two 48 kHz frames around `pos`.
     fn interpolate_stereo(stereo: &[f32], src_frames: usize, pos: f64) -> (f32, f32) {
         if pos <= 0.0 {
@@ -404,7 +487,7 @@ impl AudioEngineInner {
 
     /// Resume a paused track
     fn resume_track(&self, track_id: Uuid) -> Result<(), EngineError> {
-        self.mixer.play_track(track_id)?;
+        self.mixer.resume_track(track_id)?;
         Ok(())
     }
 
@@ -858,6 +941,16 @@ impl AudioEngine {
                 .ok_or(EngineError::SoundNotFound(sound_id))?
         };
 
+        // Forget tracks that finished or were stopped earlier, so neither the
+        // mixer nor the registry grows with every press of play.
+        if self.inner.mixer.prune_finished() > 0 {
+            let mixer = &self.inner.mixer;
+            self.inner
+                .active_tracks
+                .write()
+                .retain(|track_id, _| mixer.has_track(*track_id));
+        }
+
         let track_id = self.inner.mixer.add_track(audio, looped);
 
         // A sound's volume outlives its tracks: a track created later must pick
@@ -1033,6 +1126,11 @@ impl AudioEngine {
         *self.inner.master_volume.lock()
     }
 
+    /// Peak level of the mix since the previous call (0.0..=1.0).
+    pub fn take_output_peak(&self) -> f32 {
+        self.inner.mixer.take_peak()
+    }
+
     /// Set volume for a specific track
     pub fn set_track_volume(&self, track_id: Uuid, volume: f32) -> Result<(), EngineError> {
         self.inner.mixer.set_track_volume(track_id, volume)?;
@@ -1050,9 +1148,9 @@ impl AudioEngine {
         Ok(())
     }
 
-    /// Resume a paused track
+    /// Resume a paused track from where it was paused
     pub fn resume_track(&self, track_id: Uuid) -> Result<(), EngineError> {
-        self.inner.mixer.play_track(track_id)?;
+        self.inner.mixer.resume_track(track_id)?;
         Ok(())
     }
 
@@ -1208,25 +1306,23 @@ fn plan_output_config(
 trait MixWriter: cpal::SizedSample + FromSample<f32> {
     /// Mix one device buffer's worth of audio into `data`.
     ///
-    /// `staging` is reused across callbacks to avoid allocating in the audio
-    /// thread; `carry` keeps the resampling remainder. Returns `true` when at
-    /// least one track was playing.
+    /// `resampler` carries the rate conversion state between callbacks (and
+    /// reuses its buffer, so the audio thread does not allocate per buffer).
+    /// Returns `true` when at least one track was playing.
     fn mix_and_publish(
         mixer: &AudioMixer,
-        staging: &mut Vec<f32>,
+        resampler: &mut StreamResampler,
         data: &mut [Self],
         adapter: DeviceAdapter,
-        carry: &mut f64,
     ) -> bool;
 }
 
 impl MixWriter for f32 {
     fn mix_and_publish(
         mixer: &AudioMixer,
-        staging: &mut Vec<f32>,
+        resampler: &mut StreamResampler,
         data: &mut [Self],
         adapter: DeviceAdapter,
-        carry: &mut f64,
     ) -> bool {
         // Common case: the device takes exactly what the mixer produces, so the
         // device buffer *is* the staging buffer and nothing is copied.
@@ -1238,7 +1334,7 @@ impl MixWriter for f32 {
             return playing;
         }
 
-        converted_mix(mixer, staging, data, adapter, carry)
+        converted_mix(mixer, resampler, data, adapter)
     }
 }
 
@@ -1248,12 +1344,11 @@ macro_rules! impl_mix_writer_converted {
             impl MixWriter for $ty {
                 fn mix_and_publish(
                     mixer: &AudioMixer,
-                    staging: &mut Vec<f32>,
+                    resampler: &mut StreamResampler,
                     data: &mut [Self],
                     adapter: DeviceAdapter,
-                    carry: &mut f64,
                 ) -> bool {
-                    converted_mix(mixer, staging, data, adapter, carry)
+                    converted_mix(mixer, resampler, data, adapter)
                 }
             }
         )+
@@ -1262,42 +1357,27 @@ macro_rules! impl_mix_writer_converted {
 
 impl_mix_writer_converted!(i8, u8, i16, u16, i32, u32, i64, u64, f64);
 
-/// Mix one block, publish it for the network, then convert it for the device.
+/// Mix what the device needs, publish it for the network, then convert it.
 ///
 /// The published bytes are always the untouched 48 kHz stereo f32 mix: the
-/// conversion below happens *after* `publish_broadcast`, so what a web listener
+/// conversion happens *after* `publish_broadcast`, so what a web listener
 /// receives never depends on the local device.
 fn converted_mix<T>(
     mixer: &AudioMixer,
-    staging: &mut Vec<f32>,
+    resampler: &mut StreamResampler,
     data: &mut [T],
     adapter: DeviceAdapter,
-    carry: &mut f64,
 ) -> bool
 where
     T: cpal::SizedSample + FromSample<f32>,
 {
-    let channels = adapter.channels as usize;
-    if channels == 0 || data.is_empty() {
-        return false;
-    }
-
-    let staging_frames = adapter.frames(data.len() / channels, carry);
-    if staging_frames == 0 {
-        for slot in data.iter_mut() {
-            *slot = T::EQUILIBRIUM;
+    resampler.render(data, adapter, |fresh| {
+        let playing = mixer.mix_into(fresh);
+        if playing {
+            mixer.publish_broadcast(fresh);
         }
-        return false;
-    }
-
-    staging.resize(staging_frames * MIX_CHANNELS, 0.0);
-    let playing = mixer.mix_into(staging);
-    if playing {
-        mixer.publish_broadcast(staging);
-    }
-
-    device_adapter::convert_stereo_into(staging, data, adapter);
-    playing
+        playing
+    })
 }
 
 /// Build the output stream for one device sample format.
@@ -1323,8 +1403,7 @@ where
 
         // Sized on the first callback and reused afterwards, so the audio thread
         // does not allocate per buffer.
-        let mut staging: Vec<f32> = Vec::new();
-        let mut carry: f64 = 0.0;
+        let mut resampler = StreamResampler::new();
 
         device.build_output_stream::<T, _, _>(
             config,
@@ -1336,7 +1415,7 @@ where
                     return;
                 }
 
-                T::mix_and_publish(&mixer, &mut staging, data, adapter, &mut carry);
+                T::mix_and_publish(&mixer, &mut resampler, data, adapter);
             },
             move |err| {
                 // A stream error ends local audio for good: record it, so the UI
@@ -1730,16 +1809,14 @@ mod tests {
 
         // A 44.1 kHz u16 device: as far from the mix format as it gets.
         let adapter = DeviceAdapter::new(44_100, 2);
-        let mut staging: Vec<f32> = Vec::new();
-        let mut carry = 0.0;
+        let mut resampler = StreamResampler::new();
         let mut device_buffer = vec![0u16; 441 * 2];
 
         let playing = <u16 as MixWriter>::mix_and_publish(
             &mixer,
-            &mut staging,
+            &mut resampler,
             &mut device_buffer,
             adapter,
-            &mut carry,
         );
 
         assert!(playing);
@@ -1758,6 +1835,45 @@ mod tests {
         assert_eq!(device_buffer[1], u16::from_sample(0.25f32));
     }
 
+    /// A 44.1 kHz device fed through many callbacks must get one continuous
+    /// waveform: the old per-block resampler restarted its phase and clamped
+    /// the tail of every block, tearing the signal ~100 times a second.
+    #[test]
+    fn resampled_output_is_continuous_across_callbacks() {
+        let mixer = AudioMixer::new();
+        // 1 kHz sine at 48 kHz, half scale.
+        let frames = 48_000;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin();
+            samples.push(v);
+            samples.push(v);
+        }
+        let track = mixer.add_track(Arc::new(DecodedAudio::new(samples, 48_000, 2)), true);
+        mixer.play_track(track).unwrap();
+
+        let adapter = DeviceAdapter::new(44_100, 2);
+        let mut resampler = StreamResampler::new();
+        let mut output = Vec::new();
+        // Odd, varying callback sizes, like a real WASAPI device.
+        for size in [441usize, 448, 437, 512, 441, 300, 441, 441, 1024, 441].repeat(4) {
+            let mut buffer = vec![0f32; size * 2];
+            <f32 as MixWriter>::mix_and_publish(&mixer, &mut resampler, &mut buffer, adapter);
+            output.extend(buffer.as_chunks::<2>().0.iter().map(|f| f[0]));
+        }
+
+        // A 1 kHz, 0.5-amplitude sine at 44.1 kHz moves at most
+        // 2*pi*1000/44100*0.5 ~= 0.0712 per sample; a seam would jump far more.
+        let max_step = output
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_step < 0.075,
+            "discontinuity of {max_step} in the resampled stream"
+        );
+    }
+
     #[test]
     fn identity_adapter_publishes_the_mix_unchanged() {
         let mixer = AudioMixer::new();
@@ -1766,16 +1882,14 @@ mod tests {
         mixer.play_track(track).unwrap();
 
         let adapter = DeviceAdapter::new(48_000, 2);
-        let mut staging: Vec<f32> = Vec::new();
-        let mut carry = 0.0;
+        let mut resampler = StreamResampler::new();
         let mut device_buffer = vec![f32::NAN; 480 * 2];
 
         let playing = <f32 as MixWriter>::mix_and_publish(
             &mixer,
-            &mut staging,
+            &mut resampler,
             &mut device_buffer,
             adapter,
-            &mut carry,
         );
 
         assert!(playing);

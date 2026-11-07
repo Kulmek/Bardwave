@@ -125,7 +125,7 @@ The parent shares your workspace but does not automatically receive your transcr
 ### 4.2 Build & Test Commands
 
 ```bash
-# Full test suite (127 tests)
+# Full test suite (150+ tests)
 cargo test --all-targets
 
 # Lint

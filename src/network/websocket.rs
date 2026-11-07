@@ -121,7 +121,7 @@ impl WebSocketSession {
             "type": "welcome",
             "data": {
                 "client_id": client_id.to_string(),
-                "message": "Connected to SoundShared audio stream"
+                "message": "Connected to the Bardwave audio stream"
             }
         });
         let _ = self.msg_tx.try_send(Message::Text(welcome.to_string()));

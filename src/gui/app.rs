@@ -1,6 +1,6 @@
 //! GUI application state and logic
 
-use crate::audio::{AudioEngine, LocalOutputStatus, SoundId};
+use crate::audio::{AudioDecoder, AudioEngine, DecodedAudio, LocalOutputStatus, SoundId};
 use crate::gui::groups::{GroupFilter, GroupId, Library};
 use crate::gui::types::{
     AppState, AudioCommand, ServerCommand, ServerStatus as AppServerStatus, SoundInfo,
@@ -111,7 +111,11 @@ pub struct ServerState {
     pub local_url: Option<String>,
     /// Router port forwarding: the internet URL once the router grants it.
     pub upnp: crate::network::upnp::UpnpStatus,
+    /// Warnings about what keeps players out (VPN, firewall).
+    pub notes: Vec<String>,
     pub listener_count: usize,
+    /// Most listeners seen at once since the server started.
+    pub peak_listeners: usize,
 }
 
 /// Main GUI application state
@@ -190,6 +194,44 @@ pub struct SoundSharedApp {
     /// Replies from the server thread for pushed `ServerCommand::SetBind`s.
     bind_result_rx: Receiver<Result<(), String>>,
     bind_result_tx: Sender<Result<(), String>>,
+    /// Files waiting for the decoder worker.
+    decode_tx: Sender<DecodeJob>,
+    /// Decoded files coming back from the worker, finished on the GUI thread.
+    decoded_rx: Receiver<DecodedJob>,
+    /// MASTER OUTPUT meter position (0..1, dB scale with peak decay).
+    output_meter: f32,
+}
+
+/// One file for the background decoder: the path and where to report.
+type DecodeJob = (String, Sender<anyhow::Result<SoundInfo>>);
+/// A finished decode: the job plus the decoded PCM (or the error text).
+type DecodedJob = (
+    String,
+    Sender<anyhow::Result<SoundInfo>>,
+    Result<DecodedAudio, String>,
+);
+
+/// Decode files one by one off the GUI thread.
+///
+/// Decoding (and resampling) a long track takes a noticeable time; it used to
+/// run inside the frame update, freezing the whole console while a library
+/// loaded. The worker decodes, hands the PCM back and wakes the UI.
+fn spawn_decoder(ctx: egui::Context) -> (Sender<DecodeJob>, Receiver<DecodedJob>) {
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<DecodeJob>();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded::<DecodedJob>();
+    std::thread::Builder::new()
+        .name("decoder".into())
+        .spawn(move || {
+            for (path, response) in job_rx {
+                let result = AudioDecoder::decode_file(&path).map_err(|e| e.to_string());
+                if done_tx.send((path, response, result)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .expect("spawn decoder thread");
+    (job_tx, done_rx)
 }
 
 impl SoundSharedApp {
@@ -198,8 +240,9 @@ impl SoundSharedApp {
         app_state: AppState,
         audio_engine: Arc<Mutex<Option<AudioEngine>>>,
         audio_cmd_rx: Receiver<AudioCommand>,
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
     ) -> Self {
+        let (decode_tx, decoded_rx) = spawn_decoder(cc.egui_ctx.clone());
         // Create channels for receiving updates from background threads
         let (server_status_tx, server_status_rx) = bounded(1);
         let (bind_result_tx, bind_result_rx) = bounded(4);
@@ -230,7 +273,9 @@ impl SoundSharedApp {
                 bind_url: None,
                 local_url: None,
                 upnp: Default::default(),
+                notes: Vec::new(),
                 listener_count: 0,
+                peak_listeners: 0,
             })),
             copied_feedback: Arc::new(Mutex::new(false)),
             copied_feedback_timer: Arc::new(Mutex::new(None)),
@@ -251,6 +296,9 @@ impl SoundSharedApp {
             config_saved_at: None,
             bind_result_rx,
             bind_result_tx,
+            decode_tx,
+            decoded_rx,
+            output_meter: 0.0,
         };
 
         // Request initial server status
@@ -623,6 +671,12 @@ impl SoundSharedApp {
         let mut state = self.server_state.lock().unwrap();
         // Read real-time listener count from the shared counter (updated by server thread)
         state.listener_count = *self.app_state.listener_count.lock().unwrap();
+        // PEAK used to print the current count; keep the real maximum.
+        state.peak_listeners = if state.status == ServerStatus::Running {
+            state.peak_listeners.max(state.listener_count)
+        } else {
+            0
+        };
         // Derived, never stored separately: it follows the advertised URL and
         // disappears with it when the server stops.
         state.local_url = state
@@ -630,6 +684,7 @@ impl SoundSharedApp {
             .as_deref()
             .and_then(crate::network::server::loopback_url);
         state.upnp = self.app_state.upnp_status.lock().unwrap().clone();
+        state.notes = self.app_state.network_notes.lock().unwrap().clone();
         state.clone()
     }
 
@@ -699,7 +754,24 @@ impl SoundSharedApp {
     fn poll_local_output(&mut self) {
         if let Some(engine) = self.audio_engine.lock().unwrap().as_ref() {
             self.local_output = engine.local_output_status();
+
+            // -48 dBFS .. 0 dBFS onto the 20-cell strip, with a falling peak.
+            let peak = engine.take_output_peak();
+            let level = if peak > 0.0 {
+                ((20.0 * peak.log10() + 48.0) / 48.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            self.output_meter = level.max(self.output_meter * 0.82);
+            if self.output_meter < 0.01 {
+                self.output_meter = 0.0;
+            }
         }
+    }
+
+    /// Live output level for the MASTER OUTPUT strip (0..1).
+    pub fn output_meter(&self) -> f32 {
+        self.output_meter
     }
 
     // ===== MOTION =====
@@ -1153,6 +1225,7 @@ impl SoundSharedApp {
     pub fn update(&mut self, ctx: &Context) {
         // Process pending audio commands (runs on main thread where AudioEngine lives)
         self.process_audio_commands();
+        self.finish_decoded();
 
         // Auto-detect tracks that finished playing (mixer marks them stopped but keeps them)
         // so the GUI button switches from "Stop" back to "Play" and the sound can be removed.
@@ -1196,8 +1269,102 @@ impl SoundSharedApp {
         // Flush the library if it changed and the debounce window elapsed.
         self.maybe_persist();
 
-        // Request repaint for live updates
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Request repaint for live updates: the level meter needs a steady
+        // frame rate while anything plays (or the meter is still falling).
+        let animating =
+            self.output_meter > 0.0 || self.sounds.lock().unwrap().values().any(|s| s.playing);
+        ctx.request_repaint_after(Duration::from_millis(if animating { 33 } else { 500 }));
+    }
+
+    /// Register the files the decoder worker has finished.
+    fn finish_decoded(&mut self) {
+        while let Ok((path, response, decoded)) = self.decoded_rx.try_recv() {
+            let engine_guard = self.audio_engine.lock().unwrap();
+            let Some(engine) = engine_guard.as_ref() else {
+                let _ = response.send(Err(anyhow::anyhow!("audio engine stopped")));
+                continue;
+            };
+            match decoded {
+                Ok(audio) => {
+                    let sound_id = engine.load_sound_from_data(audio);
+                    let (duration, sample_rate, _) =
+                        engine.sound_info(sound_id).unwrap_or((0.0, 48000, 2));
+                    let name = std::path::Path::new(&path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+
+                    // A sound that was saved at a lower level must come
+                    // back at that level: the engine starts every sound
+                    // at 1.0, so the saved value is pushed into it here
+                    // rather than being silently forgotten on restart.
+                    let path_buf = PathBuf::from(&path);
+                    let saved_volume = self
+                        .library
+                        .sound(&path_buf)
+                        .map(|sound| sound.volume)
+                        .unwrap_or(1.0);
+                    if let Err(e) = engine.set_sound_volume(sound_id, saved_volume) {
+                        warn!(
+                            "Could not apply saved volume {:.2} to {}: {}",
+                            saved_volume,
+                            path_buf.display(),
+                            e
+                        );
+                    }
+
+                    let info = SoundInfo {
+                        id: sound_id,
+                        name: name.clone(),
+                        path: path.clone(),
+                        duration,
+                        is_playing: false,
+                        volume: saved_volume,
+                    };
+
+                    // Register the sound in the saved library. When the
+                    // operator is focused on a group, the new sound lands
+                    // in that group — the RPG-sounds workflow.
+                    let target_group = match self.group_filter {
+                        GroupFilter::Group(id) => Some(id),
+                        _ => None,
+                    };
+                    if self
+                        .library
+                        .insert_sound(&path_buf, &name, saved_volume, target_group)
+                    {
+                        self.library_dirty = true;
+                    }
+                    let group = self.library.sound(&path_buf).and_then(|s| s.group);
+                    // A sound saved with "repeat" comes back repeating.
+                    let looped = self
+                        .library
+                        .sound(&path_buf)
+                        .map(|s| s.looped)
+                        .unwrap_or(false);
+
+                    // Update local cache
+                    let entry = SoundEntry {
+                        id: sound_id,
+                        name,
+                        path: path_buf,
+                        playing: false,
+                        volume: saved_volume,
+                        looped,
+                        group,
+                        duration,
+                        sample_rate,
+                    };
+                    self.sounds.lock().unwrap().insert(sound_id, entry);
+                    self.sound_order.lock().unwrap().push(sound_id);
+                    let _ = response.send(Ok(info));
+                }
+                Err(e) => {
+                    let _ = response.send(Err(anyhow::anyhow!("{path}: {e}")));
+                }
+            }
+        }
     }
 
     /// Process pending audio commands on the main thread
@@ -1207,86 +1374,10 @@ impl SoundSharedApp {
             if let Some(engine) = self.audio_engine.lock().unwrap().as_mut() {
                 match cmd {
                     AudioCommand::LoadSound { path, response } => {
-                        match engine.load_sound(&path) {
-                            Ok(sound_id) => {
-                                let (duration, sample_rate, _) =
-                                    engine.sound_info(sound_id).unwrap_or((0.0, 48000, 2));
-                                let name = std::path::Path::new(&path)
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("Unknown")
-                                    .to_string();
-
-                                // A sound that was saved at a lower level must come
-                                // back at that level: the engine starts every sound
-                                // at 1.0, so the saved value is pushed into it here
-                                // rather than being silently forgotten on restart.
-                                let path_buf = PathBuf::from(&path);
-                                let saved_volume = self
-                                    .library
-                                    .sound(&path_buf)
-                                    .map(|sound| sound.volume)
-                                    .unwrap_or(1.0);
-                                if let Err(e) = engine.set_sound_volume(sound_id, saved_volume) {
-                                    warn!(
-                                        "Could not apply saved volume {:.2} to {}: {}",
-                                        saved_volume,
-                                        path_buf.display(),
-                                        e
-                                    );
-                                }
-
-                                let info = SoundInfo {
-                                    id: sound_id,
-                                    name: name.clone(),
-                                    path: path.clone(),
-                                    duration,
-                                    is_playing: false,
-                                    volume: saved_volume,
-                                };
-
-                                // Register the sound in the saved library. When the
-                                // operator is focused on a group, the new sound lands
-                                // in that group — the RPG-sounds workflow.
-                                let target_group = match self.group_filter {
-                                    GroupFilter::Group(id) => Some(id),
-                                    _ => None,
-                                };
-                                if self.library.insert_sound(
-                                    &path_buf,
-                                    &name,
-                                    saved_volume,
-                                    target_group,
-                                ) {
-                                    self.library_dirty = true;
-                                }
-                                let group = self.library.sound(&path_buf).and_then(|s| s.group);
-                                // A sound saved with "repeat" comes back repeating.
-                                let looped = self
-                                    .library
-                                    .sound(&path_buf)
-                                    .map(|s| s.looped)
-                                    .unwrap_or(false);
-
-                                // Update local cache
-                                let entry = SoundEntry {
-                                    id: sound_id,
-                                    name,
-                                    path: path_buf,
-                                    playing: false,
-                                    volume: saved_volume,
-                                    looped,
-                                    group,
-                                    duration,
-                                    sample_rate,
-                                };
-                                self.sounds.lock().unwrap().insert(sound_id, entry);
-                                self.sound_order.lock().unwrap().push(sound_id);
-                                let _ = response.send(Ok(info));
-                            }
-                            Err(e) => {
-                                let _ = response.send(Err(e.into()));
-                            }
+                        // Decoded off the GUI thread; finished in `finish_decoded`.
+                        if let Err(e) = self.decode_tx.send((path, response)) {
+                            let (_, response) = e.into_inner();
+                            let _ = response.send(Err(anyhow::anyhow!("decoder stopped")));
                         }
                     }
                     AudioCommand::PlaySound { id, response } => {

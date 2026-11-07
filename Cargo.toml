@@ -17,8 +17,10 @@ tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 
-# UPnP port forwarding (open router port for global-IP access)
-port-control-client = { version = "0.2", features = ["upnp"] }
+# UPnP port forwarding (open router port for global-IP access): SSDP needs
+# the multicast interface pinned (socket2), descriptions/SOAP are XML (roxmltree)
+socket2 = "0.6"
+roxmltree = "0.21"
 
 # Utilities
 anyhow = "1.0"
@@ -75,4 +77,5 @@ rfd = { workspace = true }
 tower-http = { workspace = true }
 backtrace = { workspace = true }
 ctrlc = { workspace = true }
-port-control-client = { workspace = true }
+socket2 = { workspace = true }
+roxmltree = { workspace = true }
