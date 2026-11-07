@@ -153,7 +153,7 @@ upnp = true
 access_token = "..."   # key listeners need in the link (/?k=...); "" = open
 
 [audio]
-buffer_size = 1024
+buffer_size = 480
 sample_rate = 48000
 channels = 2
 master_volume = 0.8

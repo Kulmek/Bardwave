@@ -135,7 +135,12 @@ Every link the console copies ends with `/?k=<key>`: the stream (and `/api/statu
 soundshared.exe --server-only
 ```
 
-> ⚠️ The current `--server-only` mode starts the HTTP/WebSocket server but has no console to load sounds, so it broadcasts silence. It is useful for protocol and network testing, not for a session. Planned to be finished — see [Roadmap](#roadmap).
+Runs without the console window, for a spare PC next to the router or a session you drive from a phone-sized screen. The saved library (`[library]` in `config.toml`, i.e. whatever you set up in the console) is loaded at start, the listener server starts at once, and the log shows both links:
+
+- the **player link** (with the access key) to share, as in the console;
+- a **control page**, `http://127.0.0.1:<port>/control`: play/stop, repeat and volume for every sound, master volume and *Stop all*.
+
+The control page only answers on the machine that runs Bardwave (players reach the same port over the network and must not get the GM's buttons). Started from Explorer or a shortcut, the server opens a console window with its log; close it or press Ctrl+C to stop.
 
 ## Configuration
 
@@ -149,9 +154,9 @@ upnp = true        # ask the router to forward the port for players outside the 
 access_token = "…" # key players need in the link (/?k=…); generated on first start, "" = open
 
 [audio]
-buffer_size = 1024 # samples per channel
-sample_rate = 48000
-channels = 2
+buffer_size = 480  # device buffer in frames (480 = 10 ms); 0 = driver default
+sample_rate = 48000 # device rate to ask for; the mix and the stream stay 48 kHz
+channels = 2        # device channels: 1 = mono downmix, 2 = stereo
 master_volume = 0.8
 
 [logging]
@@ -238,11 +243,9 @@ cargo build --release
 
 Honest list of what is **not** done yet — this is an early build, not a finished competitor:
 
-- [ ] Apply `[audio]` sample rate / channels / buffer size from the config (only master volume is wired up today)
-- [ ] A working `--server-only` mode that can load a library
 - [ ] Cross-platform local-IP detection (macOS/Linux)
 - [ ] Crossfade between scenes
-- [ ] Packaging: installer, portable build, maybe a Steam/itch release
+- [ ] Packaging: an installer, a macOS build, maybe a Steam/itch release (tagged releases already ship a portable Windows zip and a Linux tar.gz)
 
 Ideas, bug reports and pull requests are welcome.
 

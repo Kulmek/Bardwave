@@ -164,7 +164,9 @@ fn default_upnp() -> bool {
 }
 
 fn default_buffer_size() -> usize {
-    1024
+    // 10 ms at 48 kHz: what the engine always asked for before this setting
+    // was applied.
+    480
 }
 
 fn default_sample_rate() -> u32 {
@@ -322,12 +324,24 @@ mod tests {
         dir.join(format!("{}-{}.toml", name, std::process::id()))
     }
 
+    /// The commented config.toml shipped in the release archives must load,
+    /// and must not carry an access key (each install generates its own).
+    #[test]
+    fn shipped_example_config_loads() {
+        let config: Config = toml::from_str(include_str!("../packaging/config.toml"))
+            .expect("packaging/config.toml");
+        assert_eq!(config.server.port, 8080);
+        assert!(config.server.access_token.is_none());
+        assert_eq!(config.audio.buffer_size, 480);
+        assert!(config.library.sounds.is_empty());
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.audio.buffer_size, 1024);
+        assert_eq!(config.audio.buffer_size, 480);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.channels, 2);
         assert_eq!(config.audio.master_volume, 0.8);

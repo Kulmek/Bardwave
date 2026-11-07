@@ -52,13 +52,13 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --locked
 
-  release:
-    name: Build & publish release
+  # Portable Windows build: a zip with Bardwave.exe, a commented config.toml,
+  # a short README and the licence (plus the bare exe, as before).
+  release-windows:
+    name: Release build (Windows)
     needs: ci
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -71,8 +71,7 @@ jobs:
       - name: Check tag matches Cargo.toml version
         shell: bash
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | python -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
+          version=$(cargo metadata --no-deps --format-version 1 --locked             | python -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
@@ -82,12 +81,78 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package
-        shell: bash
-        run: cp target/release/soundshared.exe "Bardwave-$GITHUB_REF_NAME-windows-x86_64.exe"
+        shell: pwsh
+        run: |
+          $name = "Bardwave-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
+          Copy-Item target/release/soundshared.exe "dist/$name/Bardwave.exe"
+          Copy-Item packaging/config.toml, packaging/README.txt, LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Copy-Item target/release/soundshared.exe "dist/$name.exe"
+          Remove-Item -Recurse "dist/$name"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*
+
+  # Linux build (x86_64, glibc of the runner's Ubuntu): a tar.gz with the
+  # binary, config.toml, README and licence.
+  release-linux:
+    name: Release build (Linux)
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             pkg-config libgtk-3-dev libasound2-dev libxkbcommon-dev             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name="Bardwave-$GITHUB_REF_NAME-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/soundshared "dist/$name/bardwave"
+          cp packaging/config.toml packaging/README.txt LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: [release-windows, release-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           name: Bardwave ${{ github.ref_name }}
           generate_release_notes: true
-          files: Bardwave-${{ github.ref_name }}-windows-x86_64.exe
+          files: dist/*
