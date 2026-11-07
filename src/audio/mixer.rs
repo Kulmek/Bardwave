@@ -11,7 +11,7 @@
 //! equivalent deadline-paced loop so network streaming still works.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,6 +80,29 @@ impl Default for MixerConfig {
     }
 }
 
+/// Length of the gain ramp used for volume changes, stop, pause and resume:
+/// 10 ms at 48 kHz. A gain that jumps between two samples is an audible click
+/// (and a dragged fader is a burst of them — "zipper" noise); spreading every
+/// change over a few hundred samples makes it inaudible.
+const RAMP_FRAMES: f32 = 480.0;
+
+/// Ceiling of the master bus. The peak limiter keeps the summed mix below it,
+/// so several loud tracks played together are turned down smoothly instead of
+/// being hard-clipped into a buzzing square wave by the device or the codec.
+const LIMIT_CEILING: f32 = 0.97;
+
+/// Release time of the limiter: how fast the gain recovers after a peak.
+const LIMIT_RELEASE_SECS: f32 = 0.2;
+
+/// What happens to a track once its fade-out reaches silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingHalt {
+    /// Keep the position: `resume_track` continues where it left off.
+    Pause,
+    /// Rewind to the start (a stopped track restarts from 0 when replayed).
+    Stop,
+}
+
 /// Internal track state
 #[derive(Debug)]
 struct TrackState {
@@ -88,12 +111,68 @@ struct TrackState {
     audio: Arc<DecodedAudio>,
     /// Current playback position in frames
     position: usize,
-    /// Track volume (0.0 - 1.0)
+    /// Track volume (0.0 - 1.0): the gain the track ramps towards.
     volume: f32,
+    /// Gain actually applied right now; follows `volume` (or 0 while fading
+    /// out) through a short linear ramp.
+    gain: f32,
     /// Whether track is playing
     playing: bool,
+    /// Set while the track fades out before pausing / stopping.
+    halt: Option<PendingHalt>,
+    /// Paused (not stopped or finished): kept by [`AudioMixer::prune_finished`].
+    paused: bool,
     /// Whether track should loop
     looped: bool,
+}
+
+impl TrackState {
+    /// The gain this track is heading for.
+    fn target_gain(&self) -> f32 {
+        if self.halt.is_some() {
+            0.0
+        } else {
+            self.volume
+        }
+    }
+
+    /// Whether the track counts as playing for the outside world: a track that
+    /// is fading out after `stop`/`pause` already reports as stopped.
+    fn is_audible_playing(&self) -> bool {
+        self.playing && self.halt.is_none()
+    }
+}
+
+/// Smooth peak limiter on the master bus.
+///
+/// Instant attack (the gain drops as soon as a sample would exceed the
+/// ceiling) and an exponential release. Without it the sum of a few tracks
+/// at full volume goes past full scale and is hard-clipped — on bass-heavy
+/// ambience that is exactly the "farting" distortion.
+#[derive(Debug, Clone, Copy)]
+struct Limiter {
+    gain: f32,
+}
+
+impl Limiter {
+    const fn new() -> Self {
+        Self { gain: 1.0 }
+    }
+
+    fn process(&mut self, out: &mut [f32]) {
+        let release = 1.0 - (-1.0 / (LIMIT_RELEASE_SECS * TARGET_SAMPLE_RATE as f32)).exp();
+        for frame in out.as_chunks_mut::<CHANNELS>().0 {
+            let peak = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            self.gain += (1.0 - self.gain) * release;
+            if peak * self.gain > LIMIT_CEILING {
+                self.gain = LIMIT_CEILING / peak;
+            }
+            for sample in frame.iter_mut() {
+                // The clamp is only a safety net for NaN/inf from a broken file.
+                *sample = (*sample * self.gain).clamp(-1.0, 1.0);
+            }
+        }
+    }
 }
 
 /// High-performance audio mixer.
@@ -120,6 +199,11 @@ pub struct AudioMixer {
     next_track_id: Arc<AtomicU64>,
     /// Handle to the headless mix loop thread (None when the device drives us)
     mix_handle: parking_lot::Mutex<Option<thread::JoinHandle<()>>>,
+    /// Master-bus limiter state, carried across mix calls.
+    limiter: Arc<parking_lot::Mutex<Limiter>>,
+    /// Peak output level since the GUI last read it (f32 bits; non-negative
+    /// floats order like their bit patterns, so `fetch_max` works).
+    peak: Arc<AtomicU32>,
 }
 
 impl AudioMixer {
@@ -144,6 +228,8 @@ impl AudioMixer {
             seq_no: Arc::new(AtomicU64::new(0)),
             next_track_id: Arc::new(AtomicU64::new(0)),
             mix_handle: parking_lot::Mutex::new(None),
+            limiter: Arc::new(parking_lot::Mutex::new(Limiter::new())),
+            peak: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -159,7 +245,10 @@ impl AudioMixer {
             audio,
             position: 0,
             volume: 1.0,
+            gain: 1.0,
             playing: false,
+            halt: None,
+            paused: false,
             looped,
         };
 
@@ -184,6 +273,8 @@ impl AudioMixer {
         let timestamp = Arc::clone(&self.timestamp);
         let seq_no = Arc::clone(&self.seq_no);
         let master_volume = Arc::clone(&self.master_volume);
+        let limiter = Arc::clone(&self.limiter);
+        let peak = Arc::clone(&self.peak);
 
         let handle = thread::spawn(move || {
             Self::headless_loop(
@@ -194,6 +285,8 @@ impl AudioMixer {
                 timestamp,
                 seq_no,
                 master_volume,
+                limiter,
+                peak,
             );
         });
 
@@ -222,7 +315,18 @@ impl AudioMixer {
     ///
     /// Returns `true` when at least one track was playing during this call.
     pub fn mix_into(&self, out: &mut [f32]) -> bool {
-        Self::mix_into_parts(&self.tracks, &self.master_volume, out)
+        Self::mix_into_parts(
+            &self.tracks,
+            &self.master_volume,
+            &self.limiter,
+            &self.peak,
+            out,
+        )
+    }
+
+    /// Peak output level (0.0..=1.0) since the previous call, for the meter.
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak.swap(0, Ordering::Relaxed))
     }
 
     /// Publish an already-mixed buffer to the network broadcast channel.
@@ -236,6 +340,8 @@ impl AudioMixer {
     fn mix_into_parts(
         tracks: &RwLock<HashMap<Uuid, TrackState>>,
         master_volume: &parking_lot::Mutex<f32>,
+        limiter: &parking_lot::Mutex<Limiter>,
+        peak: &AtomicU32,
         out: &mut [f32],
     ) -> bool {
         let frames = out.len() / CHANNELS;
@@ -246,23 +352,28 @@ impl AudioMixer {
 
         let master = *master_volume.lock();
         let mut any_playing = false;
-        // (track_id, new_position, still_playing)
-        let mut updates: Vec<(Uuid, usize, bool)> = Vec::new();
+        let ramp_step = 1.0 / RAMP_FRAMES;
 
         {
-            let tracks_read = tracks.read();
-            for (track_id, track) in tracks_read.iter() {
+            // One write lock for the whole pass: positions, gains and fade
+            // states are updated in place, so nothing is allocated on the
+            // audio thread and the GUI never sees a half-updated track.
+            let mut tracks_write = tracks.write();
+            for track in tracks_write.values_mut() {
                 if !track.playing || track.audio.frames == 0 {
                     continue;
                 }
 
                 any_playing = true;
-                let mut src_pos = track.position.min(track.audio.frames);
-                let mut dst_frame = 0usize;
+                let total = track.audio.frames;
+                let samples = &track.audio.samples;
+                let target = track.target_gain();
+                let mut gain = track.gain;
+                let mut src_pos = track.position.min(total);
                 let mut finished = false;
 
-                while dst_frame < frames {
-                    if src_pos >= track.audio.frames {
+                for frame in 0..frames {
+                    if src_pos >= total {
                         if track.looped {
                             src_pos = 0;
                         } else {
@@ -271,20 +382,42 @@ impl AudioMixer {
                         }
                     }
 
-                    let frames_to_mix = (track.audio.frames - src_pos).min(frames - dst_frame);
-                    let src_start = src_pos * CHANNELS;
-                    let dst_start = dst_frame * CHANNELS;
-                    let sample_count = frames_to_mix * CHANNELS;
-
-                    for i in 0..sample_count {
-                        out[dst_start + i] += track.audio.samples[src_start + i] * track.volume;
+                    if gain != target {
+                        let delta = (target - gain).clamp(-ramp_step, ramp_step);
+                        gain += delta;
+                        if (target - gain).abs() < 1e-6 {
+                            gain = target;
+                        }
                     }
 
-                    dst_frame += frames_to_mix;
-                    src_pos += frames_to_mix;
+                    let src = src_pos * CHANNELS;
+                    let dst = frame * CHANNELS;
+                    out[dst] += samples[src] * gain;
+                    out[dst + 1] += samples[src + 1] * gain;
+                    src_pos += 1;
+
+                    // The fade-out of a pause/stop has reached silence.
+                    if track.halt.is_some() && gain <= 0.0 {
+                        break;
+                    }
                 }
 
-                updates.push((*track_id, src_pos, !finished));
+                track.gain = gain;
+                track.position = src_pos;
+                if finished {
+                    track.position = total;
+                    track.playing = false;
+                    track.halt = None;
+                } else if let Some(halt) = track.halt {
+                    if gain <= 0.0 {
+                        track.playing = false;
+                        track.halt = None;
+                        match halt {
+                            PendingHalt::Stop => track.position = 0,
+                            PendingHalt::Pause => track.paused = true,
+                        }
+                    }
+                }
             }
         }
 
@@ -296,18 +429,13 @@ impl AudioMixer {
             }
         }
 
-        if !updates.is_empty() {
-            let mut tracks_write = tracks.write();
-            for (track_id, new_position, still_playing) in updates {
-                if let Some(track) = tracks_write.get_mut(&track_id) {
-                    if still_playing {
-                        track.position = new_position;
-                    } else {
-                        track.position = track.audio.frames;
-                        track.playing = false;
-                    }
-                }
-            }
+        // Keep the bus below full scale. Hard clipping of an overloaded sum is
+        // the harsh, buzzing distortion; the limiter turns it down instead.
+        limiter.lock().process(out);
+
+        if any_playing {
+            let block_peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            peak.fetch_max(block_peak.to_bits(), Ordering::Relaxed);
         }
 
         any_playing
@@ -343,6 +471,7 @@ impl AudioMixer {
     ///
     /// Uses a fixed deadline instead of `sleep(interval)`, so scheduler
     /// oversleep does not accumulate into a permanent underrun.
+    #[allow(clippy::too_many_arguments)]
     fn headless_loop(
         config: MixerConfig,
         tracks: Arc<RwLock<HashMap<Uuid, TrackState>>>,
@@ -351,6 +480,8 @@ impl AudioMixer {
         timestamp: Arc<AtomicU64>,
         seq_no: Arc<AtomicU64>,
         master_volume: Arc<parking_lot::Mutex<f32>>,
+        limiter: Arc<parking_lot::Mutex<Limiter>>,
+        peak: Arc<AtomicU32>,
     ) {
         let frames = config.buffer_frames.max(1);
         let mut buffer = vec![0.0f32; frames * CHANNELS];
@@ -360,7 +491,8 @@ impl AudioMixer {
         let mut next_deadline = Instant::now() + period;
 
         while running.load(Ordering::Acquire) {
-            let playing = Self::mix_into_parts(&tracks, &master_volume, &mut buffer);
+            let playing =
+                Self::mix_into_parts(&tracks, &master_volume, &limiter, &peak, &mut buffer);
             if playing {
                 Self::publish_broadcast_parts(&broadcast_tx, &timestamp, &seq_no, &buffer);
             }
@@ -439,33 +571,64 @@ impl AudioMixer {
     }
 
     /// Start playback for a track (resets position to 0)
+    ///
+    /// Starts at full gain on purpose: a one-shot stinger (door slam, sword
+    /// hit) must keep its attack.
     pub fn play_track(&self, track_id: Uuid) -> Result<(), MixerError> {
         let mut tracks = self.tracks.write();
         if let Some(track) = tracks.get_mut(&track_id) {
             track.playing = true;
             track.position = 0;
+            track.halt = None;
+            track.paused = false;
+            track.gain = track.volume;
             Ok(())
         } else {
             Err(MixerError::TrackNotFound(track_id))
         }
     }
 
-    /// Stop playback for a track (does not remove it)
+    /// Continue a paused track from where it was, fading back in.
+    ///
+    /// Unlike [`play_track`](Self::play_track) this keeps the position; the
+    /// engine's `resume` used to call `play_track` and restart from the top.
+    pub fn resume_track(&self, track_id: Uuid) -> Result<(), MixerError> {
+        let mut tracks = self.tracks.write();
+        if let Some(track) = tracks.get_mut(&track_id) {
+            if !track.playing {
+                track.gain = 0.0;
+            }
+            track.playing = track.position < track.audio.frames || track.looped;
+            track.halt = None;
+            track.paused = false;
+            Ok(())
+        } else {
+            Err(MixerError::TrackNotFound(track_id))
+        }
+    }
+
+    /// Stop playback for a track (does not remove it).
+    ///
+    /// The track fades out over a few milliseconds instead of being cut
+    /// mid-waveform, which is an audible click; it reports as stopped at once.
     pub fn stop_track(&self, track_id: Uuid) -> Result<(), MixerError> {
-        let mut tracks = self.tracks.write();
-        if let Some(track) = tracks.get_mut(&track_id) {
-            track.playing = false;
-            Ok(())
-        } else {
-            Err(MixerError::TrackNotFound(track_id))
-        }
+        self.halt_track(track_id, PendingHalt::Stop)
     }
 
-    /// Pause playback for a track
+    /// Pause playback for a track (fades out, keeps the position).
     pub fn pause_track(&self, track_id: Uuid) -> Result<(), MixerError> {
+        self.halt_track(track_id, PendingHalt::Pause)
+    }
+
+    fn halt_track(&self, track_id: Uuid, halt: PendingHalt) -> Result<(), MixerError> {
         let mut tracks = self.tracks.write();
         if let Some(track) = tracks.get_mut(&track_id) {
-            track.playing = false;
+            if track.playing {
+                track.halt = Some(halt);
+            } else if halt == PendingHalt::Stop {
+                track.position = 0;
+                track.paused = false;
+            }
             Ok(())
         } else {
             Err(MixerError::TrackNotFound(track_id))
@@ -477,7 +640,7 @@ impl AudioMixer {
         let tracks = self.tracks.read();
         tracks
             .get(&track_id)
-            .map(|t| t.playing)
+            .map(TrackState::is_audible_playing)
             .ok_or(MixerError::TrackNotFound(track_id))
     }
 
@@ -489,6 +652,22 @@ impl AudioMixer {
         } else {
             Err(MixerError::TrackNotFound(track_id))
         }
+    }
+
+    /// Drop every track that is neither playing nor fading out.
+    ///
+    /// Each `play` adds a track; without this a long session accumulates
+    /// thousands of dead entries that the audio callback walks on every buffer.
+    pub fn prune_finished(&self) -> usize {
+        let mut tracks = self.tracks.write();
+        let before = tracks.len();
+        tracks.retain(|_, t| t.playing || t.paused);
+        before - tracks.len()
+    }
+
+    /// Whether the mixer still holds this track.
+    pub fn has_track(&self, track_id: Uuid) -> bool {
+        self.tracks.read().contains_key(&track_id)
     }
 
     /// Get the broadcast output receiver for network streaming (WebSocket clients)
@@ -676,6 +855,95 @@ mod tests {
         let mut out = vec![0.0f32; 480 * 2];
         assert!(mixer.mix_into(&mut out));
         assert!(!mixer.is_track_playing(id).unwrap());
+    }
+
+    /// Stopping fades the track out over the ramp instead of cutting it
+    /// mid-waveform (an audible click), and it reports as stopped at once.
+    #[test]
+    fn test_stop_fades_out_instead_of_cutting() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.5; 48_000 * 2], 48_000, 2));
+        let id = mixer.add_track(audio, true);
+        mixer.play_track(id).unwrap();
+
+        let mut out = vec![0.0f32; 480 * 2];
+        mixer.mix_into(&mut out);
+        mixer.stop_track(id).unwrap();
+        assert!(!mixer.is_track_playing(id).unwrap());
+
+        let mut tail = vec![0.0f32; 960 * 2];
+        mixer.mix_into(&mut tail);
+        // Starts near the old level, decreases monotonically, ends silent.
+        assert!(tail[0] > 0.49);
+        assert!(tail
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[1] <= w[0] + 1e-6));
+        assert_eq!(tail[tail.len() - 1], 0.0);
+        // After the fade the track rewinds, so a new play starts from 0.
+        assert_eq!(mixer.prune_finished(), 1);
+    }
+
+    /// A volume change ramps instead of stepping (no zipper noise).
+    #[test]
+    fn test_volume_change_is_ramped() {
+        let mixer = AudioMixer::new();
+        let audio = Arc::new(DecodedAudio::new(vec![0.5; 48_000 * 2], 48_000, 2));
+        let id = mixer.add_track(audio, true);
+        mixer.play_track(id).unwrap();
+        mixer.set_track_volume(id, 0.0).unwrap();
+
+        let mut out = vec![0.0f32; 480 * 2];
+        mixer.mix_into(&mut out);
+        let max_step = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_step < 0.01, "volume jumped by {max_step}");
+    }
+
+    /// Pause keeps the position; resume continues instead of restarting.
+    #[test]
+    fn test_pause_resume_keeps_position() {
+        let mixer = AudioMixer::new();
+        let ramp: Vec<f32> = (0..48_000).flat_map(|i| [i as f32 / 48_000.0; 2]).collect();
+        let id = mixer.add_track(Arc::new(DecodedAudio::new(ramp, 48_000, 2)), false);
+        mixer.play_track(id).unwrap();
+
+        let mut out = vec![0.0f32; 4_800 * 2];
+        mixer.mix_into(&mut out);
+        mixer.pause_track(id).unwrap();
+        mixer.mix_into(&mut out); // fade-out completes
+        assert_eq!(mixer.prune_finished(), 0, "a paused track must be kept");
+
+        mixer.resume_track(id).unwrap();
+        mixer.mix_into(&mut out);
+        // Well past the first 0.1 s, so it did not restart from the top.
+        assert!(out[out.len() - 2] > 0.15);
+    }
+
+    /// Several loud tracks are limited below full scale instead of clipping.
+    #[test]
+    fn test_overloaded_mix_is_limited() {
+        let mixer = AudioMixer::new();
+        for _ in 0..4 {
+            let audio = Arc::new(DecodedAudio::new(vec![0.8; 4_800 * 2], 48_000, 2));
+            let id = mixer.add_track(audio, true);
+            mixer.play_track(id).unwrap();
+        }
+        let mut out = vec![0.0f32; 4_800 * 2];
+        mixer.mix_into(&mut out);
+        assert!(out.iter().all(|s| s.abs() <= LIMIT_CEILING + 1e-6));
+        assert!(out[out.len() - 1] > 0.9);
     }
 
     #[test]

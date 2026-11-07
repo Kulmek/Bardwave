@@ -73,7 +73,7 @@ Running ambience in a tabletop game is still surprisingly awkward. The paid opti
 
 **Engineering**
 - Rust, one binary, one config file
-- 127 tests (`cargo test --all-targets`), including end-to-end broadcast and WebSocket wire-format tests
+- 150+ tests (`cargo test --all-targets`), including end-to-end broadcast and WebSocket wire-format tests
 - Typed commands between GUI, audio engine and network — no shared mutable soup
 - Streaming resampled to 48 kHz / stereo f32 in the mix pipeline, encoded to **Opus** (~64 kbit/s VBR) for the network wire
 
@@ -112,10 +112,13 @@ The SERVER panel shows two addresses:
 
 #### Players outside your network
 
-On **Start** the console asks your router to forward the port to this PC (UPnP IGD, with PCP / NAT-PMP as fallbacks) and shows the resulting `INTERNET` address (click to copy). The mapping is renewed while the server runs and removed on **Stop**. Requirements and caveats:
+On **Start** the console asks your router to forward the port to this PC (UPnP IGD) and shows the resulting `INTERNET` address (click to copy). Discovery is sent from every LAN address of the PC, so it also works while a VPN owns the default route. The mapping is renewed while the server runs and removed on **Stop**. Requirements and caveats:
 
 - UPnP must be enabled on the router. If no router answers, the panel says *no UPnP router* and the LAN address keeps working; forward the port by hand instead.
 - If the router's external address is private (carrier-grade NAT, or a provider modem in front of your router), the panel says *blocked by a second NAT*: the port is not reachable from the internet until you forward it on the upstream device or get a public IP from your provider.
+- **VPN:** with a full-tunnel VPN on the GM's PC, the router forwards the player's connection, but the reply leaves through the tunnel and never arrives. The panel warns about it (*VPN active*); turn the VPN off, or exclude Bardwave from it, for internet players.
+- **Windows firewall:** Windows marks many networks as *Public*, and the "allow access" prompt only opens *Private* ones by default. If the panel says *Firewall: port not opened*, allow Bardwave for public networks too (or run it once as administrator so it can add the rule itself).
+- Opening the internet URL from inside your own network may fail on routers without NAT loopback. Test it from a phone on mobile data.
 - On Windows the app adds an inbound firewall rule for the port when it runs as administrator; otherwise allow it when Windows asks.
 - Set `upnp = false` in `config.toml` to turn this off.
 
@@ -147,7 +150,7 @@ master_volume = 0.8
 
 [logging]
 level = "info"     # trace | debug | info | warn | error
-file_logging = false
+file_logging = false # true: also write bardwave.log next to the executable
 
 [gui]
 reduce_motion = false  # stop the pulsing dot and backdrop animation
@@ -220,7 +223,7 @@ The broadcaster encodes the 48 kHz / stereo f32 mix to Opus before sending it ov
 ## Building & testing
 
 ```bash
-cargo test --all-targets     # 127 tests
+cargo test --all-targets     # 150+ tests
 cargo clippy --all-targets   # lint
 cargo build --release
 ```
@@ -229,9 +232,7 @@ cargo build --release
 
 Honest list of what is **not** done yet — this is an early build, not a finished competitor:
 
-- [ ] Higher-quality resampling (the current one is linear interpolation; 96/192 kHz sources will alias)
 - [ ] Apply `[audio]` sample rate / channels / buffer size from the config (only master volume is wired up today)
-- [ ] File logging (`logging.file_logging` is parsed but ignored)
 - [ ] A working `--server-only` mode that can load a library
 - [ ] Cross-platform local-IP detection (macOS/Linux)
 - [ ] Crossfade between scenes; per-listener volume control

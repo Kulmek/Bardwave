@@ -88,13 +88,21 @@ pub struct AudioDecoder;
 impl AudioDecoder {
     /// Decode an audio file to PCM samples at target sample rate and channels
     pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio, DecoderError> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let file = File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-        // Create a probe hint from the file extension
-        let hint = Hint::new();
+        // The extension is a strong hint for the prober: without it, MP3 files
+        // with a large ID3 tag or no Xing header are often not recognised.
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
         let meta_opts = MetadataOptions::default();
-        let fmt_opts = FormatOptions::default();
+        let fmt_opts = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
 
         let probed = symphonia::default::get_probe()
             .format(&hint, mss, &fmt_opts, &meta_opts)
@@ -116,15 +124,15 @@ impl AudioDecoder {
             .make(&codec_params, &dec_opts)
             .map_err(DecoderError::Decoder)?;
 
+        // The rate and channel count are taken from the *decoded* buffers, not
+        // from the container header: MP3/AAC headers often omit the channel
+        // layout (it used to default to stereo, so a mono file played twice
+        // as fast with its samples split between the ears), and HE-AAC
+        // declares half its real output rate.
         let mut all_samples = Vec::new();
-        let sample_rate = codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
-        let channels = codec_params
-            .channels
-            .map(|c| c.count())
-            .unwrap_or(TARGET_CHANNELS as usize);
-        let channels_u32: u32 = channels.try_into().unwrap();
+        let mut sample_rate = codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
+        let mut channels: Option<usize> = None;
 
-        // Decode all packets
         loop {
             let packet = match format.next_packet() {
                 Ok(packet) => packet,
@@ -133,6 +141,8 @@ impl AudioDecoder {
                 {
                     break;
                 }
+                // A chained stream (e.g. concatenated Ogg) ends the track here.
+                Err(symphonia::core::errors::Error::ResetRequired) => break,
                 Err(e) => return Err(DecoderError::Decoder(e)),
             };
 
@@ -142,8 +152,22 @@ impl AudioDecoder {
 
             match decoder.decode(&packet) {
                 Ok(audio_buf) => {
-                    let converted =
-                        Self::convert_audio_buffer(audio_buf, sample_rate, channels_u32)?;
+                    let spec = *audio_buf.spec();
+                    let buf_channels = spec.channels.count();
+                    if buf_channels == 0 || audio_buf.frames() == 0 {
+                        continue;
+                    }
+                    match channels {
+                        None => {
+                            channels = Some(buf_channels);
+                            sample_rate = spec.rate;
+                        }
+                        // A mid-stream layout change cannot be interleaved
+                        // into one buffer; skip the odd packets.
+                        Some(c) if c != buf_channels => continue,
+                        Some(_) => {}
+                    }
+                    let converted = Self::convert_audio_buffer(audio_buf, spec.rate, 0)?;
                     all_samples.extend_from_slice(&converted);
                 }
                 Err(symphonia::core::errors::Error::DecodeError(_)) => {
@@ -154,21 +178,24 @@ impl AudioDecoder {
             }
         }
 
-        // Resample if needed
-        let final_samples = if sample_rate != TARGET_SAMPLE_RATE {
-            Self::resample(
-                &all_samples,
-                channels as u32,
-                sample_rate,
-                TARGET_SAMPLE_RATE,
-            )?
+        let channels = channels.unwrap_or(TARGET_CHANNELS as usize);
+        let channels_u32 = u32::try_from(channels).unwrap_or(TARGET_CHANNELS);
+
+        // Downmix first: resampling two channels is cheaper than six.
+        let final_samples = if channels_u32 != TARGET_CHANNELS {
+            Self::convert_channels(&all_samples, channels_u32, TARGET_CHANNELS)?
         } else {
             all_samples
         };
 
-        // Convert channels if needed
-        let final_samples = if channels as u32 != TARGET_CHANNELS {
-            Self::convert_channels(&final_samples, channels as u32, TARGET_CHANNELS)?
+        // Resample if needed
+        let final_samples = if sample_rate != TARGET_SAMPLE_RATE && sample_rate > 0 {
+            Self::resample(
+                &final_samples,
+                TARGET_CHANNELS,
+                sample_rate,
+                TARGET_SAMPLE_RATE,
+            )?
         } else {
             final_samples
         };
@@ -250,7 +277,13 @@ impl AudioDecoder {
         Ok(interleaved)
     }
 
-    /// Simple linear resampling (for production, consider using rubato or samplerrate crate)
+    /// Band-limited (windowed-sinc) sample-rate conversion.
+    ///
+    /// Linear interpolation, used before, aliases badly: every 44.1 -> 48 kHz
+    /// file got audible metallic images, and a 96 kHz source folded its
+    /// ultrasonic content down into the audible band. This is a polyphase
+    /// Blackman-windowed sinc, low-passed at the lower of the two Nyquist
+    /// frequencies. Decoding is offline (once per file), so the cost is fine.
     fn resample(
         samples: &[f32],
         channels: u32,
@@ -260,39 +293,81 @@ impl AudioDecoder {
         if from_rate == to_rate {
             return Ok(samples.to_vec());
         }
+        let channels = channels as usize;
+        if channels == 0 || from_rate == 0 || to_rate == 0 {
+            return Err(DecoderError::ResampleUnsupported);
+        }
+        let input_frames = samples.len() / channels;
+        if input_frames == 0 {
+            return Ok(Vec::new());
+        }
 
-        let ratio = from_rate as f64 / to_rate as f64;
-        let input_frames = samples.len() / channels as usize;
-        let output_frames = (input_frames as f64 / ratio).ceil() as usize;
-        let mut output = Vec::with_capacity(output_frames * channels as usize);
+        // Source-sample step per output sample, and the low-pass cutoff as a
+        // fraction of the source Nyquist (with a little transition band).
+        let step = from_rate as f64 / to_rate as f64;
+        let cutoff = (to_rate as f64 / from_rate as f64).min(1.0) * 0.94;
+        // Zero crossings on each side of the kernel.
+        const ZERO_CROSSINGS: f64 = 16.0;
+        let half_width = (ZERO_CROSSINGS / cutoff).ceil() as i64;
 
-        for ch in 0..channels as usize {
-            for out_frame in 0..output_frames {
-                let src_pos = out_frame as f64 * ratio;
-                let src_frame = src_pos.floor() as usize;
-                let frac = src_pos - src_frame as f64;
+        // Kernel table: PHASES entries per source sample, linearly interpolated.
+        const PHASES: usize = 256;
+        let table_len = half_width as usize * PHASES + 2;
+        let table: Vec<f32> = (0..table_len)
+            .map(|i| {
+                let x = i as f64 / PHASES as f64; // distance in source samples
+                if x >= half_width as f64 {
+                    return 0.0;
+                }
+                let arg = std::f64::consts::PI * x * cutoff;
+                let sinc = if x == 0.0 { 1.0 } else { arg.sin() / arg };
+                let u = x / half_width as f64; // 0..1
+                let window = 0.42
+                    + 0.5 * (std::f64::consts::PI * u).cos()
+                    + 0.08 * (2.0 * std::f64::consts::PI * u).cos();
+                (cutoff * sinc * window) as f32
+            })
+            .collect();
+        let kernel = |distance: f64| -> f32 {
+            let pos = distance.abs() * PHASES as f64;
+            let index = pos as usize;
+            if index + 1 >= table_len {
+                return 0.0;
+            }
+            let frac = (pos - index as f64) as f32;
+            table[index] + (table[index + 1] - table[index]) * frac
+        };
 
-                let idx1 = src_frame * channels as usize + ch;
-                let idx2 = ((src_frame + 1).min(input_frames - 1)) * channels as usize + ch;
-
-                let sample1 = samples.get(idx1).copied().unwrap_or(0.0);
-                let sample2 = samples.get(idx2).copied().unwrap_or(0.0);
-
-                let interpolated = sample1 + (sample2 - sample1) * frac as f32;
-                output.push(interpolated);
+        let output_frames = ((input_frames as f64) / step).floor() as usize;
+        let mut output = vec![0.0f32; output_frames * channels];
+        let mut acc = vec![0.0f32; channels];
+        for (out_frame, out) in output.chunks_exact_mut(channels).enumerate() {
+            let center = out_frame as f64 * step;
+            let first = (center.floor() as i64 - half_width + 1).max(0);
+            let last = (center.floor() as i64 + half_width).min(input_frames as i64 - 1);
+            acc.iter_mut().for_each(|a| *a = 0.0);
+            let mut weight_sum = 0.0f32;
+            for src in first..=last {
+                let w = kernel(center - src as f64);
+                weight_sum += w;
+                let base = src as usize * channels;
+                for (ch, a) in acc.iter_mut().enumerate() {
+                    *a += samples[base + ch] * w;
+                }
+            }
+            // Normalising by the summed weights keeps DC exact, including at
+            // the file edges where the kernel is truncated.
+            let norm = if weight_sum.abs() > 1e-6 {
+                1.0 / weight_sum
+            } else {
+                0.0
+            };
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
+                *o = a * norm;
             }
         }
 
-        // Re-interleave
-        let mut interleaved = Vec::with_capacity(output.len());
-        let out_frames = output.len() / channels as usize;
-        for frame in 0..out_frames {
-            for ch in 0..channels as usize {
-                interleaved.push(output[frame + ch * out_frames]);
-            }
-        }
-
-        Ok(interleaved)
+        Ok(output)
     }
 
     /// Convert between channel configurations
@@ -325,16 +400,30 @@ impl AudioDecoder {
                 }
             }
             (_, 2) => {
-                // Multi-channel to stereo: take first two or downmix
-                for frame in 0..frames {
-                    let left = samples[frame * from_channels as usize];
-                    let right = if from_channels >= 2 {
-                        samples[frame * from_channels as usize + 1]
-                    } else {
-                        left
-                    };
-                    output.push(left);
-                    output.push(right);
+                // Multi-channel to stereo. Symphonia orders channels by the
+                // WAVE/SMPTE layout: FL, FR, FC, LFE, then surrounds. Keep the
+                // fronts, fold the centre and the surrounds in at -3 dB, and
+                // drop the LFE, instead of throwing away everything but the
+                // first two channels (which lost all dialogue in a 5.1 file).
+                let n = from_channels as usize;
+                let k = std::f32::consts::FRAC_1_SQRT_2;
+                let norm = if n >= 3 { 1.0 / (1.0 + k + k) } else { 1.0 };
+                for frame in samples.chunks_exact(n) {
+                    let mut left = frame[0];
+                    let mut right = frame[1];
+                    if n >= 3 {
+                        left += frame[2] * k;
+                        right += frame[2] * k;
+                    }
+                    for (i, s) in frame.iter().enumerate().skip(4) {
+                        if i % 2 == 0 {
+                            left += s * k;
+                        } else {
+                            right += s * k;
+                        }
+                    }
+                    output.push(left * norm);
+                    output.push(right * norm);
                 }
             }
             _ => {
@@ -361,6 +450,41 @@ mod tests {
         assert_eq!(audio.duration, 1.0);
         assert_eq!(audio.sample_rate, 48000);
         assert_eq!(audio.channels, 2);
+    }
+
+    #[test]
+    fn resample_keeps_a_tone_clean() {
+        // 1 kHz at 44.1 kHz -> 48 kHz: same frequency, same amplitude, no images.
+        let from = 44_100u32;
+        let input: Vec<f32> = (0..from as usize)
+            .flat_map(|i| {
+                let v = 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / from as f32).sin();
+                [v, v]
+            })
+            .collect();
+        let out = AudioDecoder::resample(&input, 2, from, 48_000).unwrap();
+        let frames = out.len() / 2;
+        assert!((frames as i64 - 48_000).abs() <= 2, "{frames} frames");
+
+        // Compare against the ideal 48 kHz tone away from the edges.
+        let mut err = 0.0f64;
+        let mut sig = 0.0f64;
+        for i in 1000..frames - 1000 {
+            let ideal = 0.5 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0).sin();
+            let got = out[i * 2] as f64;
+            err += (got - ideal).powi(2);
+            sig += ideal.powi(2);
+        }
+        let snr_db = 10.0 * (sig / err).log10();
+        assert!(snr_db > 60.0, "SNR only {snr_db:.1} dB");
+    }
+
+    #[test]
+    fn surround_downmix_keeps_the_centre_channel() {
+        // 6 channels: only the centre (index 2) carries signal.
+        let frame = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let out = AudioDecoder::convert_channels(&frame, 6, 2).unwrap();
+        assert!(out[0] > 0.2 && out[1] > 0.2);
     }
 
     #[test]

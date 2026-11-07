@@ -1,8 +1,8 @@
 /**
- * SoundShared Listener вЂ” WebSocket audio player
+ * Bardwave Listener вЂ” WebSocket audio player
  *
  * Wire format (server -> browser):
- *   [seq_no: u32 LE][pcm: f32 LE, interleaved stereo, 48 kHz]
+ *   [seq_no: u32 LE][server_ms: u32 LE][one Opus packet, 10 ms, 48 kHz stereo]
  *
  * Playback uses an AudioWorklet with a ring buffer and a drift-correcting
  * jitter buffer:
@@ -11,8 +11,8 @@
  *   - hold the queue at the target by consuming at 1 +/- a small factor
  *     (fractional, Catmull-Rom interpolated read), so two independent audio
  *     clocks never accumulate latency and no PCM is ever hard-dropped in
- *     steady state
- *   - catch up at up to +2% when latency creeps above the target
+ *     steady state; the factor follows the *smoothed* queue level and is
+ *     capped at +/-0.5 %, so it never audibly wobbles the pitch
  *   - clear-and-rebuffer (a clean resync with fade) when the queue exceeds the
  *     hard cap, instead of skipping every other packet
  *   - fade in/out over ~8 ms to avoid clicks
@@ -28,6 +28,44 @@
 
 (function () {
     'use strict';
+
+    // =========================================================================
+    // Built-in icons
+    //
+    // The page used to load the Iconify web component from a CDN with a
+    // blocking <script> in <head>. On a LAN without internet (or with the CDN
+    // blocked) the page hung until that request timed out and then showed no
+    // icons at all — and this page is meant to work with no cloud. The handful
+    // of Lucide icons it uses (ISC licence) are inlined here instead, behind
+    // the same <iconify-icon icon="lucide:..."> element, so the markup and the
+    // `setAttribute('icon', ...)` calls stay as they were.
+    // =========================================================================
+    const ICON_SVG = {
+        'lucide:zap': '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+        'lucide:power': '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
+        'lucide:radio': '<path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/>',
+        'lucide:radio-tower': '<path d="M4.9 16.1C1 12.2 1 5.8 4.9 1.9"/><path d="M7.8 4.7a6.14 6.14 0 0 0-.8 7.5"/><circle cx="12" cy="9" r="2"/><path d="M16.9 4.7a6.14 6.14 0 0 1 .8 7.5"/><path d="M19.1 1.9a9.96 9.96 0 0 1 0 14.1"/><path d="M9.5 18h5"/><path d="m8 22 4-11 4 11"/>',
+        'lucide:check-circle': '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+        'lucide:alert-triangle': '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+        'lucide:info': '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+        'lucide:chevron-down': '<path d="m6 9 6 6 6-6"/>'
+    };
+
+    if (window.customElements && !window.customElements.get('iconify-icon')) {
+        class InlineIcon extends HTMLElement {
+            static get observedAttributes() { return ['icon']; }
+            connectedCallback() { this.render(); }
+            attributeChangedCallback() { this.render(); }
+            render() {
+                const body = ICON_SVG[this.getAttribute('icon')] || '';
+                this.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" ' +
+                    'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+                    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" ' +
+                    'style="display:block">' + body + '</svg>';
+            }
+        }
+        window.customElements.define('iconify-icon', InlineIcon);
+    }
 
     // =========================================================================
     // Configuration
@@ -48,11 +86,13 @@
         // Frames this much older than the freshest arrival are dropped at
         // ingress (burst backlog from the server must not flood the queue).
         staleMs: 1200,
-        // Limits for the drift-correcting consumption step: up to В±2% while
-        // catching up (a short transient at the edge of perception), and
-        // effectively ~0 in steady state because the factor is proportional
-        // to how far the queue is from its target.
-        catchupLimit: 0.02,
+        // Largest consumption-speed correction of the drift controller:
+        // +/-0.5 % (about 8 cents) is inaudible on ambience and still drains
+        // 100 ms of excess latency in ~20 s. The old controller jumped
+        // straight between 1.00 and 1.02 whenever the queue crossed a
+        // threshold, i.e. on every 10 ms packet; that 100 Hz pitch wobble
+        // is what made the stream sound like it was farting.
+        catchupLimit: 0.005,
         // UI refresh interval for fallback stats (ms).
         uiUpdateInterval: 100,
         reconnect: {
@@ -104,10 +144,15 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.targetFrames = Math.floor(this.streamRate * (opts.targetMs || 200) / 1000);
         this.lowWaterFrames = Math.floor(this.streamRate * (opts.lowWaterMs || 30) / 1000);
         this.maxFrames = Math.floor(this.streamRate * (opts.maxMs || 1200) / 1000);
-        this.catchupLimit = opts.catchupLimit || 0.02;
-        // Smoothed consumption-speed correction (see step()).
-        this.smoothedSpeed = 1;
-        this.rebuildFrames = Math.floor(this.streamRate * 0.04);
+        this.catchupLimit = opts.catchupLimit || 0.005;
+        // Drift controller state (see updateSpeed()): smoothed queue level
+        // and the current, slew-limited consumption speed.
+        this.fillAvg = -1;
+        this.speed = 1;
+        // Last output frame, so a fade over an empty queue decays from the
+        // real signal instead of stepping to zero.
+        this.lastL = 0;
+        this.lastR = 0;
 
         this.underruns = 0;
         this.overruns = 0;
@@ -138,43 +183,23 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         }
     }
 
-    // Consumption speed correction, in stream frames per context frame.
+    // Drift controller, run once per render quantum (not per sample).
     //
-    // The base ratio resamples the stream to the context rate. On top of that
-    // a small extra factor nudges the queue back towards the target, so clock
-    // drift and burst aftermath never accumulate: the factor is proportional
-    // to the queue's distance from the target, so in steady state it is
-    // exactly 1 and the correction a few clocks apart is tiny.
-    step() {
-        const excess = this.available - this.targetFrames;
-        // Deadband: inside +/-12 ms of the target the consumer runs at
-        // exactly 1.0. A proportional factor alone oscillates around the
-        // target (speed up -> overshoot -> slow down -> undershoot), which
-        // is audible as a slow pitch wobble; the deadband kills that cycle.
-        if (Math.abs(excess) < this.streamRate * 0.012) {
-            this.smoothedSpeed = 1;
-            return this.rateRatio;
-        }
-        let speed = 1;
-        if (excess > 0) {
-            // Above target: consume slightly faster to drain back down.
-            speed = 1 + Math.min(
-                this.catchupLimit,
-                excess / Math.max(1, this.targetFrames * 2)
-            );
-        } else if (-excess > this.rebuildFrames) {
-            // Materially below target: consume slightly slower to rebuild
-            // before the queue falls into an underrun rebuffer.
-            speed = 1 - Math.min(
-                this.catchupLimit,
-                -excess / Math.max(1, this.targetFrames * 4)
-            );
-        }
-        // Smooth the correction over ~100 ms so step changes between
-        // consecutive callbacks never become an audible ramp.
-        const alpha = 1 - Math.exp(-(this.sampleRate * 0.05) / 128);
-        this.smoothedSpeed += (speed - this.smoothedSpeed) * alpha;
-        return Math.max(0.5, this.rateRatio * this.smoothedSpeed);
+    // The queue level is smoothed over ~0.5 s, so the sawtooth of 10 ms
+    // packet arrivals never reaches the speed; the correction is
+    // proportional to the relative distance from the target, capped at
+    // +/-catchupLimit, and its rate of change is limited too. The result
+    // is a speed that wanders by hundredths of a percent instead of
+    // jumping, which is inaudible.
+    updateSpeed(blockFrames) {
+        if (this.fillAvg < 0) this.fillAvg = this.available;
+        const a = 1 - Math.exp(-blockFrames / (this.sampleRate * 0.5));
+        this.fillAvg += (this.available - this.fillAvg) * a;
+        const error = (this.fillAvg - this.targetFrames) / Math.max(1, this.targetFrames);
+        const want = 1 + Math.max(-this.catchupLimit, Math.min(this.catchupLimit, error * 0.01));
+        const slew = 0.00005;
+        this.speed += Math.max(-slew, Math.min(slew, want - this.speed));
+        return this.rateRatio * this.speed;
     }
 
     push(samples) {
@@ -245,6 +270,8 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.readFrame = this.writeFrame;
         this.started = false;
         this.fadeGain = 0;
+        this.fillAvg = -1;
+        this.speed = 1;
     }
 
     reset() {
@@ -253,6 +280,10 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         this.available = 0;
         this.started = false;
         this.fadeGain = 0;
+        this.fillAvg = -1;
+        this.speed = 1;
+        this.lastL = 0;
+        this.lastR = 0;
         this.underruns = 0;
         this.overruns = 0;
         this.resyncs = 0;
@@ -305,32 +336,37 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
         const left = output[0];
         const right = output.length > 1 ? output[1] : null;
         const frames = left.length;
+        const step = this.updateSpeed(frames);
 
         for (let i = 0; i < frames; i++) {
-            let l = 0;
-            let r = 0;
-            const consuming = this.started || this.fadeGain > 0;
+            // Underrun is detected per sample: as soon as the queue drops
+            // to the low-water mark, playback fades out on the audio that is
+            // still queued (30 ms is far more than the 8 ms fade), so the
+            // stream never stops mid-waveform and never plays zeros at full
+            // gain — both of which are loud clicks.
+            if (this.started && this.available < this.lowWaterFrames) {
+                this.started = false;
+                this.underruns++;
+                this.report();
+            }
 
-            if (consuming && this.available >= 6) {
-                const step = this.step();
+            const consuming = this.started || this.fadeGain > 0;
+            if (consuming && this.available >= 3) {
                 const out = this.readCubicPos(this.readFrame, this.readOut);
-                l = out[0];
-                r = this.channels > 1 ? out[1] : out[0];
+                this.lastL = out[0];
+                this.lastR = this.channels > 1 ? out[1] : out[0];
                 this.readFrame += step;
                 if (this.readFrame >= this.capacityFrames) {
                     this.readFrame -= this.capacityFrames;
                 }
                 this.available = Math.max(0, this.available - step);
                 this.playedFrames++;
-            } else if (consuming && this.available <= 0) {
+            } else if (this.available <= 0 && !this.started) {
                 // The queue is completely empty. Park the read head exactly
                 // at the write frontier so the next packet resumes at fresh
                 // audio instead of straddling a gap of stale ring memory.
-                // A queue that is merely *small* (1-5 frames) must be left
-                // alone: the read head already points at its start.
                 this.readFrame = this.writeFrame;
                 this.available = 0;
-                this.fadeGain = Math.min(this.fadeGain, 0.5);
             }
 
             if (this.started) {
@@ -339,17 +375,17 @@ class SoundSharedStreamProcessor extends AudioWorkletProcessor {
                 this.fadeGain = Math.max(0, this.fadeGain - this.fadeStep);
             }
 
-            left[i] = l * this.fadeGain;
+            left[i] = this.lastL * this.fadeGain;
             if (right) {
-                right[i] = r * this.fadeGain;
+                right[i] = this.lastR * this.fadeGain;
+            }
+            if (this.fadeGain === 0 && !this.started) {
+                this.lastL = 0;
+                this.lastR = 0;
             }
         }
 
-        if (this.started && this.available < this.lowWaterFrames) {
-            this.started = false;
-            this.underruns++;
-            this.report();
-        } else if (this.playedFrames - this.lastReportPlayed >= Math.floor(this.sampleRate / 10)) {
+        if (this.playedFrames - this.lastReportPlayed >= Math.floor(this.sampleRate / 10)) {
             this.lastReportPlayed = this.playedFrames;
             this.report();
         }
@@ -377,19 +413,18 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             this.streamRate = streamRate;
             this.rateRatio = contextRate > 0 ? streamRate / contextRate : 1;
             this.targetFrames = Math.floor(streamRate * ((targetMs == null ? 200 : targetMs) / 1000));
-            this.catchupLimit = catchupLimit || 0.02;
-            // Drift control (mirrors the worklet): the consumption speed is
-            // nudged by how far the queue sits from its target, so two
-            // independent audio clocks never drag latency up to the hard cap.
+            this.catchupLimit = catchupLimit || 0.005;
+            this.contextRate = contextRate > 0 ? contextRate : streamRate;
+            // Drift control (mirrors the worklet's updateSpeed()).
             this.rebuildFrames = Math.floor(streamRate * 0.04);
+            this.fillAvg = -1;
+            this.speedFactor = 1;
             this.buffer = new Float32Array(this.capacity);
             this.writeFrame = 0;
             this.readFrame = 0;
             this.available = 0;
             this.overruns = 0;
             this.resyncs = 0;
-            // Smoothed consumption-speed correction (see speed()).
-            this.smoothedSpeed = 1;
             // Reused per-sample readout (no allocation in the render loop).
             this.takeOut = [0, 0];
         }
@@ -442,32 +477,19 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             this.available += frames;
         }
 
-        // Consumption-speed correction, mirroring the worklet's step(): the
-        // base ratio resamples the stream to the context rate, the extra
-        // factor nudges the queue back towards the target.
-        speed() {
-            const excess = this.available - this.targetFrames;
-            // Same deadband + smoothing as the worklet's step(): a bare
-            // proportional factor oscillates around the target, which is
-            // audible as a slow pitch wobble.
-            if (Math.abs(excess) < this.streamRate * 0.012) {
-                this.smoothedSpeed = 1;
-                return this.rateRatio;
-            }
-            let s = 1;
-            if (excess > 0) {
-                s = 1 + Math.min(
-                    this.catchupLimit,
-                    excess / Math.max(1, this.targetFrames * 2)
-                );
-            } else if (-excess > this.rebuildFrames) {
-                s = 1 - Math.min(
-                    this.catchupLimit,
-                    -excess / Math.max(1, this.targetFrames * 4)
-                );
-            }
-            this.smoothedSpeed += (s - this.smoothedSpeed) * 0.02;
-            return Math.max(0.5, this.rateRatio * this.smoothedSpeed);
+        // Consumption speed for one ScriptProcessor block, mirroring the
+        // worklet's updateSpeed(): smoothed level, proportional and capped
+        // correction, slew-limited change. Called once per block.
+        blockSpeed(blockFrames) {
+            if (this.fillAvg < 0) this.fillAvg = this.available;
+            const a = 1 - Math.exp(-blockFrames / (this.contextRate * 0.5));
+            this.fillAvg += (this.available - this.fillAvg) * a;
+            const error = (this.fillAvg - this.targetFrames) / Math.max(1, this.targetFrames);
+            const want = 1 + Math.max(-this.catchupLimit, Math.min(this.catchupLimit, error * 0.01));
+            // One 2048-frame block is ~16 worklet quanta: same slew per second.
+            const slew = 0.00005 * Math.max(1, blockFrames / 128);
+            this.speedFactor += Math.max(-slew, Math.min(slew, want - this.speedFactor));
+            return this.rateRatio * this.speedFactor;
         }
 
         // Take one output frame (interleaved) via linear interpolation
@@ -494,6 +516,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
             this.available = 0;
             this.overruns = 0;
             this.resyncs = 0;
+            this.fillAvg = -1;
+            this.speedFactor = 1;
             this.buffer.fill(0);
         }
     }
@@ -523,6 +547,8 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         scriptRing: null,
         scriptStarted: false,
         scriptFade: 0,
+        scriptLastL: 0,
+        scriptLastR: 0,
 
         // Buffer / playback statistics
         bufferFrames: 0,
@@ -735,9 +761,10 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         els.infoProtocol.textContent =
             codec.toUpperCase() + ' / ' + Math.round(sampleRate / 1000) + 'KHZ';
-        // Opus is sent at a configured bitrate; PCM would be the raw budget.
+        // Opus is sent at the server's WIRE_BITRATE (64 kbit/s VBR); PCM would
+        // be the raw budget.
         els.infoBitrate.textContent =
-            codec === 'opus' ? '96 KBPS' :
+            codec === 'opus' ? '~64 KBPS VBR' :
             Math.round((sampleRate * channels * 32) / 1000) + ' KBPS';
     }
 
@@ -1023,23 +1050,27 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
         if (!state.scriptStarted && ring.available >= ring.targetFrames) {
             state.scriptStarted = true;
         }
+        const step = ring.blockSpeed(frames);
 
         for (let i = 0; i < frames; i++) {
-            let l = 0;
-            let r = 0;
-            const consuming = state.scriptStarted || state.scriptFade > 0;
+            // Same per-sample underrun handling as the worklet: fade out on
+            // the audio still queued instead of cutting to zeros.
+            if (state.scriptStarted && ring.available < lowFrames) {
+                state.scriptStarted = false;
+                state.underruns++;
+            }
 
-            if (consuming && ring.available > 4) {
-                const out = ring.take(ring.speed());
-                l = out[0];
-                r = out[1];
+            const consuming = state.scriptStarted || state.scriptFade > 0;
+            if (consuming && ring.available >= 2) {
+                const out = ring.take(step);
+                state.scriptLastL = out[0];
+                state.scriptLastR = out[1];
                 state.framesPlayed++;
-            } else if (consuming && ring.available <= 0) {
+            } else if (ring.available <= 0 && !state.scriptStarted) {
                 // Queue empty: park the read head at the write frontier so a
                 // refill resumes at fresh audio (mirror of the worklet).
                 ring.readFrame = ring.writeFrame;
                 ring.available = 0;
-                state.scriptFade = Math.min(state.scriptFade, 0.5);
             }
 
             if (state.scriptStarted) {
@@ -1048,13 +1079,12 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
                 state.scriptFade = Math.max(0, state.scriptFade - fadeStep);
             }
 
-            outL[i] = l * state.scriptFade;
-            outR[i] = r * state.scriptFade;
-        }
-
-        if (state.scriptStarted && ring.available < lowFrames) {
-            state.scriptStarted = false;
-            state.underruns++;
+            outL[i] = state.scriptLastL * state.scriptFade;
+            outR[i] = state.scriptLastR * state.scriptFade;
+            if (state.scriptFade === 0 && !state.scriptStarted) {
+                state.scriptLastL = 0;
+                state.scriptLastR = 0;
+            }
         }
 
         state.bufferFrames = Math.floor(ring.available);
@@ -1797,7 +1827,7 @@ registerProcessor('soundshared-stream-processor', SoundSharedStreamProcessor);
 
         state.animationFrame = requestAnimationFrame(updateUI);
 
-        log('SoundShared Listener initialized');
+        log('Bardwave Listener initialized');
     }
 
     if (document.readyState === 'loading') {

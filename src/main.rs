@@ -1,6 +1,11 @@
-//! SoundShared - Main Entry Point
+//! Bardwave (SoundShared) - Main Entry Point
 //!
 //! Integrates audio engine, network server, and GUI into a single application.
+
+// A release build is a GUI program: no black console window next to the
+// console. When it is started from a terminal (e.g. `--server-only`) it
+// re-attaches to that terminal, see `attach_parent_console`.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -127,7 +132,11 @@ async fn start_listener(
             "🌐 Server task started, beginning to serve on {}",
             actual_addr
         );
+        // Opus packets are ~100 bytes every 10 ms: with Nagle's algorithm on,
+        // Windows holds them back and sends bursts, which drains the
+        // listener's jitter buffer and makes the stream stutter.
         let _ = axum::serve(listener, app_clone)
+            .tcp_nodelay(true)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx_for_server.recv().await;
                 info!("🌐 Shutdown signal received, stopping server...");
@@ -165,6 +174,7 @@ fn run_server_and_get_handle(
     listener_count_tx: Sender<usize>,
     server_handle_tx: Sender<ServerHandle>,
     upnp_status: Arc<Mutex<UpnpStatus>>,
+    network_notes: Arc<Mutex<Vec<String>>>,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -270,6 +280,25 @@ fn run_server_and_get_handle(
                                         let _ = response.send(Ok(url.clone()));
                                         info!("Server started at {}", url);
 
+                                        // Players on the LAN and on the internet
+                                        // both need an inbound firewall rule.
+                                        // `netsh` blocks, so it runs off this
+                                        // thread, which also carries the audio.
+                                        let port = bind_port;
+                                        let notes = Arc::clone(&network_notes);
+                                        *notes.lock().unwrap() = soundshared::network::local_ip::vpn_warning(
+                                            detect_for_bind(bind_addr),
+                                        )
+                                        .into_iter()
+                                        .collect();
+                                        tokio::task::spawn_blocking(move || {
+                                            if !upnp::allow_through_firewall(port) {
+                                                notes.lock().unwrap().push(format!(
+                                                    "Firewall: port {port} not opened - allow Bardwave for public networks or run as admin"
+                                                ));
+                                            }
+                                        });
+
                                         // Port forwarding runs in the background:
                                         // the LAN URL above is never held up by
                                         // a slow or absent router.
@@ -297,6 +326,7 @@ fn run_server_and_get_handle(
                                     upnp::release(mapping).await;
                                 }
                                 *upnp_status.lock().unwrap() = UpnpStatus::Off;
+                                network_notes.lock().unwrap().clear();
 
                                 // Tell the listener (and every session it holds
                                 // open) to stop, then wait for it with a deadline.
@@ -364,13 +394,12 @@ fn run_server_and_get_handle(
                 // at any time while the server runs.
                 _ = upnp_poll.tick(), if upnp_mapping.is_some() => {
                     if let Some(mapping) = &upnp_mapping {
-                        let next = upnp::describe(&mapping.status());
+                        let next = mapping.status();
                         let mut current = upnp_status.lock().unwrap();
                         if *current != next {
                             match &next {
                                 UpnpStatus::Mapped { external, url } => {
                                     info!("Router forwards {external} -> port {bind_port}; internet URL {url}");
-                                    upnp::allow_through_firewall(bind_port);
                                 }
                                 UpnpStatus::DoubleNat { external } => warn!(
                                     "Router forwards {external}, but that address is private: \
@@ -435,8 +464,33 @@ fn main() -> Result<()> {
         }
     }));
 
-    // Load configuration
-    let config = Config::load()?;
+    attach_parent_console();
+
+    // Check for --server-only flag to run without GUI
+    let args: Vec<String> = std::env::args().collect();
+    let server_only = args.iter().any(|a| a == "--server-only");
+
+    // Load configuration. A broken config.toml used to end the process
+    // silently (there is no console to print to), which looked like the app
+    // simply refusing to start. Say what is wrong instead; never fall back to
+    // defaults here, because the next save would overwrite the library.
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            if !server_only {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Bardwave")
+                    .set_description(format!(
+                        "config.toml could not be read:\n\n{e}\n\nFix the file (or move it away to start with defaults) and launch Bardwave again."
+                    ))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
+            eprintln!("Error: {e}");
+            return Err(e);
+        }
+    };
     info!(
         "Configuration loaded: server={}, audio_buffer={}, log_level={}",
         config.server_addr(),
@@ -448,10 +502,6 @@ fn main() -> Result<()> {
     init_logging(&config)?;
 
     info!("Starting SoundShared v{}", soundshared::VERSION);
-
-    // Check for --server-only flag to run without GUI
-    let args: Vec<String> = std::env::args().collect();
-    let server_only = args.iter().any(|a| a == "--server-only");
 
     // Create channels for inter-component communication
     let (audio_cmd_tx, audio_cmd_rx) = bounded::<AudioCommand>(32);
@@ -508,6 +558,7 @@ fn main() -> Result<()> {
     let server_config_clone = server_config.clone();
     let server_handle_tx_clone = server_handle_tx.clone();
     let upnp_status = app_state.upnp_status.clone();
+    let network_notes = app_state.network_notes.clone();
     thread::spawn(move || {
         if let Err(e) = run_server_and_get_handle(
             server_config_clone,
@@ -515,6 +566,7 @@ fn main() -> Result<()> {
             listener_count_tx_clone,
             server_handle_tx_clone,
             upnp_status,
+            network_notes,
         ) {
             error!("Server error: {}", e);
         }
@@ -652,20 +704,93 @@ fn stop_server_and_wait(server_cmd_tx: &Sender<ServerCommand>) {
 }
 
 /// Initialize logging based on configuration
+///
+/// With `logging.file_logging = true` the log also goes to `bardwave.log` next
+/// to the executable — the only way to read it from a release build, which
+/// has no console window.
 fn init_logging(config: &Config) -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
-    let subscriber = FmtSubscriber::builder()
+    let log_file = if config.logging.file_logging {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("bardwave.log")))
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            })
+    } else {
+        None
+    };
+
+    let builder = FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(true)
         .with_file(true)
-        .with_line_number(true)
-        .finish();
+        .with_line_number(true);
 
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| SoundSharedError::Other(format!("Failed to set global logger: {}", e)))?;
+    let result = match log_file {
+        Some(file) => {
+            let file = Arc::new(Mutex::new(file));
+            let writer = move || TeeWriter {
+                file: Arc::clone(&file),
+            };
+            tracing::subscriber::set_global_default(builder.with_writer(writer).finish())
+        }
+        None => tracing::subscriber::set_global_default(builder.finish()),
+    };
+    result.map_err(|e| SoundSharedError::Other(format!("Failed to set global logger: {}", e)))?;
 
     Ok(())
 }
+
+/// Log writer for `file_logging`: stdout (when there is a console) plus the
+/// log file.
+struct TeeWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stdout().write_all(buf);
+        if let Ok(mut file) = self.file.lock() {
+            file.write_all(buf)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stdout().flush();
+        if let Ok(mut file) = self.file.lock() {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// Re-attach stdout/stderr to the terminal that started us, if any.
+///
+/// The release build uses the GUI subsystem (no console window of its own),
+/// so `soundshared.exe --server-only` started from cmd/PowerShell would
+/// otherwise print nothing at all.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: plain Win32 call without pointers; failure (no parent console)
+    // is harmless and simply leaves the process without a console.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}

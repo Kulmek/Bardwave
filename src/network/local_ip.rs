@@ -200,6 +200,35 @@ fn probe_route() -> Option<IpAddr> {
     None
 }
 
+/// Source address of the default IPv4 route, unfiltered.
+///
+/// Unlike [`probe_route`] this keeps VPN / TUN addresses: it answers "which
+/// adapter does internet traffic leave through", which is what decides
+/// whether replies to players outside the LAN go back through the router.
+pub fn default_route_source() -> Option<std::net::Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(local) => Some(*local.ip()),
+        SocketAddr::V6(_) => None,
+    }
+}
+
+/// A warning when internet traffic does not leave through the LAN adapter.
+///
+/// With a full-tunnel VPN up, the router forwards a player's connection to
+/// our LAN address, but the reply follows the default route into the tunnel
+/// and never reaches the player. Port forwarding itself works; the VPN has to
+/// be off (or exclude Bardwave) for internet players.
+pub fn vpn_warning(lan: Option<IpAddr>) -> Option<String> {
+    let IpAddr::V4(lan) = lan? else {
+        return None;
+    };
+    let route = default_route_source()?;
+    (route != lan && !route.is_loopback())
+        .then(|| format!("VPN active ({route}): internet players can't connect until it is off"))
+}
+
 #[cfg(windows)]
 fn adapter_addresses() -> Vec<IpAddr> {
     windows::unicast_addresses()

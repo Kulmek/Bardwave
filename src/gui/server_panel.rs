@@ -98,7 +98,8 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         let running = matches!(server.status, GuiServerStatus::Running);
 
         ui.horizontal(|ui| {
-            let well_w = (ui.available_width() - 34.0).max(60.0);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let well_w = (ui.available_width() - 34.0 - Metrics::XS).max(60.0);
             let (rect, _) = ui.allocate_exact_size(Vec2::new(well_w, 40.0), Sense::hover());
             let painter = ui.painter();
             painter.rect(
@@ -178,7 +179,11 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                 match &server.upnp {
                     UpnpStatus::Mapped { url, .. } => {
                         if label
-                            .on_hover_text("Click to copy the internet URL")
+                            .on_hover_text(
+                                "Click to copy the internet URL.\n\nOpening it from inside your own \
+                                 network may fail on routers without NAT loopback - test it from \
+                                 a phone on mobile data instead.",
+                            )
                             .clicked()
                         {
                             ui.output_mut(|o| o.copied_text = url.clone());
@@ -200,6 +205,23 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             }
         }
 
+        // What keeps players out even though the server runs: a VPN taking
+        // the default route, a firewall rule that could not be added.
+        if running {
+            for note in &server.notes {
+                ui.add_space(Metrics::XS);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(note.to_uppercase())
+                            .font(crate::gui::widgets::glyph_font(Metrics::MICRO_TINY))
+                            .color(Palette::AMBER_400)
+                            .extra_letter_spacing(0.6),
+                    )
+                    .wrap(),
+                );
+            }
+        }
+
         ui.add_space(Metrics::LG);
 
         // ---- Listener occupancy ----
@@ -214,7 +236,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             ui.add_space(Metrics::MD);
             occupancy_cells(ui, server.listener_count.min(8), 8, 8.0, 6.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(micro_label(format!("Peak {}", server.listener_count)));
+                ui.label(micro_label(format!("Peak {}", server.peak_listeners)));
             });
         });
 
@@ -226,9 +248,11 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
         // Both buttons live on one line, so each needs an explicit width: with no
         // width a `ConsoleButton` claims the whole row and pushes its neighbour
         // outside the panel.
-        let copy_w = 112.0;
+        let copy_w = 124.0;
         let primary_w = (ui.available_width() - copy_w - Metrics::SM).max(96.0);
         ui.horizontal(|ui| {
+            // Widths above already include the one explicit gap.
+            ui.spacing_mut().item_spacing.x = 0.0;
             match &server.status {
                 GuiServerStatus::Stopped | GuiServerStatus::Error(_) => {
                     let label = if matches!(server.status, GuiServerStatus::Error(_)) {
@@ -237,7 +261,7 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
                         "Start Server"
                     };
                     if ConsoleButton::primary(label)
-                        .glyph(glyph::PLAY)
+                        .glyph(glyph::BROADCAST)
                         .width(primary_w)
                         .height(40.0)
                         .id_salt("server_start")

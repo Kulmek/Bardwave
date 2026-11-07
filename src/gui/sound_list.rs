@@ -88,6 +88,7 @@ fn header(ui: &mut Ui, state: &mut SoundSharedApp) {
             if ConsoleButton::primary("Add Sound")
                 .glyph(glyph::PLUS)
                 .font_size(11.0)
+                .width(150.0)
                 .id_salt("library_add")
                 .show(ui)
                 .clicked()
@@ -264,11 +265,11 @@ fn rail_chip(
             let del = ui
                 .interact(del_rect, resp.id.with("del"), Sense::click())
                 .on_hover_text("Delete group");
-            painter.text(
-                del_rect.center(),
-                egui::Align2::CENTER_CENTER,
+            crate::gui::widgets::paint_icon(
+                painter,
                 glyph::CROSS,
-                crate::gui::widgets::glyph_font(10.0),
+                del_rect.center(),
+                12.5,
                 if del.hovered() {
                     Palette::ROSE_400
                 } else {
@@ -283,11 +284,11 @@ fn rail_chip(
             let ren = ui
                 .interact(ren_rect, resp.id.with("ren"), Sense::click())
                 .on_hover_text("Rename group");
-            painter.text(
-                ren_rect.center(),
-                egui::Align2::CENTER_CENTER,
+            crate::gui::widgets::paint_icon(
+                painter,
                 glyph::EDIT,
-                crate::gui::widgets::glyph_font(10.0),
+                ren_rect.center(),
+                12.5,
                 if ren.hovered() {
                     Palette::WHITE
                 } else {
@@ -485,11 +486,11 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         btn_fill,
         Stroke::new(1.0_f32, btn_border),
     );
-    painter.text(
-        btn_rect.center(),
-        egui::Align2::CENTER_CENTER,
+    crate::gui::widgets::paint_icon(
+        painter,
         if playing { glyph::STOP } else { glyph::PLAY },
-        crate::gui::widgets::glyph_font(11.0),
+        btn_rect.center(),
+        13.8,
         btn_fg,
     );
     if btn_resp.clicked() {
@@ -527,13 +528,7 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         loop_fill,
         Stroke::new(1.0_f32, loop_border),
     );
-    painter.text(
-        loop_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph::LOOP,
-        crate::gui::widgets::glyph_font(11.0),
-        loop_fg,
-    );
+    crate::gui::widgets::paint_icon(painter, glyph::LOOP, loop_rect.center(), 13.8, loop_fg);
     if loop_resp.clicked() {
         action = RowAction::SetLoop(!sound.looped);
     }
@@ -560,7 +555,7 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
             (120.0 + 135.0 * phase) as u8
         };
         painter.circle_filled(
-            egui::pos2(text_x + 3.0, rect.center().y - 8.0),
+            egui::pos2(text_x + 3.0, rect.center().y - 9.0),
             3.0,
             alpha(Palette::ROSE_500, a),
         );
@@ -574,7 +569,9 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
     };
     let name = elide(&sound.name, 38);
     let name_galley = painter.layout_no_wrap(name, ui_font(14.0), name_color);
-    let name_y = rect.center().y - 11.0;
+    // Name sits right above the centre line, the meta line right below it;
+    // the old fixed offset let the two overlap by a few pixels.
+    let name_y = rect.center().y - name_galley.size().y;
     painter.galley(egui::pos2(name_x, name_y), name_galley, name_color);
 
     // `48 kHz / 00:42 / WAV` — mono telemetry under the name.
@@ -590,7 +587,7 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         crate::gui::widgets::format_extension(&sound.path)
     );
     painter.text(
-        egui::pos2(text_x, rect.center().y + 2.0),
+        egui::pos2(text_x, rect.center().y + 3.0),
         egui::Align2::LEFT_TOP,
         meta.to_uppercase(),
         crate::gui::widgets::glyph_font(10.0),
@@ -604,11 +601,11 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
     let remove_rect =
         Rect::from_center_size(egui::pos2(cursor - 9.0, rect.center().y), Vec2::splat(18.0));
     let remove_resp = ui.interact(remove_rect, resp.id.with("remove"), Sense::click());
-    painter.text(
-        remove_rect.center(),
-        egui::Align2::CENTER_CENTER,
+    crate::gui::widgets::paint_icon(
+        painter,
         glyph::CROSS,
-        crate::gui::widgets::glyph_font(11.0),
+        remove_rect.center(),
+        13.8,
         if remove_resp.hovered() {
             Palette::ROSE_400
         } else {
@@ -626,9 +623,15 @@ fn sound_row(ui: &mut Ui, state: &mut SoundSharedApp, sound: &SoundEntry) -> Row
         crate::gui::widgets::glyph_font(10.0),
         Palette::ZINC_400,
     );
-    cursor -= pct_galley.size().x;
+    // Fixed-width, right-aligned readout: "100%" is wider than "70%", and a
+    // width that follows the text shifted the slider from row to row.
+    const PCT_W: f32 = 34.0;
+    cursor -= PCT_W;
     painter.galley(
-        egui::pos2(cursor, rect.center().y - pct_galley.size().y / 2.0),
+        egui::pos2(
+            cursor + PCT_W - pct_galley.size().x,
+            rect.center().y - pct_galley.size().y / 2.0,
+        ),
         pct_galley,
         Palette::ZINC_400,
     );
@@ -784,6 +787,7 @@ fn empty_state(ui: &mut Ui, state: &mut SoundSharedApp, filter: GroupFilter, hei
             if matches!(filter, GroupFilter::Group(_) | GroupFilter::Ungrouped) {
                 ui.add_space(Metrics::SM);
                 if ConsoleButton::ghost("Show All")
+                    .glyph(glyph::FOLDER)
                     .width(150.0)
                     .id_salt("empty_show_all")
                     .show(ui)
@@ -804,13 +808,14 @@ fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
             let muted = state.is_muted();
             let mute_label = if muted { "Unmute" } else { "Mute" };
             let resp = ConsoleButton::new(mute_label)
+                .glyph(if muted { glyph::MUTED } else { glyph::VOLUME })
                 .kind(if muted {
                     crate::gui::widgets::BtnKind::Armed
                 } else {
                     crate::gui::widgets::BtnKind::Ghost
                 })
                 .small()
-                .width(64.0)
+                .width(92.0)
                 .id_salt("master_mute")
                 .show(ui);
             if resp.clicked() {
@@ -827,7 +832,8 @@ fn master_output(ui: &mut Ui, state: &mut SoundSharedApp) {
             );
 
             ui.add_space(Metrics::SM);
-            segmented_meter(ui, value, 20, 160.0, 8.0);
+            // Live output level (peak, dB scale), not the fader position.
+            segmented_meter(ui, state.output_meter(), 20, 160.0, 8.0);
 
             ui.add_space(Metrics::MD);
             let mut slider_value = value;

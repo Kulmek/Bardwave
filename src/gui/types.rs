@@ -117,6 +117,10 @@ pub struct AppState {
 
     /// Router port forwarding state, written by the server thread
     pub upnp_status: std::sync::Arc<std::sync::Mutex<crate::network::upnp::UpnpStatus>>,
+
+    /// Problems that keep players out (VPN route, firewall), written by the
+    /// server thread on Start and cleared on Stop.
+    pub network_notes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl AppState {
@@ -133,6 +137,7 @@ impl AppState {
             listener_count,
             config,
             upnp_status: Default::default(),
+            network_notes: Default::default(),
         }
     }
 }

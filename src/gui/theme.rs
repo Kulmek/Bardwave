@@ -307,8 +307,12 @@ pub fn create_theme() -> Style {
     style.spacing.menu_margin = Margin::same(Metrics::SM);
     style.spacing.slider_width = Metrics::ROW_SLIDER_W;
     style.spacing.interact_size = egui::vec2(24.0, 24.0);
-    style.spacing.scroll.bar_width = 6.0;
-    style.spacing.scroll.floating = false;
+    // Thin floating scroll bars in the panel colours: they appear on hover
+    // and never steal layout width, so a panel that overflows by a few
+    // pixels no longer shifts its content sideways. The default handle used
+    // the (light grey) text colour, which glared against the noir panels.
+    style.spacing.scroll = egui::style::ScrollStyle::thin();
+    style.spacing.scroll.foreground_color = false;
 
     style.interaction.selectable_labels = false;
     style.interaction.tooltip_delay = 0.35;

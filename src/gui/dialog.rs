@@ -73,6 +73,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                     }
                     ui.add_space(Metrics::SM);
                     if ConsoleButton::ghost("Cancel")
+                        .glyph(glyph::CROSS)
                         .width(120.0)
                         .height(Metrics::BTN_H)
                         .id_salt("dlg_new_cancel")
@@ -134,6 +135,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                     }
                     ui.add_space(Metrics::SM);
                     if ConsoleButton::ghost("Cancel")
+                        .glyph(glyph::CROSS)
                         .width(120.0)
                         .height(Metrics::BTN_H)
                         .id_salt("dlg_rename_cancel")
@@ -182,7 +184,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
 
                 ui.horizontal(|ui| {
                     if ConsoleButton::danger("Delete")
-                        .glyph(glyph::CROSS)
+                        .glyph(glyph::TRASH)
                         .width(150.0)
                         .height(Metrics::BTN_H)
                         .id_salt("dlg_delete_ok")
@@ -193,6 +195,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
                     }
                     ui.add_space(Metrics::SM);
                     if ConsoleButton::ghost("Keep")
+                        .glyph(glyph::CHECK)
                         .width(120.0)
                         .height(Metrics::BTN_H)
                         .id_salt("dlg_delete_cancel")
@@ -263,6 +266,7 @@ pub fn show_dialogs(ctx: &Context, state: &mut SoundSharedApp) {
 
                 ui.horizontal(|ui| {
                     if ConsoleButton::ghost("Cancel")
+                        .glyph(glyph::CROSS)
                         .width(150.0)
                         .height(Metrics::BTN_H)
                         .id_salt("dlg_assign_cancel")
@@ -327,11 +331,11 @@ fn assign_row(ui: &mut Ui, label: &str, selected: bool) -> bool {
     );
 
     if selected {
-        painter.text(
-            egui::pos2(rect.right() - 14.0, rect.center().y),
-            egui::Align2::CENTER_CENTER,
+        crate::gui::widgets::paint_icon(
+            painter,
             glyph::CHECK,
-            crate::gui::widgets::glyph_font(12.0),
+            egui::pos2(rect.right() - 14.0, rect.center().y),
+            15.0,
             Palette::ROSE_400,
         );
     }

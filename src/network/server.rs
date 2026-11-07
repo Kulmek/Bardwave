@@ -200,7 +200,11 @@ impl NetworkServer {
         // Spawn server task
         let server_task = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
+            // Opus packets are ~100 bytes every 10 ms: with Nagle's algorithm
+            // on, Windows holds them back and sends bursts, which drains the
+            // listener's jitter buffer and makes the stream stutter.
             axum::serve(listener, app)
+                .tcp_nodelay(true)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.recv().await;
                     info!("🌐 Shutdown signal received, stopping server...");
@@ -514,7 +518,7 @@ mod tests {
         let addr = url.trim_start_matches("http://");
 
         let body = http_get(addr, "/").await;
-        assert!(body.contains("SoundShared"), "unexpected body: {body}");
+        assert!(body.contains("Bardwave"), "unexpected body: {body}");
 
         handle.stop();
     }

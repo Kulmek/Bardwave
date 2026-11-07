@@ -61,7 +61,7 @@ impl GuiApp {
             viewport: ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
                 .with_min_inner_size([960.0, 620.0])
-                .with_title("SoundShared — Broadcast Console")
+                .with_title("Bardwave — Broadcast Console")
                 .with_icon(window_icon()),
             centered: true,
             ..Default::default()
