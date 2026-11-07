@@ -1,206 +1,253 @@
-//! UPnP IGD port mapping for SoundShared.
+//! Router port forwarding, so players outside the LAN can reach the console.
 //!
-//! Discovers the local IGD (Internet Gateway Device) via SSDP and adds a port
-//! mapping so the bound port is reachable from the global IP. If no IGD is
-//! found or the mapping fails, the server still works on LAN — UPnP is purely
-//! additive and never a hard failure.
+//! On `Start` the server thread asks the local router to forward the listen
+//! port to this machine, through UPnP IGD first and PCP / NAT-PMP as fallbacks
+//! ([`port-control-client`](https://crates.io/crates/port-control-client)).
+//! The request runs in the background and never delays or fails the server:
+//! the LAN URL is published at once and the internet URL is added when (and
+//! if) the router grants the mapping. The background task renews the lease
+//! and keeps retrying while no router answers; `Stop` removes the mapping.
 //!
-//! Built on [`port-control-client`](https://crates.io/crates/port-control-client),
-//! which speaks UPnP IGD (v1/v2) over Tokio.
-//!
-//! On Windows, a firewall rule is also added so inbound connections on the
-//! mapped port are not blocked by Windows Defender Firewall.
+//! A granted mapping is not always reachable from the internet: behind a second
+//! NAT (carrier-grade NAT, a provider modem in front of the router) the
+//! router's external address is itself private. That case is reported as
+//! [`UpnpStatus::DoubleNat`] instead of advertising a URL nobody can open.
 
-use std::net::IpAddr;
-use std::num::NonZeroU16;
-use port_control_client::{Config, Method, Protocol};
 pub use port_control_client::PortMapping;
-use tracing::{debug, info, warn};
+use port_control_client::{Config, Method, Protocol, Status};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::num::NonZeroU16;
+use std::time::Duration;
 
-/// Result of an attempted UPnP port mapping.
-#[derive(Debug, Clone)]
-pub struct UpnpResult {
-    /// True if a mapping was successfully created.
-    pub mapped: bool,
-    /// External port on the router that forwards to our bind port.
-    pub external_port: u16,
-    /// The router's external (global) IP address, if we could read it.
-    pub external_ip: Option<IpAddr>,
+/// Lease asked of the router; the task renews it at half-time.
+const LEASE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// How long to wait before asking again when no router granted a mapping.
+const RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Description shown in the router's port-forwarding table.
+const DESCRIPTION: &str = "Bardwave";
+
+/// Where port forwarding stands, as shown to the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpnpStatus {
+    /// Disabled in the config, not applicable to the bind address, or the
+    /// server is stopped.
+    #[default]
+    Off,
+    /// Looking for a router; no answer yet.
+    Searching,
+    /// The router forwards `external` to us and it is a public address.
+    Mapped {
+        external: SocketAddrV4,
+        /// URL players outside the LAN open.
+        url: String,
+    },
+    /// The router granted `external`, but that address is private: there is
+    /// another NAT in front of the router and the port is not reachable from
+    /// the internet.
+    DoubleNat { external: SocketAddrV4 },
+    /// No router granted a mapping; the reason of the last attempt. The
+    /// background task keeps retrying.
+    Unavailable(String),
 }
 
-/// How long to wait for the UPnP background task to discover the router and
-/// grant the mapping before checking the result.
-const UPNP_DISCOVER_WAIT_SECS: u64 = 10;
+impl UpnpStatus {
+    /// Internet URL, when there is one to advertise.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            UpnpStatus::Mapped { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+}
 
-/// How many times to retry the whole discovery + mapping cycle.
-const UPNP_MAX_RETRIES: u32 = 3;
-
-/// Try to open the given port on the local IGD for TCP via UPnP.
+/// Starts forwarding `port` (TCP) on the router, if the bind address can be
+/// forwarded at all.
 ///
-/// Returns `Ok((UpnpResult, PortMapping))` — keep the `PortMapping` handle alive
-/// for as long as the server runs, and call [`remove_port_mapping`] on shutdown.
-/// On failure returns `Ok((UpnpResult { mapped: false, .. }, ...))` so callers
-/// can continue without port forwarding. Only truly unexpected errors surface as
-/// `Err`.
-pub async fn add_port_mapping(bind_addr: IpAddr, port: u16) -> Result<(UpnpResult, PortMapping), String> {
-    if !bind_addr.is_ipv4() {
-        debug!("UPnP skipped: bind address is not IPv4 ({bind_addr})");
-        let mapping = PortMapping::start(Config::new(Protocol::Tcp, NonZeroU16::new(1).unwrap())
-            .methods(vec![Method::Upnp]));
-        return Ok((
-            UpnpResult {
-                mapped: false,
-                external_port: port,
-                external_ip: None,
-            },
-            mapping,
-        ));
+/// Returns `None` for IPv6 and loopback binds: routers only forward IPv4, and
+/// a loopback socket is unreachable from anywhere else anyway. Keep the handle
+/// for as long as the server runs and call [`release`] on stop; dropping it
+/// also releases the mapping, in the background.
+///
+/// Must be called inside a Tokio runtime.
+pub fn start(bind_addr: IpAddr, port: u16) -> Option<PortMapping> {
+    let IpAddr::V4(v4) = bind_addr else {
+        tracing::info!("Port forwarding skipped: routers forward IPv4 only ({bind_addr})");
+        return None;
+    };
+    if v4.is_loopback() {
+        tracing::info!("Port forwarding skipped: bound to loopback ({bind_addr})");
+        return None;
     }
+    let port = NonZeroU16::new(port)?;
 
-    info!("Searching for UPnP IGD devices...");
-
-    let mut last_error: Option<String> = None;
-
-    for attempt in 1..=UPNP_MAX_RETRIES {
-        if attempt > 1 {
-            info!("UPnP retry {attempt}/{UPNP_MAX_RETRIES}...");
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-
-        let config = Config::new(Protocol::Tcp, NonZeroU16::new(port).unwrap())
-            .lifetime(std::time::Duration::from_secs(2 * 60 * 60)) // 2 hours
-            .retry_interval(std::time::Duration::from_secs(60))
-            .description("SoundShared")
-            .methods(vec![Method::Upnp]);
-
-        let mapping = PortMapping::start(config);
-
-        // Give the background task time to discover the router via SSDP and
-        // negotiate the port mapping. 2 seconds is usually too short on a busy
-        // home network.
-        tokio::time::sleep(std::time::Duration::from_secs(UPNP_DISCOVER_WAIT_SECS)).await;
-
-        let external = mapping.mapping();
-        match external {
-            Some(m) => {
-                info!(
-                    "UPnP port mapping granted: external {} -> local {}",
-                    m.external, port
-                );
-                // Also ensure Windows Defender Firewall allows inbound on this port.
-                #[cfg(windows)]
-                if let Err(e) = add_firewall_rule(port) {
-                    warn!("Could not add Windows firewall rule for port {port}: {e}");
-                }
-                return Ok((
-                    UpnpResult {
-                        mapped: true,
-                        external_port: m.external.port(),
-                        external_ip: Some(IpAddr::V4(*m.external.ip())),
-                    },
-                    mapping,
-                ));
-            }
-            None => {
-                let err = mapping.last_error();
-                if let Some(e) = &err {
-                    last_error = Some(e.to_string());
-                    debug!("UPnP attempt {attempt} last error: {e}");
-                } else {
-                    debug!("UPnP attempt {attempt}: no mapping granted yet");
-                }
-                // Stop this mapping attempt before the next retry.
-                mapping.stop().await;
-            }
-        }
-    }
-
-    info!(
-        "No UPnP mapping granted after {UPNP_MAX_RETRIES} attempts — continuing without port forwarding{}",
-        match &last_error {
-            Some(e) => format!(" (last error: {e})"),
-            None => String::new(),
-        }
-    );
-
-    let dummy_mapping = PortMapping::start(Config::new(Protocol::Tcp, NonZeroU16::new(1).unwrap())
-        .methods(vec![Method::Upnp]));
-
-    Ok((
-        UpnpResult {
-            mapped: false,
-            external_port: port,
-            external_ip: None,
-        },
-        dummy_mapping,
-    ))
+    tracing::info!("Asking the router to forward TCP port {port} (UPnP IGD, PCP, NAT-PMP)");
+    let config = Config::new(Protocol::Tcp, port)
+        .lifetime(LEASE)
+        .retry_interval(RETRY_INTERVAL)
+        .description(DESCRIPTION)
+        .methods([Method::Upnp, Method::Pcp, Method::NatPmp]);
+    Some(PortMapping::start(config))
 }
 
-/// Remove a previously added port mapping on shutdown.
-pub async fn remove_port_mapping(mapping: PortMapping) {
+/// Removes the mapping from the router; returns within about two seconds.
+pub async fn release(mapping: PortMapping) {
+    let had_mapping = mapping.mapping().is_some();
     mapping.stop().await;
-    info!("UPnP port mapping released");
+    if had_mapping {
+        match mapping.last_error() {
+            Some(e) => tracing::warn!("Could not remove the router port mapping: {e}"),
+            None => tracing::info!("Router port mapping removed"),
+        }
+    }
 }
 
-/// Add a Windows Defender Firewall inbound rule for the given TCP port so
-/// connections from the internet (after UPnP router forwarding) are not blocked.
+/// What the operator should see for a mapping task's status.
+pub fn describe(status: &Status) -> UpnpStatus {
+    if let Some(mapping) = status.mapping() {
+        let external = mapping.external;
+        return if is_public_ipv4(*external.ip()) {
+            UpnpStatus::Mapped {
+                external,
+                url: format!("http://{external}"),
+            }
+        } else {
+            UpnpStatus::DoubleNat { external }
+        };
+    }
+    match status {
+        Status::Stopped { .. } => UpnpStatus::Off,
+        _ => match status.error() {
+            Some(e) => UpnpStatus::Unavailable(e.to_string()),
+            None => UpnpStatus::Searching,
+        },
+    }
+}
+
+/// Whether hosts on the internet can route to this address.
+pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // 100.64.0.0/10, carrier-grade NAT
+        || (a == 100 && (64..=127).contains(&b))
+        // 192.0.0.0/24, IETF protocol assignments
+        || (a == 192 && b == 0 && c == 0)
+        // 198.18.0.0/15, benchmarking
+        || (a == 198 && (b & 0xfe) == 18)
+        // 0.0.0.0/8 and 240.0.0.0/4
+        || a == 0
+        || a >= 240)
+}
+
+/// Lets inbound connections on `port` through Windows Defender Firewall.
+///
+/// Needs an elevated process; otherwise Windows asks the user on the first
+/// listen, and this only logs why it could not add the rule. The rule is
+/// replaced, not duplicated, on every start.
 #[cfg(windows)]
-fn add_firewall_rule(port: u16) -> Result<(), String> {
-    let rule_name = format!("SoundShared port {port}");
-    let output = std::process::Command::new("netsh")
+pub fn allow_through_firewall(port: u16) {
+    use std::process::Command;
+
+    let name = format!("name=Bardwave TCP {port}");
+    let _ = Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", &name])
+        .output();
+    let added = Command::new("netsh")
         .args([
             "advfirewall",
             "firewall",
             "add",
             "rule",
-            &format!("name={rule_name}"),
+            &name,
             "dir=in",
             "action=allow",
-            &format!("protocol=TCP"),
+            "protocol=TCP",
             &format!("localport={port}"),
             "enable=yes",
             "profile=any",
         ])
-        .output()
-        .map_err(|e| format!("failed to run netsh: {e}"))?;
-
-    if output.status.success() {
-        info!("Windows firewall rule added for TCP port {port}");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("netsh returned non-zero: {stderr}"))
+        .output();
+    match added {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Windows firewall: inbound TCP {port} allowed")
+        }
+        Ok(out) => tracing::warn!(
+            "Windows firewall rule for TCP {port} not added (run as administrator to add it): {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => tracing::warn!("Windows firewall rule for TCP {port} not added: {e}"),
     }
 }
 
+/// Lets inbound connections on `port` through the host firewall (Windows only).
 #[cfg(not(windows))]
-fn add_firewall_rule(_port: u16) -> Result<(), String> {
-    Ok(())
-}
+pub fn allow_through_firewall(_port: u16) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     #[test]
-    fn upnp_result_default_fields() {
-        let result = UpnpResult {
-            mapped: false,
-            external_port: 8080,
-            external_ip: None,
-        };
-        assert!(!result.mapped);
-        assert_eq!(result.external_port, 8080);
-        assert!(result.external_ip.is_none());
+    fn public_addresses_are_public() {
+        for ip in ["8.8.8.8", "85.140.1.20", "140.232.64.5", "100.128.0.1"] {
+            assert!(is_public_ipv4(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]
-    fn non_ipv4_and_ipv4_detected() {
-        let v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
-        assert!(v6.is_ipv6());
-        assert!(!v6.is_ipv4());
-        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert!(v4.is_ipv4());
+    fn private_and_special_addresses_are_not_public() {
+        for ip in [
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "192.0.0.8",
+            "240.0.0.1",
+        ] {
+            assert!(!is_public_ipv4(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_and_loopback_binds_are_not_forwarded() {
+        assert!(start("::".parse().unwrap(), 8080).is_none());
+        assert!(start("127.0.0.1".parse().unwrap(), 8080).is_none());
+        assert!(start("0.0.0.0".parse().unwrap(), 0).is_none());
+    }
+
+    #[test]
+    fn describe_without_mapping() {
+        assert_eq!(
+            describe(&Status::Unmapped { error: None }),
+            UpnpStatus::Searching
+        );
+        assert_eq!(describe(&Status::Stopped { error: None }), UpnpStatus::Off);
+    }
+
+    #[test]
+    fn only_mapped_status_has_a_url() {
+        let external: SocketAddrV4 = "85.140.1.20:8080".parse().unwrap();
+        let mapped = UpnpStatus::Mapped {
+            external,
+            url: format!("http://{external}"),
+        };
+        assert_eq!(mapped.url(), Some("http://85.140.1.20:8080"));
+        assert_eq!(UpnpStatus::DoubleNat { external }.url(), None);
+        assert_eq!(UpnpStatus::Searching.url(), None);
     }
 }

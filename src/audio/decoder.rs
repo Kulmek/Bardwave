@@ -114,13 +114,13 @@ impl AudioDecoder {
         let dec_opts = DecoderOptions::default();
         let mut decoder = symphonia::default::get_codecs()
             .make(&codec_params, &dec_opts)
-            .map_err(|e| DecoderError::Decoder(e))?;
+            .map_err(DecoderError::Decoder)?;
 
         let mut all_samples = Vec::new();
         let sample_rate = codec_params.sample_rate.unwrap_or(TARGET_SAMPLE_RATE);
         let channels = codec_params
             .channels
-            .map(|c| c.count() as usize)
+            .map(|c| c.count())
             .unwrap_or(TARGET_CHANNELS as usize);
         let channels_u32: u32 = channels.try_into().unwrap();
 
@@ -191,8 +191,8 @@ impl AudioDecoder {
         _src_sample_rate: u32,
         _src_channels: u32,
     ) -> Result<Vec<f32>, DecoderError> {
-        let frames = audio_buf.frames() as usize;
-        let channels = audio_buf.spec().channels.count() as usize;
+        let frames = audio_buf.frames();
+        let channels = audio_buf.spec().channels.count();
 
         // Convert to f32 - get all channels
         let mut channel_data: Vec<Vec<f32>> = Vec::with_capacity(channels);
@@ -234,7 +234,7 @@ impl AudioDecoder {
                     .iter()
                     .map(|&v| v as f32 / 2147483648.0)
                     .collect(),
-                AudioBufferRef::F32(ref buf) => buf.chan(ch).iter().copied().collect(),
+                AudioBufferRef::F32(ref buf) => buf.chan(ch).to_vec(),
                 AudioBufferRef::F64(ref buf) => buf.chan(ch).iter().map(|&v| v as f32).collect(),
             };
             channel_data.push(samples);
@@ -243,8 +243,8 @@ impl AudioDecoder {
         // Interleave channels
         let mut interleaved = Vec::with_capacity(frames * channels);
         for frame in 0..frames {
-            for ch in 0..channels {
-                interleaved.push(channel_data[ch][frame]);
+            for channel in &channel_data {
+                interleaved.push(channel[frame]);
             }
         }
         Ok(interleaved)
@@ -311,8 +311,7 @@ impl AudioDecoder {
         match (from_channels, to_channels) {
             (1, 2) => {
                 // Mono to stereo: duplicate
-                for frame in 0..frames {
-                    let sample = samples[frame];
+                for &sample in &samples[..frames] {
                     output.push(sample); // Left
                     output.push(sample); // Right
                 }

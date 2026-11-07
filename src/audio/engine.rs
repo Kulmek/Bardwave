@@ -437,6 +437,8 @@ impl AudioEngine {
         let config = MixerConfig::default();
         let mixer = Arc::new(AudioMixer::with_config(config));
 
+        // cpal::Stream is !Send: the engine stays on the thread that built it.
+        #[allow(clippy::arc_with_non_send_sync)]
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),
@@ -456,6 +458,8 @@ impl AudioEngine {
     pub fn with_config(config: MixerConfig) -> Result<Self, EngineError> {
         let mixer = Arc::new(AudioMixer::with_config(config));
 
+        // cpal::Stream is !Send: the engine stays on the thread that built it.
+        #[allow(clippy::arc_with_non_send_sync)]
         let inner = Arc::new(AudioEngineInner {
             mixer,
             sounds: RwLock::new(HashMap::new()),

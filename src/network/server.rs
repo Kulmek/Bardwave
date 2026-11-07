@@ -46,7 +46,8 @@ pub struct ServerConfig {
     pub bind_addr: IpAddr,
     /// Port (default: 8080)
     pub port: u16,
-    /// Try UPnP IGD port mapping for global-IP access (default: false)
+    /// Ask the router to forward the port (UPnP IGD / PCP / NAT-PMP) for
+    /// access from the internet (default: true)
     pub upnp: bool,
     /// Broadcaster configuration
     pub broadcaster_config: BroadcasterConfig,

@@ -114,6 +114,9 @@ pub struct AppState {
 
     /// Application configuration
     pub config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
+
+    /// Router port forwarding state, written by the server thread
+    pub upnp_status: std::sync::Arc<std::sync::Mutex<crate::network::upnp::UpnpStatus>>,
 }
 
 impl AppState {
@@ -129,6 +132,7 @@ impl AppState {
             server_cmd_tx,
             listener_count,
             config,
+            upnp_status: Default::default(),
         }
     }
 }

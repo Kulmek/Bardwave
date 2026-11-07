@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 /// Application configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Network server configuration
     pub server: ServerConfig,
@@ -178,24 +178,12 @@ pub fn default_sound_volume() -> f32 {
     1.0
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            audio: AudioConfig::default(),
-            logging: LoggingConfig::default(),
-            library: LibraryConfig::default(),
-            gui: GuiConfig::default(),
-        }
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: default_port(),
             host: default_host(),
-            upnp: false,
+            upnp: default_upnp(),
         }
     }
 }

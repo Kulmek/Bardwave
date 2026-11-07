@@ -10,6 +10,7 @@
 //! ─────────────────────────────
 //! LISTEN URL   [ http://192.168.1.245:8080  ⧉ ]
 //!              LOCAL http://127.0.0.1:8080
+//!              INTERNET http://203.0.113.7:8080
 //! LISTENERS    03  ▮▮▮▯▯▯▯▯   PEAK 3
 //! ─────────────────────────────
 //! [ ■ STOP SERVER ] [ ⧉ COPY LINK ]
@@ -156,6 +157,46 @@ pub fn server_panel(ui: &mut Ui, state: &mut SoundSharedApp, size: Vec2) {
             if let Some(local) = server.local_url.as_deref() {
                 ui.add_space(Metrics::XS);
                 ui.label(micro_label(format!("Local {local}")));
+            }
+        }
+
+        // Router port forwarding: players outside the LAN use this URL.
+        if running {
+            use crate::network::upnp::UpnpStatus;
+            let line = match &server.upnp {
+                UpnpStatus::Off => None,
+                UpnpStatus::Searching => Some("Internet: asking the router…".to_string()),
+                UpnpStatus::Mapped { url, .. } => Some(format!("Internet {url}")),
+                UpnpStatus::DoubleNat { external } => {
+                    Some(format!("Internet: blocked by a second NAT ({external})"))
+                }
+                UpnpStatus::Unavailable(_) => Some("Internet: no UPnP router".to_string()),
+            };
+            if let Some(line) = line {
+                ui.add_space(Metrics::XS);
+                let label = ui.add(egui::Label::new(micro_label(line)).sense(Sense::click()));
+                match &server.upnp {
+                    UpnpStatus::Mapped { url, .. } => {
+                        if label
+                            .on_hover_text("Click to copy the internet URL")
+                            .clicked()
+                        {
+                            ui.output_mut(|o| o.copied_text = url.clone());
+                            state.set_copied_feedback(true);
+                        }
+                    }
+                    UpnpStatus::Unavailable(reason) => {
+                        label.on_hover_text(reason.as_str());
+                    }
+                    UpnpStatus::DoubleNat { .. } => {
+                        label.on_hover_text(
+                            "The router's external address is private (CGNAT or a modem in \
+                             front of it): forward the port on the upstream device or ask the \
+                             provider for a public IP.",
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
 

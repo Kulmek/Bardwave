@@ -109,6 +109,8 @@ pub struct ServerState {
     /// players; the operator checking the page locally does not have to go
     /// through the network for it.
     pub local_url: Option<String>,
+    /// Router port forwarding: the internet URL once the router grants it.
+    pub upnp: crate::network::upnp::UpnpStatus,
     pub listener_count: usize,
 }
 
@@ -227,6 +229,7 @@ impl SoundSharedApp {
                 status: ServerStatus::Stopped,
                 bind_url: None,
                 local_url: None,
+                upnp: Default::default(),
                 listener_count: 0,
             })),
             copied_feedback: Arc::new(Mutex::new(false)),
@@ -626,6 +629,7 @@ impl SoundSharedApp {
             .bind_url
             .as_deref()
             .and_then(crate::network::server::loopback_url);
+        state.upnp = self.app_state.upnp_status.lock().unwrap().clone();
         state.clone()
     }
 
